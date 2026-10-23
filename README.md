@@ -12,20 +12,18 @@ blob services.
 
 ## Registration
 **Registry**
-A registry is simply a list of paths and URIs, new line delimited. For example,
-a to register a whole system, the registry contains simply the root path, `/`.
+A registry is simply a list of paths and URIs, newline delimited. For example,
+to register a whole system, the registry contains simply the root path, `/`.
 The system-wide registry is kept by default in `/var/lib/ext/registry`. Files
-may be registered by `ext -r <path>` or by editing the registry file. 
+may be registered by `ext -r <path>` or by editing the registry file.
 
 **Subdirectory Registration**
-Sub-extants keep their own registries in <sub-extant_path>/registry.
-
-`<extant_path>/<subdirectory_extant_path>`
+Sub-extants keep their own registries in `<sub-extant_path>/registry`.
 
 Sub-extants may be registered to a parent extant.
 
 **External Service Registration**
-External services may be registered via 
+External services may be registered via
 
 `ext -r <URI>`
 
@@ -46,20 +44,19 @@ Tag:        <tag>:<digest>
 Cache:      <digest>:<path>
 Cache Time: <digest>:<time>
 
-
 ## Digest Naming
 **Hash Storage**
+Storage uses **reverse digest naming** (reverse form), where the digest appears
+before the hash label, `<digest>:<alg>`. The reverse form provides a global
+namespace for all hashes.
 
-Storage uses __reverse digest naming__. This provides a global namespace for all
-hashes. 
-
-oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo:SHA-256
+`oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo:SHA-256`
 
 **Human Naming**
-If the human name doesn't exist ext does not return the value even if the digest
-exists. (If the human name doesn't exist ext returns nothing.) Why? If you don't
-need the human name, don't use it. The alg with the value can always be sent.
-If the human readable value is sent, ext forces interpretation.
+If the human name doesn't exist, ext does not return the value even if the
+digest exists. Why? The digest value can always be sent. If the human readable
+value is sent, ext forces interpretation. If you don't need the human name,
+don't use it.
 
 Digest with Human Name
 <alg>:<value>:<human_name>
@@ -75,7 +72,7 @@ Ergonomic naming with extension:
 
 ## Scheme and URI API
 Extant is designed with existing HTTP services in mind. HTTP servers can format
-however they would like. The follow are a few examples:
+however they would like. The following are a few examples:
 
 Page:
 https://cyphr.me/example:SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
@@ -93,39 +90,40 @@ implementing systems (such as a browser):
 hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
 ```
 
-### Hash Scheme 
+### Hash Scheme
 **Hash Scheme Grammar**
 ```
 hash-uri = "hash://" alg ":" digest [tail]
 scheme   = "hash://"
-alg      = 1 * (ALPHA / DIGIT / "-")      ; Coz alg. No ":".
-digest   = 1*b64ut
-b64ut    = ALPHA / DIGIT / "-" / "_"    ; b64UT 
+alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No ":".
+digest   = 1*b64ut / 1*hex; 
+b64ut    = ALPHA / DIGIT / "-" / "_" ; 
+hex      = ALPHA / alpha / DIGIT;
 tail     = <Starting at first non-b64ut>
 ```
 
 Scheme match is case-insensitive. `alg` and `digest` are case-sensitive. `alg`
 uses Coz labels (`SHA-256`, not `sha-256`). Tail is optional and resolution is out of scope.
 
-### Parse
-
+**Hash Scheme Parsing**
 1. After `hash://`, split on first `:`.
 2. `digest` is the longest b64ut prefix of the remainder. First non-b64ut char
    starts `tail`.
-3. Strict b64ut decode. Non-canonical encoding errors.
-4. Decoded length must equal `alg`'s digest size. Else error.
+3. Prefer the decoding whose length equals `alg`'s digest size. Even-length
+   `0-9A-F` is hex. Otherwise strict b64ut. Non-canonical encoding is an error.
+4. When truncation is enabled, a shorter digest is accepted: `0-9A-F` only is
+   hex, anything else is b64ut. Else error.
 
 Identity = (`alg`, raw digest bytes). `tail` is not identity.
 
-SHA-256 is 32 bytes, 43 b64ut chars. Full digest only. No truncate. No hex. No
-`=`.
+SHA-256 is 32 bytes, 43 b64ut chars, or 64 uppercase hex chars. No `=`.
 
 ## System Integrated Extant: `/dev/ext`
 So far described is **userland extant**. The extant service is designed first as
 a stand alone, user space service, with a root existing in `/var/lib/ext`.
 However, extant has the eventual goal of kernel integration, `/dev/ext`, a
-character special file.. Due to the difficulty of kernel integration, it is a
-later TODO. However the conceptional model is informative for eventual
+character special file. Due to the difficulty of kernel integration, it is a
+later TODO. However, the conceptual model is informative for eventual
 architectural goals.
 
 On unix systems, `/dev/null` is for nothing.  It is a black hole. In the same
@@ -149,27 +147,39 @@ ln -s target /dev/ext /var/www/website_name/content
 `/dev/ext` is a character special file.
  - `cat` lists all digests in the source index.
  - `ls` simply prints the extant, such as `/dev/ext`, just as it does with
-   `/dev/null`, `dev/random` and other such special files.
+   `/dev/null`, `/dev/random` and other such special files.
 
 ## Bases
-Both Base64 (b64ut) and Hex (upper case) are supported.  However the default is
-b64ut.
+Both Base64 (b64ut) and hex (lower, upper, and mixed case) are supported.
+However, the default is b64ut.
 
 ## Truncation and Collision
-Truncation is supported but disabled by default.Example 
+Truncation is supported but disabled by default. For example:
  - Full hash: SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
- - Truncated: SHA-256:2rfHUI84JBkIziY
+ - Truncated: SHA-256:2rfHUI84JB
 
 Note that the strength of the integrity protection is lessened with truncation.
 
 **Collision**
-Collision is where two files may resolve to a single digest and may happen when
+A collision is where two files resolve to a single digest. This may happen when
 using a non-cryptographic hash, truncation, or a broken cryptographic hash.
+Although `ext` is designed for cryptographic hashes, there are circumstances
+where non-cryptographic hashes are useful, such as speed and smaller lookup
+keys.
 
+On collision for truncation or non-cryptographic hashed, tooling provides top
+matches. For cryptographic hashes provided with full sized digests, tooling must
+fail as appropriate.
+
+```
+AMBIGUOUS SHA-256 2rfHUI84JB 2
+2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8:<path_0>
+2rfHUI84JBkIziYdK9qPJtG648Epv8MUI248F517dW8:<path_1>
+```
 
 ## Caching
 The cache is used for external services. After external retrieval the digest is
-added to the cache.  The cache is an Least Recently Used (LRU) Unix time cache.
+added to the cache.  The cache is a least recently used (LRU) Unix time cache.
 
 The order of operations for the lookups is:
 
@@ -177,79 +187,95 @@ The order of operations for the lookups is:
 2. Local cache
 3. Query external services
 
-The cache has two indexes which provides O(n) lookups, the Cache Index comprised
+The cache has two indexes which provide O(n) lookups, the Cache Index comprised
 of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.  Once the
 cache reaches capacity, the oldest items are removed.
 
 ## Directories
-`ext` checks for stores indexes and registrations. Default system wide userland
-directory: `/var/lib/ext` This may be set to a different directory using the
-environmental variable `EXTANT_DIR`.
+`ext` checks for stores, indexes, and registrations. Default system wide userland
+directory: `/var/lib/ext`. This may be set to a different directory using the
+environment variable `EXTANT_DIR`.
 
-The waterfall for directories
-1. Environmental variable
+The waterfall for directories. Use the first candidate that exists.
+1. Environment variable
 2. Default path, `/var/lib/ext`
 3. Flag value
 4. Current directory
+5. Fail if nothing exists.
 
 ## Config Flags
-The config file is saved as <extant_path>/config. 
+The config file is saved as <extant_path>/config.
 
 |Flag - Default Value - Description|
 - Aware      - True  - the system only supports digests specified by ext.
+- Base64     - True  - Support Base64 encoding.
+- Hex        - True  - Support lower, upper, and mixed case hex.
+- DefaultEnc - B64   - Default encoding.  B64 is preferred.
+- IndexEnc   - B64   - Default index encoding.  (Lookups are converted to target base)
 - Truncation - False - Supports truncation.
-- Unlabeled  - False - Do not require digest labeling. (Security concern)
+- Unlabeled  - False - Do not require digest labeling.
 - Directory  - CWD   - Specify working directory for `ext`.
 
 ## Commands
-`ext -r`         - registration Supports both files and directories
-`ext -u`         - unregister (Deleting a directory also unregisters)
-`ext -check`     - Re-hash all files and compare digests
-`ext -rerun`     - rebuild all indexes and re-hash all files.
-`ext --d <path>` - Specifies working directory for `ext`
+`ext -r`         - Registration. Supports both files and directories.
+`ext -u`         - Unregister. (Deleting a directory also unregisters.)
+`ext -check`     - Re-hash all files and compare digests.
+`ext -rerun`     - Rebuild all indexes and re-hash all files.
+`ext --d <path>` - Specifies the working directory for `ext`.
 
 ## Coz
-Extant using the hash naming convention specified by Coz.
+Extant uses the hash naming convention specified by Coz.
 `hash://` + Coz external form `ALG:b64ut`. Same value as `SHA-256:…` and
-`coz:SHA-256:…`.
+`coz:SHA-256:…`. Uppercase hex may be used in place of b64ut.
 
-This specification also uses b64ut, also specified by Coz.  (RFC 4648 base64
+This specification also uses b64ut, as specified by Coz.  (RFC 4648 base64
 url, padding truncated, canonical.)
 
 ## Technical Considerations
 **Extant Non-goals**
-- Not a transport. 
-- Not a multi-hash registry. Not ni:. Not hex. Not a filename standard.
+- Not a transport.
+- Not a multi-hash registry. Not ni:. Not a filename standard.
 
-**Recursion**
-Recursion is not supported. If an ext path contains another ext, it is ignored.
+**Recursion** - Recursion is not supported. If an ext path contains another ext,
+it is ignored. Subdirectories must be explicitly registered.
 
-Subdirectories must be explicitly registered. 
+**Digest Labeling** - Unlabeled digests are a security concern: the weakest hash
+becomes the security floor of the system overall. A system with unlabeled
+digests is only as strong as the weakest supported hash algorithm.
 
+If the hashes are trusted, or for systems that only support one hash type or
+otherwise inferred, the label may be dropped, but the responsibility should be
+understood to rest completely on the system administration's setup of `ext`. Use
+with extreme caution.
 
-**The Mining Problem** although collisions may be very difficult, even in weak
-hashes, specific ranges may be targeted.
+**Size Ambiguity** Digests without labels may have an unknown size. Otherwise
+the expected digest size is given by the Coz specification.
+
+**The Mining Problem.** Although collisions may be very difficult, even with
+weak hashes, specific ranges may be targeted.
 
 The architecture should not assume a uniform, normal distribution of digests.
 Instead, it should assume an irregular, unbalanced distribution to avoid any
-problems with distribution. 
+problems with distribution.
 
 For example, sharding should not be naive. Sharding should measure the sizes in
 different directories.
 
-**Size Ambiguity** Digests without labels may have an unknown size.
+**Operating System Considerations**
+Base64 support requires case sensitivity.
 
-**Other Operating Systems Consideration** We do not foresee any problems with
+Unix: We do not foresee any problems with
 other Unix systems.
 
-**Windows Considerations** There are no naming conflicts with windows except
-`:`.  We suggest `_` is used instead.
+Windows:There are no naming conflicts with Windows except
+`:`.  We suggest `_` be used instead.
 
-**/dev/random
- /dev/random , waits for CSPRNG to fully initialized on boot. It never
-blocks after bootup after 5.6.
+**/dev/random**
+`/dev/random` waits for the CSPRNG to fully initialize on boot. It never
+blocks after bootup after Linux 5.6.
 
-- /dev/random <- May block under low entropy
+Before 5.6:
+- /dev/random  <- May block under low entropy
 - /dev/urandom <- non-blocking, including boot up
 
 ## FAQ
@@ -257,6 +283,6 @@ blocks after bootup after 5.6.
 Unix file naming.
 
 
-## See also 
+## See also
  - https://github.com/Cyphrme/Coz
  - https://github.com/Cyphrme/Path
