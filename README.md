@@ -1,36 +1,57 @@
 DRAFT
-# Extant: Hash Based Naming, `/dev/ext`
+# Extant: Hash Based Naming
 
-`/dev/ext`, "extant", is a character special file that contains all registered
-digests on a system. It also supports subdirectories.
+Extant is an index that contains the digests of files inside registered
+directories on a system. Extant supports subdirectory registries (sub-extants)
+and external blob services.
 
-## /dev/ext
-
-On unix systems, `/dev/null` is for nothing.  It is a black hole.
-
-In the same way there should be a white hole, `/dev/ext`, "ext" being short for
-"extant". "extant" coming from the Latin meaning "to exist".
-
-`/dev/ext` is an index for all content addressable files on the system.
-
-Using a symbolic link, this file then can be used as a database:
-
-For example:
-ln -s target /dev/ext /var/www/website_name/content
-
-Then URLs may look like:
-
-List of existing sources or sinks:
-- /dev/null
-- /dev/full
-- /dev/zero
-- /dev/random
-- /dev/urandom
-
-# Goals
+# Extant Goals
  - Provide hash based addressing on a system wide and subdirectory basis.
  - Provide cryptographic integrity to files.
  - Explicitly support external blob services.
+
+## Registry and Indexes
+ stores indexes and registrations.
+
+**Registry**
+The is kept in `/dev/.ext/registry`.  It is simply a list of paths and URIs, new
+line delimited.  For example, a to register a whole system the registry would
+contain simply the root path, `/`.
+
+**Indexes**
+Indexes are kept in `/dev/.ext/<index_name>`.
+
+Required:
+Source: <digest>:<path>
+
+Optional:
+Path Index: <path>:<digest>
+Tag:        <tag>:<digest>
+Cache:      <digest>:<path>
+Cache Time: <digest>:<time>
+
+## Registration
+Files may be registered by `ext -r <path>`.  The simplest registration is simply
+registering the whole system, `/`.
+
+**Subdirectory Registration**
+Subdirectories may be registered.
+
+`/dev/.ext/<subdirectory_extant_path>`
+
+For example, `/home/z/webserver/asset`, registered as an ext appears as 
+
+`/dev/.ext//home/z/webserver/asset`
+
+**External Service Registration**
+External services may be registered via 
+
+`ext -r <URI>`
+
+For example:
+`ext -r https://cyphr.me/e`
+
+
 
 ## Digest Naming
 **Hash URI** - Names bytes by digest. The following URI requires support by
@@ -111,61 +132,43 @@ Identity = (`alg`, raw digest bytes). `tail` is not identity.
 SHA-256 is 32 bytes, 43 b64ut chars. Full digest only. No truncate. No hex. No
 `=`.
 
-## Registry and Indexes
-`/dev/.ext/` directory stores indexes and registrations.
+## System Integrated Extant: `/dev/ext`
+So far described is **userland extant**. The extant service is designed first as
+a stand alone, user space service.  However, extant has the eventual goal of
+kernel integration, `/dev/ext`. Due to the difficulty of kernel integration, it
+is a later TODO. However the conceptional model is informative for eventual
+architectural goals.
 
-**Registry**
-The is kept in `/dev/.ext/registry`.  It is simply a list of paths and URIs, new
-line delimited.  For example, a to register a whole system the registry would
-contain simply the root path, `/`.
+`/dev/ext` is a character special file.
 
-**Indexes**
-Indexes are kept in `/dev/.ext/<index_name>`.
+On unix systems, `/dev/null` is for nothing.  It is a black hole. In the same
+way there should be a white hole, `/dev/ext`,  an index for all content
+addressable files on the system. "Ext" is short for "extant", Latin meaning "to
+exist".
 
-Required:
-Source: <digest>:<path>
-
-Optional:
-Path Index: <path>:<digest>
-Tag:        <tag>:<digest>
-Cache:      <digest>:<path>
-Cache Time: <digest>:<time>
-
-## Registration
-Files may be registered by `ext -r <path>`.  The simplest registration is simply
-registering the whole system, `/`.
-
-**Subdirectory Registration**
-Subdirectories may be registered.
-
-`/dev/.ext/<subdirectory_extant_path>`
-
-For example, `/home/z/webserver/asset`, registered as an ext appears as 
-
-`/dev/.ext//home/z/webserver/asset`
-
-**External Service Registration**
-External services may be registered via 
-
-`ext -r <URI>`
+Using a symbolic link, this file then can be used as a database:
 
 For example:
-`ext -r https://cyphr.me/e`
+ln -s target /dev/ext /var/www/website_name/content
 
+**List of existing sources or sinks**
+- /dev/null
+- /dev/full
+- /dev/zero
+- /dev/random
+- /dev/urandom
 
-## Extant server
-Instead of integrating with the system at a kernal level, this tool is designed
-first as a stand alone server. OS integration is a later TODO.
-
-
-
-
-## Unix Tools
+**`/dev/ext` Unix Tools**
 As noted, `/dev/ext` and subdir extants `/dev/.ext/<path>` are character special
 files. 
  - `cat` lists all digests in the source index.
  - `ls` simply prints the extant, such as `/dev/ext`, just as it does with
    `/dev/null`, `dev/random` and other such special files.
+
+
+
+
+
 
 
 
