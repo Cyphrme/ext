@@ -1,47 +1,28 @@
 DRAFT
 # Extant: Hash Based Naming
 
-Extant is an index that contains the digests of files inside registered
-directories on a system. Extant supports subdirectory registries (sub-extants)
-and external blob services.
+Extant is an index containing the digests of files inside registered
+directories. Extant supports subdirectory registries (sub-extants) and external
+blob services.
 
 # Extant Goals
  - Provide hash based addressing on a system wide and subdirectory basis.
  - Provide cryptographic integrity to files.
  - Explicitly support external blob services.
 
-## Registry and Indexes
- stores indexes and registrations.
-
-**Registry**
-The is kept in `/dev/.ext/registry`.  It is simply a list of paths and URIs, new
-line delimited.  For example, a to register a whole system the registry would
-contain simply the root path, `/`.
-
-**Indexes**
-Indexes are kept in `/dev/.ext/<index_name>`.
-
-Required:
-Source: <digest>:<path>
-
-Optional:
-Path Index: <path>:<digest>
-Tag:        <tag>:<digest>
-Cache:      <digest>:<path>
-Cache Time: <digest>:<time>
-
 ## Registration
-Files may be registered by `ext -r <path>`.  The simplest registration is simply
-registering the whole system, `/`.
+**Registry**
+A registry is simply a list of paths and URIs, new line delimited. For example,
+a to register a whole system, the registry contains simply the root path, `/`.
+The system-wide registry is kept by default in `/var/lib/ext/registry`. Files
+may be registered by `ext -r <path>` or by editing the registry file. 
 
 **Subdirectory Registration**
-Subdirectories may be registered.
+Sub-extants keep their own registries in <sub-extant_path>/registry.
 
-`/dev/.ext/<subdirectory_extant_path>`
+`<extant_path>/<subdirectory_extant_path>`
 
-For example, `/home/z/webserver/asset`, registered as an ext appears as 
-
-`/dev/.ext//home/z/webserver/asset`
+Sub-extants may be registered to a parent extant.
 
 **External Service Registration**
 External services may be registered via 
@@ -51,23 +32,28 @@ External services may be registered via
 For example:
 `ext -r https://cyphr.me/e`
 
+## Extant Files
+**Files and Indexes**
+Indexes are kept in `<extant_path>/<index_name>`.
+
+**Required**
+Registry: <registry>
+Source:   <digest>:<path>
+
+**Optional**
+Path Index: <path>:<digest>
+Tag:        <tag>:<digest>
+Cache:      <digest>:<path>
+Cache Time: <digest>:<time>
 
 
 ## Digest Naming
-**Hash URI** - Names bytes by digest. The following URI requires support by
-implementing systems (such as a browser):
-
-```
-hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
-```
-
 **Hash Storage**
 
 Storage uses __reverse digest naming__. This provides a global namespace for all
 hashes. 
 
 oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo:SHA-256
-
 
 **Human Naming**
 If the human name doesn't exist ext does not return the value even if the digest
@@ -87,7 +73,6 @@ Ergonomic naming:
 Ergonomic naming with extension:
 <human_name>:<alg>:<value>.<ext>
 
-
 ## Scheme and URI API
 Extant is designed with existing HTTP services in mind. HTTP servers can format
 however they would like. The follow are a few examples:
@@ -101,23 +86,26 @@ https://cyphr.me/File:Example:SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU
 Simple blog service:
 https://cyphr.me/e/SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
 
+**Hash URI** - Names bytes by digest. The following URI requires support by
+implementing systems (such as a browser):
 
+```
+hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
+```
 
 ### Hash Scheme 
-
 **Hash Scheme Grammar**
-
 ```
 hash-uri = "hash://" alg ":" digest [tail]
 scheme   = "hash://"
 alg      = 1 * (ALPHA / DIGIT / "-")      ; Coz alg. No ":".
 digest   = 1*b64ut
-b64ut    = ALPHA / DIGIT / "-" / "_"    ; RFC 4648 base64url, no pad
-tail     = <any run starting at first non-b64ut>
+b64ut    = ALPHA / DIGIT / "-" / "_"    ; b64UT 
+tail     = <Starting at first non-b64ut>
 ```
 
 Scheme match is case-insensitive. `alg` and `digest` are case-sensitive. `alg`
-uses Coz labels (`SHA-256`, not `sha-256`).
+uses Coz labels (`SHA-256`, not `sha-256`). Tail is optional and resolution is out of scope.
 
 ### Parse
 
@@ -134,12 +122,11 @@ SHA-256 is 32 bytes, 43 b64ut chars. Full digest only. No truncate. No hex. No
 
 ## System Integrated Extant: `/dev/ext`
 So far described is **userland extant**. The extant service is designed first as
-a stand alone, user space service.  However, extant has the eventual goal of
-kernel integration, `/dev/ext`. Due to the difficulty of kernel integration, it
-is a later TODO. However the conceptional model is informative for eventual
+a stand alone, user space service, with a root existing in `/var/lib/ext`.
+However, extant has the eventual goal of kernel integration, `/dev/ext`, a
+character special file.. Due to the difficulty of kernel integration, it is a
+later TODO. However the conceptional model is informative for eventual
 architectural goals.
-
-`/dev/ext` is a character special file.
 
 On unix systems, `/dev/null` is for nothing.  It is a black hole. In the same
 way there should be a white hole, `/dev/ext`,  an index for all content
@@ -159,31 +146,26 @@ ln -s target /dev/ext /var/www/website_name/content
 - /dev/urandom
 
 **`/dev/ext` Unix Tools**
-As noted, `/dev/ext` and subdir extants `/dev/.ext/<path>` are character special
-files. 
+`/dev/ext` is a character special file.
  - `cat` lists all digests in the source index.
  - `ls` simply prints the extant, such as `/dev/ext`, just as it does with
    `/dev/null`, `dev/random` and other such special files.
-
-
-
-
-
-
-
 
 ## Bases
 Both Base64 (b64ut) and Hex (upper case) are supported.  However the default is
 b64ut.
 
-## Truncation
-Truncation is supported but disabled by default.
-
-Example:
-Full hash: SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
-Truncated: SHA-256:2rfHUI84JBkIziY
+## Truncation and Collision
+Truncation is supported but disabled by default.Example 
+ - Full hash: SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
+ - Truncated: SHA-256:2rfHUI84JBkIziY
 
 Note that the strength of the integrity protection is lessened with truncation.
+
+**Collision**
+Collision is where two files may resolve to a single digest and may happen when
+using a non-cryptographic hash, truncation, or a broken cryptographic hash.
+
 
 ## Caching
 The cache is used for external services. After external retrieval the digest is
@@ -199,47 +181,51 @@ The cache has two indexes which provides O(n) lookups, the Cache Index comprised
 of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.  Once the
 cache reaches capacity, the oldest items are removed.
 
-## Collisions
-If using a non-cryptographic hash, or in the case of a broken hash. 
+## Directories
+`ext` checks for stores indexes and registrations. Default system wide userland
+directory: `/var/lib/ext` This may be set to a different directory using the
+environmental variable `EXTANT_DIR`.
+
+The waterfall for directories
+1. Environmental variable
+2. Default path, `/var/lib/ext`
+3. Flag value
+4. Current directory
+
+## Config Flags
+The config file is saved as <extant_path>/config. 
+
+|Flag - Default Value - Description|
+- Aware      - True  - the system only supports digests specified by ext.
+- Truncation - False - Supports truncation.
+- Unlabeled  - False - Do not require digest labeling. (Security concern)
+- Directory  - CWD   - Specify working directory for `ext`.
+
+## Commands
+`ext -r`         - registration Supports both files and directories
+`ext -u`         - unregister (Deleting a directory also unregisters)
+`ext -check`     - Re-hash all files and compare digests
+`ext -rerun`     - rebuild all indexes and re-hash all files.
+`ext --d <path>` - Specifies working directory for `ext`
+
+## Coz
+Extant using the hash naming convention specified by Coz.
+`hash://` + Coz external form `ALG:b64ut`. Same value as `SHA-256:…` and
+`coz:SHA-256:…`.
+
+This specification also uses b64ut, also specified by Coz.  (RFC 4648 base64
+url, padding truncated, canonical.)
+
+## Technical Considerations
+**Extant Non-goals**
+- Not a transport. 
+- Not a multi-hash registry. Not ni:. Not hex. Not a filename standard.
 
 **Recursion**
 Recursion is not supported. If an ext path contains another ext, it is ignored.
 
+Subdirectories must be explicitly registered. 
 
-### Tail
-
-Optional. Suggested: `;ct=type`, `?src=url`, `/label`. Resolution is out of
-scope.
-
-### Coz
-
-`hash://` + Coz external form `ALG:b64ut`. Same value as `SHA-256:…` and
-`coz:SHA-256:…`.
-
-### Non-goals
-- Not a transport. 
-- Not a multi-hash registry. Not ni:. Not hex. Not a filename standard.
-
-## Config Flags
-The config is saved in /dev/.ext/
-
-Flag - Default Value - Description
-- Aware      - True - the system only supports digests specified by ext.
-- Truncation - False - Supports truncation.
-- Unlabeled  - False - Do not require digest labeling. (Security concern)
-
-## Commands
-
-`ext -r` - registration Supports both files and directories
-`ext -u` - unregister (Deleting a directory also unregisters)
-`ext -check` - Re-hash all files and compare digests
-`ext -rerun` - rebuild all indexes and re-hash all files.
-
-
-## Technical Considerations
-
-**System Awareness** - Exant is designed so that system doesn't need necessarily
-need to be aware of a
 
 **The Mining Problem** although collisions may be very difficult, even in weak
 hashes, specific ranges may be targeted.
