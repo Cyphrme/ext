@@ -99,7 +99,8 @@ alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No ":".
 digest   = 1*b64ut / 1*hex; 
 b64ut    = ALPHA / DIGIT / "-" / "_" ; 
 hex      = ALPHA / alpha / DIGIT;
-tail     = <Starting at first non-b64ut>
+tail     = <Starting at first non-b64ut> 
+           (which is of course inclusive of the Hex character set)
 ```
 
 Scheme match is case-insensitive. `alg` and `digest` are case-sensitive. `alg`
@@ -143,7 +144,7 @@ ln -s target /dev/ext /var/www/website_name/content
 - /dev/random
 - /dev/urandom
 
-**`/dev/ext` Unix Tools**
+**Unix Tools**
 `/dev/ext` is a character special file.
  - `cat` lists all digests in the source index.
  - `ls` simply prints the extant, such as `/dev/ext`, just as it does with
@@ -187,9 +188,9 @@ The order of operations for the lookups is:
 2. Local cache
 3. Query external services
 
-The cache has two indexes which provide O(n) lookups, the Cache Index comprised
-of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.  Once the
-cache reaches capacity, the oldest items are removed.
+The cache has two indexes which provide O(log(n)) lookups, the Cache Index
+comprised of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.
+Once the cache reaches capacity, the oldest items are removed.
 
 ## Directories
 `ext` checks for stores, indexes, and registrations. Default system wide userland
@@ -224,12 +225,14 @@ The config file is saved as <extant_path>/config.
 `ext --d <path>` - Specifies the working directory for `ext`.
 
 ## Coz
-Extant uses the hash naming convention specified by Coz.
-`hash://` + Coz external form `ALG:b64ut`. Same value as `SHA-256:…` and
-`coz:SHA-256:…`. Uppercase hex may be used in place of b64ut.
+Extant uses the algorithm hash naming convention and b64ut (RFC 4648 base64 url,
+padding truncated, canonical), and expected default digest sizes as specified by
+Coz. Hex may be used in place of b64ut.
 
-This specification also uses b64ut, as specified by Coz.  (RFC 4648 base64
-url, padding truncated, canonical.)
+## Errors
+AMBIGUOUS - Multiple digests complete given string
+COLLISION - Two distinct payloads resolve to the same digest.
+
 
 ## Technical Considerations
 **Extant Non-goals**
