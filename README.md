@@ -1,4 +1,5 @@
 DRAFT
+https://github.com/Cyphrme/ext
 # Extant: Hash Based Naming
 
 Extant is an index containing the digests of files inside registered
@@ -7,8 +8,10 @@ blob services.
 
 # Extant Goals
  - Provide hash based addressing on a system wide and subdirectory basis.
- - Provide cryptographic integrity to files.
- - Explicitly support external blob services.
+  - Provide cryptographic integrity to files.
+ - Incremental behavior. (New changes are added as the occur. No global
+   re-hashing)
+ - Support external blob services.
 
 ## Registration
 **Registry**
@@ -30,19 +33,22 @@ External services may be registered via
 For example:
 `ext -r https://cyphr.me/e`
 
-## Extant Files
-**Files and Indexes**
-Indexes are kept in `<extant_path>/<index_name>`.
+## Extant Registry and Index paths
+Indexes are kept in `<extant_path>/<index_name>`. The registry and source index
+are required, others are optional.
 
-**Required**
-Registry: <registry>
-Source:   <digest>:<path>
+**File Formats**
+Registry:   <registered_file_path>
+Source:     <digest>:<alg>\t<path>
+Path Index: <path>\t<digest>:<alg>
+Tag:        <tag>\t<digest>:<alg>
+Cache:      <digest>:<alg>\t<path>
+Cache Time: <digest>:<alg>\t<time>
+Timestamp:  <path>\t<last_checked>\t<last_modified>
 
-**Optional**
-Path Index: <path>:<digest>
-Tag:        <tag>:<digest>
-Cache:      <digest>:<path>
-Cache Time: <digest>:<time>
+The same digest may appear more than once when multiple paths contain
+identical content. Lookup by digest returns every matching path. The path index,
+by contrast, has unique paths.
 
 ## Digest Naming
 **Hash Storage**
@@ -90,7 +96,6 @@ implementing systems (such as a browser):
 hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
 ```
 
-### Hash Scheme
 **Hash Scheme Grammar**
 ```
 hash-uri = "hash://" alg ":" digest [tail]
@@ -103,8 +108,8 @@ tail     = <Starting at first non-b64ut>
            (which is of course inclusive of the Hex character set)
 ```
 
-Scheme match is case-insensitive. `alg` and `digest` are case-sensitive. `alg`
-uses Coz labels (`SHA-256`, not `sha-256`). Tail is optional and resolution is out of scope.
+Scheme match is case-insensitive while `alg` and `digest` are case-sensitive.
+Tail is optional and resolution is out of scope.
 
 **Hash Scheme Parsing**
 1. After `hash://`, split on first `:`.
@@ -216,13 +221,60 @@ The config file is saved as <extant_path>/config.
 - Truncation - False - Supports truncation.
 - Unlabeled  - False - Do not require digest labeling.
 - Directory  - CWD   - Specify working directory for `ext`.
+- Hash     - SHA-256 - Default hash.
 
 ## Commands
-`ext -r`         - Registration. Supports both files and directories.
-`ext -u`         - Unregister. (Deleting a directory also unregisters.)
-`ext -check`     - Re-hash all files and compare digests.
-`ext -rerun`     - Rebuild all indexes and re-hash all files.
+`ext init <path>` - Create a `ext` directory with a new registry. If no path is
+specified CWD is used.
+
+`ext register`,`ext -r`  - Registration. Supports both files and directories.
+
+`ext unregister`, `ext -u`         - Unregister, removing all references in
+indexing. (Deleting a directory also unregisters.)
+
+`ext resolve <dig>` - Print path(s)
+
+`ext list` - prints the source index.
+
+`ext check`, `ext -check` - Re-hash all files and compare digests. Skip
+unchanged paths.
+
+`ext check --full` - Re-hash all files and does not skip unchanged paths.
+
+`ext -rerun` - Rebuild all indexes and re-hash all files.
+
 `ext --d <path>` - Specifies the working directory for `ext`.
+
+`ext watch` - Starts the watcher that triggers on file change.
+
+## Incrementality
+
+Incrementality uses both a persistent timestamp index and an optional continuous
+watcher. The timestamps are the source of truth; the watcher is an optimization
+that updates them.
+
+**Timestamp Index** For each registered path the following are stored:
+
+- `last_checked` — Unix time of the last examination by `ext`
+- `last_modified` — the path’s mtime (or platform equivalent) at that moment
+
+On any run (CLI or watcher):
+
+1. If the current mtime matches the stored `last_modified`, the path is skipped.
+2. Otherwise the file is re-hashed, indexes are updated, and both timestamps are
+   rewritten.
+
+The timestamp records are advisory for performance. `ext check --full` ignores
+them and re-hashes every registered path for a complete integrity verification.
+
+
+`ext watch` monitors registered paths via the platform mechanism (Linux:
+inotify/fanotify). On create/modify/delete events it updates the same timestamp
+index and performs the corresponding re-hash or removal. The watcher is not
+required for correctness; any later `ext` invocation will observe the same
+timestamps and produce the same result.
+
+External services are never watched; they are consulted only on cache miss.
 
 ## Coz
 Extant uses the algorithm hash naming convention and b64ut (RFC 4648 base64 url,
@@ -289,3 +341,8 @@ Unix file naming.
 ## See also
  - https://github.com/Cyphrme/Coz
  - https://github.com/Cyphrme/Path
+
+**Prior art**
+- IPFS, Protocol Labs
+- Nix store
+- git
