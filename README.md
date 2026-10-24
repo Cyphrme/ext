@@ -248,31 +248,30 @@ unchanged paths.
 `ext watch` - Starts the watcher that triggers on file change.
 
 ## Incrementality
+Incrementality uses a persistent timestamp index and an optional continuous
+watcher. The timestamp records are advisory for performance. `ext check --full`
+ignores them and re-hashes every registered path for a complete integrity
+verification.
 
-Incrementality uses both a persistent timestamp index and an optional continuous
-watcher. The timestamps are the source of truth; the watcher is an optimization
-that updates them.
+**Timestamp Index** - For each registered path the following are stored:
+- `last_checked` - Unix time of the last examination by `ext`
+- `last_modified` - the path’s mtime (or platform equivalent) at that moment
 
-**Timestamp Index** For each registered path the following are stored:
-
-- `last_checked` — Unix time of the last examination by `ext`
-- `last_modified` — the path’s mtime (or platform equivalent) at that moment
-
-On any run (CLI or watcher):
+On run (CLI or watcher):
 
 1. If the current mtime matches the stored `last_modified`, the path is skipped.
 2. Otherwise the file is re-hashed, indexes are updated, and both timestamps are
    rewritten.
 
-The timestamp records are advisory for performance. `ext check --full` ignores
-them and re-hashes every registered path for a complete integrity verification.
+Large directories (either by size or number of files) may also be added to the
+timestamp index as a further optimization. This allows only some child
+directories in a parent to be re-examined.
 
-
-`ext watch` monitors registered paths via the platform mechanism (Linux:
-inotify/fanotify). On create/modify/delete events it updates the same timestamp
-index and performs the corresponding re-hash or removal. The watcher is not
-required for correctness; any later `ext` invocation will observe the same
-timestamps and produce the same result.
+**Watcher** - `ext watch` monitors registered paths via the platform mechanism (Linux:
+inotify/fanotify). On create/modify/delete events it re-hash (or removes) and
+updates the timestamp index. The watcher is not required for correctness; any
+later `ext` invocation will observe the same timestamps and produce the same
+result.
 
 External services are never watched; they are consulted only on cache miss.
 
