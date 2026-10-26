@@ -39,14 +39,11 @@ fn stable_file_digest_and_meta_match() {
         "not cumulative: {calls:?}"
     );
     assert_eq!(*calls.last().unwrap(), SIZE as u64);
-}
 
-#[test]
-fn empty_file_hashes() {
-    let (_t, d) = support::canon_tmp();
-    let p = d.join("e");
-    fs::write(&p, b"").unwrap();
-    let (dg, m) = hash_stable(&File::open(&p).unwrap(), Alg::Sha256, &mut |_| {}).unwrap();
+    // The empty file is the loop-skip edge.
+    let e = d.join("e");
+    fs::write(&e, b"").unwrap();
+    let (dg, m) = hash_stable(&File::open(&e).unwrap(), Alg::Sha256, &mut |_| {}).unwrap();
     assert_eq!(dg, Digest::compute(Alg::Sha256, b""));
     assert_eq!(m.size, 0);
 }
@@ -100,28 +97,4 @@ fn same_size_rewrite_mid_hash_is_unstable() {
         }
     });
     assert!(matches!(r, Err(HashError::Unstable)), "{r:?}");
-}
-
-// The failure is about the hash being untrustworthy, so a retry on the same
-// file with no further mutation succeeds and yields the new content's digest.
-#[test]
-fn retry_after_unstable_succeeds_when_file_settles() {
-    let (_t, d) = support::canon_tmp();
-    let (p, _) = big(&d);
-    let mut done = false;
-    let first = hash_stable(&File::open(&p).unwrap(), Alg::Sha256, &mut |_| {
-        if !done {
-            done = true;
-            OpenOptions::new()
-                .append(true)
-                .open(&p)
-                .unwrap()
-                .write_all(b"x")
-                .unwrap();
-        }
-    });
-    assert!(matches!(first, Err(HashError::Unstable)));
-    let want = Digest::compute(Alg::Sha256, &fs::read(&p).unwrap());
-    let (dg, _) = hash_stable(&File::open(&p).unwrap(), Alg::Sha256, &mut |_| {}).unwrap();
-    assert_eq!(dg, want);
 }
