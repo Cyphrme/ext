@@ -136,6 +136,12 @@ impl Index {
         Ok(ix)
     }
 
+    /// Whether `SQLITE_DBCONFIG_DEFENSIVE` is set on this connection.
+    #[doc(hidden)]
+    pub fn db_config_defensive(&self) -> Result<bool, StoreError> {
+        todo!("step 2 rework: read back DbConfig::SQLITE_DBCONFIG_DEFENSIVE")
+    }
+
     /// Value of `PRAGMA <name>` on this index's own connection, as text.
     #[doc(hidden)]
     pub fn pragma(&self, name: &str) -> Result<String, StoreError> {

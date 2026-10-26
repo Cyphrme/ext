@@ -354,5 +354,10 @@ fn connection_settings_are_applied() {
     assert_eq!(ix.pragma("trusted_schema").unwrap(), "0");
     assert_eq!(ix.pragma("journal_mode").unwrap().to_lowercase(), "wal");
 }
-// SQLITE_DBCONFIG_DEFENSIVE has no PRAGMA and no safe way to read it back
-// through this API; it is not covered by a test.
+
+/// SQLITE_DBCONFIG_DEFENSIVE is read back through `sqlite3_db_config`.
+#[test]
+fn defensive_mode_is_on() {
+    let (_t, _st, ix) = fresh();
+    assert!(ix.db_config_defensive().unwrap());
+}

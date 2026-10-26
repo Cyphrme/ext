@@ -423,3 +423,66 @@ fn registry_error_kind_is_exposed_for_hand_edits() {
         })
     ));
 }
+
+// ---- re-gate additions ----
+
+/// init must apply the same ancestor rule as open, and leave nothing behind;
+/// otherwise it produces a store that cannot be opened.
+#[test]
+fn init_under_writable_nonsticky_parent_is_refused_and_leaves_nothing() {
+    let t = tempfile::tempdir().unwrap();
+    let parent = fs::canonicalize(t.path()).unwrap().join("p");
+    fs::create_dir(&parent).unwrap();
+    chmod(&parent, 0o777);
+    let r = Store::init_bare(&parent.join("s"));
+    assert!(is_unsafe(&r, &parent), "init_bare: {:?}", r.err());
+    assert!(
+        listing(&parent).is_empty(),
+        "init_bare left {:?}",
+        listing(&parent)
+    );
+    let r = Store::init_extant(&parent);
+    assert!(is_unsafe(&r, &parent), "init_extant: {:?}", r.err());
+    assert!(
+        listing(&parent).is_empty(),
+        "init_extant left {:?}",
+        listing(&parent)
+    );
+}
+
+/// The ancestor walk is over the canonical path: a symlink in the given
+/// path must not hide an unsafe directory on the real path.
+#[test]
+fn ancestor_check_uses_the_canonical_path() {
+    let t = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(t.path()).unwrap();
+    let a = base.join("a");
+    let b = a.join("b");
+    fs::create_dir_all(&b).unwrap();
+    chmod(&b, 0o700);
+    Store::init_bare(&b.join("s")).unwrap();
+    chmod(&a, 0o777);
+    let trusted = base.join("trusted");
+    fs::create_dir(&trusted).unwrap();
+    symlink(&b, trusted.join("link")).unwrap();
+    assert!(is_unsafe(&Store::open(&trusted.join("link/s")), &a));
+}
+
+/// Even a swapped-in directory with no index.db at all must not receive a
+/// freshly created database (or -wal/-shm) from `Index::open`.
+#[test]
+fn index_open_after_swap_to_empty_dir_creates_nothing() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    Store::init_bare(&dir).unwrap();
+    let st = Store::open(&dir).unwrap();
+    fs::rename(&dir, t.path().join("old")).unwrap();
+    fs::create_dir(&dir).unwrap();
+    chmod(&dir, 0o700);
+    assert!(Index::open(&st).is_err());
+    assert!(
+        listing(&dir).is_empty(),
+        "created {:?} in the decoy",
+        listing(&dir)
+    );
+}
