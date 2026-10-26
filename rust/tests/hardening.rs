@@ -418,7 +418,8 @@ fn registry_error_kind_is_exposed_for_hand_edits() {
         st.registry(),
         Err(StoreError::Registry {
             line: 2,
-            kind: RegistryErrorKind::NotUtf8
+            kind: RegistryErrorKind::NotUtf8,
+            ..
         })
     ));
 }

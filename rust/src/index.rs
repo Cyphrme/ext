@@ -3,6 +3,8 @@
 use crate::digest::{Alg, Digest};
 use crate::registry::RegPath;
 use crate::store::{wrap, Store, StoreError};
+use rusqlite::config::DbConfig;
+use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -113,9 +115,19 @@ const UNDER: &str = "(path = ?1 OR (path >= ?2 AND path < ?3))";
 
 impl Index {
     pub fn open(store: &Store) -> Result<Index, StoreError> {
+        // SQLite opens by path, not through the store's dir fd, so the path
+        // must still name the checked directory both before (nothing may be
+        // created in a decoy) and after (narrowing, not closing, the window;
+        // the ancestor check in `Store::open` is what closes it).
+        store.check_unmoved()?;
         let db = store.path().join("index.db");
         let conn = Connection::open(&db).map_err(|e| wrap_db(e, &db))?;
+        store.check_unmoved()?;
         conn.busy_timeout(Duration::from_millis(5000))?;
+        // A hostile or damaged database must not run SQL functions through
+        // its schema, nor have its shadow tables rewritten.
+        conn.pragma_update(None, "trusted_schema", "OFF")?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
         // Readers must not block the single writer or vice versa; the mode is
         // persisted in the file, so this is a no-op on later opens.
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
@@ -126,8 +138,22 @@ impl Index {
 
     /// Value of `PRAGMA <name>` on this index's own connection, as text.
     #[doc(hidden)]
-    pub fn pragma(&self, _name: &str) -> Result<String, StoreError> {
-        todo!("step 2 rework: test seam for per-connection settings")
+    pub fn pragma(&self, name: &str) -> Result<String, StoreError> {
+        // A pragma name cannot be a bound parameter, so it is restricted
+        // instead.
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(StoreError::Corrupt(format!("invalid pragma name {name:?}")));
+        }
+        let v: Value = self
+            .conn
+            .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?;
+        Ok(match v {
+            Value::Integer(i) => i.to_string(),
+            Value::Real(f) => f.to_string(),
+            Value::Text(t) => t,
+            Value::Blob(b) => crate::escape::escape(&b),
+            Value::Null => String::new(),
+        })
     }
 
     /// No migrations: an unknown version is refused rather than guessed at.
