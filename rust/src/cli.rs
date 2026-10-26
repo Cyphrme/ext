@@ -253,12 +253,20 @@ fn register(store: &Store, path: &Path, fmt: Fmt, w: &mut impl Write) -> Result<
     }
     let root = RegPath::from_bytes(canon.as_os_str().as_bytes())
         .map_err(|kind| CliError::BadRoot { path: canon, kind })?;
+    let already = store.registry()?.contains(&root);
     store.edit_registry(&lock, |v| {
         if !v.contains(&root) {
             v.push(root.clone());
         }
     })?;
     let idx = Index::open(store)?;
+    // Re-registering is the operator vouching for the root's current
+    // filesystem (its id can change legitimately, e.g. after a remount).
+    if already {
+        if let Ok(id) = crate::walk::root_id(&root) {
+            idx.set_root_id(&root, id)?;
+        }
+    }
     let opts = Opts {
         only: Some(root),
         ..Opts::default()

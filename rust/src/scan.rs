@@ -125,6 +125,7 @@ pub fn run_hooked(
         let mut rs = RootScan {
             idx,
             opts,
+            roots: &roots,
             summary: &mut summary,
             after_chunk: &mut *after_chunk,
             out: &mut *out,
@@ -149,6 +150,7 @@ enum Op {
 struct RootScan<'a> {
     idx: &'a Index,
     opts: &'a Opts,
+    roots: &'a [RegPath],
     summary: &'a mut Summary,
     after_chunk: &'a mut dyn FnMut(&[u8], u64),
     out: &'a mut dyn FnMut(Report),
@@ -218,6 +220,8 @@ fn confirmed_absent(rootfd: &OwnedFd, root: &RegPath, path: &[u8]) -> bool {
 impl RootScan<'_> {
     fn scan(&mut self, root: &RegPath, store_id: (u64, u64)) -> Result<(), StoreError> {
         let idx = self.idx;
+        // Registered roots strictly inside this one belong to their own scan.
+        let nested = self.nested_roots(root);
         let mut id_err: Option<StoreError> = None;
         walk_checked(
             root,
@@ -239,6 +243,7 @@ impl RootScan<'_> {
                     ))
                 }
             },
+            &|p| nested.contains(p),
             &mut |_| {},
             &mut |ev| {
                 if self.fatal.is_none() {
@@ -265,6 +270,9 @@ impl RootScan<'_> {
         };
         let mut gone = Vec::new();
         for p in stored {
+            if covered(&nested, &p) {
+                continue;
+            }
             let kind = if self.root_gone {
                 ReportKind::Missing
             } else if self.seen.contains(&p) || covered(&self.unverified, &p) {
@@ -292,6 +300,19 @@ impl RootScan<'_> {
                 .batch(|ix| chunk.iter().try_for_each(|p| ix.remove(p)))?;
         }
         Ok(())
+    }
+
+    fn nested_roots(&self, root: &RegPath) -> HashSet<Vec<u8>> {
+        let mut prefix = root.as_bytes().to_vec();
+        if prefix != b"/" {
+            prefix.push(b'/');
+        }
+        self.roots
+            .iter()
+            .map(|r| r.as_bytes())
+            .filter(|r| r.starts_with(&prefix) && *r != root.as_bytes())
+            .map(<[u8]>::to_vec)
+            .collect()
     }
 
     fn report(

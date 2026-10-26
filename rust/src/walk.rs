@@ -74,6 +74,8 @@ struct Ctx<'a> {
     /// Wrong on btrfs subvolumes, hence only a fallback.
     use_dev: bool,
     stack: Vec<Pending>,
+    /// Paths of other registered roots: each is walked by its own scan only.
+    skip: &'a dyn Fn(&[u8]) -> bool,
     before_open: &'a mut dyn FnMut(&[u8]),
     visit: &'a mut dyn FnMut(Event),
 }
@@ -112,6 +114,18 @@ fn changed(what: &str) -> io::Error {
     ))
 }
 
+/// The filesystem identity `walk` would record for `root` right now.
+pub fn root_id(root: &RegPath) -> io::Result<RootId> {
+    let fd = openat2(
+        CWD,
+        root.as_bytes(),
+        DIR_FLAGS,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )?;
+    Ok(RootId(fstatvfs(&fd)?.f_fsid))
+}
+
 /// Every descent is relative to a held descriptor, so no component can be
 /// swapped for a symlink after it was checked.
 pub fn walk(root: &RegPath, store_id: (u64, u64), visit: &mut dyn FnMut(Event)) {
@@ -127,7 +141,14 @@ pub fn walk_hooked(
     before_open: &mut dyn FnMut(&[u8]),
     visit: &mut dyn FnMut(Event),
 ) {
-    walk_checked(root, store_id, &mut |_| Ok(()), before_open, visit)
+    walk_checked(
+        root,
+        store_id,
+        &mut |_| Ok(()),
+        &|_| false,
+        before_open,
+        visit,
+    )
 }
 
 /// As [`walk_hooked`], and `check` sees the root's filesystem identity once
@@ -136,6 +157,7 @@ pub(crate) fn walk_checked(
     root: &RegPath,
     store_id: (u64, u64),
     check: &mut dyn FnMut(RootId) -> io::Result<()>,
+    skip: &dyn Fn(&[u8]) -> bool,
     before_open: &mut dyn FnMut(&[u8]),
     visit: &mut dyn FnMut(Event),
 ) {
@@ -179,6 +201,7 @@ pub(crate) fn walk_checked(
         root_uid: st.stx_uid,
         use_dev,
         stack: Vec::new(),
+        skip,
         before_open,
         visit,
     };
@@ -189,6 +212,12 @@ pub(crate) fn walk_checked(
         (ctx.before_open)(&path);
         let fd = match openat(&p.parent.fd, &p.name, DIR_FLAGS, Mode::empty()) {
             Ok(fd) => fd,
+            // O_NOFOLLOW|O_DIRECTORY on a name swapped for a symlink or a
+            // file fails with ELOOP or ENOTDIR.
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                (ctx.visit)(Event::Unstable(path, changed("directory")));
+                continue;
+            }
             Err(e) => {
                 (ctx.visit)(Event::Error(path, e.into()));
                 continue;
@@ -284,7 +313,7 @@ fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
     match FileType::from_raw_mode(st.stx_mode.into()) {
         FileType::Symlink => (ctx.visit)(Event::Symlink(path)),
         FileType::Directory => {
-            if id == ctx.store_id {
+            if id == ctx.store_id || (ctx.skip)(&path) {
                 return;
             }
             let child_mnt = if ctx.use_dev { id.0 } else { st.stx_mnt_id };
