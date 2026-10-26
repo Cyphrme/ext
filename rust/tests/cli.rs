@@ -397,7 +397,7 @@ fn check_excluded_and_subextant() {
     let fx = Fx::new();
     let f = fx.write("sub/f", b"inside");
     assert_eq!(fx.check().code, 0);
-    fs::create_dir(fx.tree.join("sub/.ext")).unwrap();
+    Store::init_extant(&fx.tree.join("sub")).unwrap(); // only a real store makes a sub-extant
     let o = fx.check();
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert_eq!(status_lines(&o, "EXCLUDED")[0][1], p_bytes(&f));
