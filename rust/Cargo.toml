@@ -9,6 +9,9 @@ publish = false
 sha2 = "0.10"
 data-encoding = "2"
 thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
