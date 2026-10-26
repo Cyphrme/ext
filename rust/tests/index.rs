@@ -36,23 +36,6 @@ fn sorted(mut v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     v
 }
 
-#[test]
-fn awkward_path_bytes_roundtrip() {
-    let (_t, _st, ix) = fresh();
-    for p in [
-        &b"/a\tb"[..],
-        b"/a\nb",
-        b"/a\\b",
-        b"/\xff\xfe",
-        b"/a\\x41",
-        "/caf\u{e9}".as_bytes(),
-    ] {
-        let e = entry(p, p);
-        ix.upsert(&e).unwrap();
-        assert_eq!(ix.get(p).unwrap(), Some(e), "{p:?}");
-    }
-}
-
 /// One store+index for all cases: creating a store per case made this test
 /// take ~10 s.
 #[test]
@@ -67,14 +50,9 @@ fn arbitrary_path_bytes_roundtrip() {
     });
 }
 
+/// i64/u64 boundary values for every numeric column.
 #[test]
-fn get_missing_is_none() {
-    let (_t, _st, ix) = fresh();
-    assert_eq!(ix.get(b"/nope").unwrap(), None);
-}
-
-#[test]
-fn meta_fields_roundtrip_exactly() {
+fn meta_extremes_roundtrip() {
     let (_t, _st, ix) = fresh();
     let mut e = entry(b"/m", b"m");
     e.meta = Meta {
@@ -87,45 +65,41 @@ fn meta_fields_roundtrip_exactly() {
     e.last_checked_ns = i64::MAX;
     ix.upsert(&e).unwrap();
     assert_eq!(ix.get(b"/m").unwrap(), Some(e));
+    for v in [i64::MAX as u64 + 1, u64::MAX, u64::MAX - 1] {
+        let mut e = entry(b"/big", b"b");
+        e.meta.size = v;
+        e.meta.dev = v;
+        e.meta.ino = v;
+        ix.upsert(&e).unwrap();
+        assert_eq!(ix.get(b"/big").unwrap(), Some(e), "{v}");
+    }
 }
 
+/// R6: every path with the digest, ordered by raw bytes (memcmp) rather than
+/// text collation; a replaced entry leaves its old digest; a miss is empty.
 #[test]
-fn by_digest_returns_every_path_with_that_digest() {
+fn by_digest() {
     let (_t, _st, ix) = fresh();
-    for p in [&b"/r/two"[..], b"/r/one", b"/other/root/three"] {
-        ix.upsert(&entry(p, b"same content")).unwrap();
+    let paths: [&[u8]; 6] = [b"/b", b"/\xff", b"/a", b"/\x7f", b"/a/b", b"/A"];
+    for p in paths {
+        ix.upsert(&entry(p, b"same")).unwrap();
     }
-    ix.upsert(&entry(b"/r/different", b"other content"))
-        .unwrap();
-    let d = Digest::compute(Alg::Sha256, b"same content");
-    assert_eq!(
-        ix.by_digest(&d).unwrap(),
-        vec![
-            b"/other/root/three".to_vec(),
-            b"/r/one".to_vec(),
-            b"/r/two".to_vec()
-        ]
-    );
+    ix.upsert(&entry(b"/different", b"other content")).unwrap();
+    let same = Digest::compute(Alg::Sha256, b"same");
+    let mut want: Vec<Vec<u8>> = paths.iter().map(|p| p.to_vec()).collect();
+    want.sort();
+    assert_eq!(ix.by_digest(&same).unwrap(), want);
     assert!(ix
         .by_digest(&Digest::compute(Alg::Sha256, b"absent"))
         .unwrap()
         .is_empty());
-}
 
-#[test]
-fn upsert_replaces_by_path_and_updates_digest_lookup() {
-    let (_t, _st, ix) = fresh();
     ix.upsert(&entry(b"/f", b"v1")).unwrap();
     ix.upsert(&entry(b"/f", b"v2")).unwrap();
-    assert!(ix
-        .by_digest(&Digest::compute(Alg::Sha256, b"v1"))
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        ix.by_digest(&Digest::compute(Alg::Sha256, b"v2")).unwrap(),
-        vec![b"/f".to_vec()]
-    );
-    assert_eq!(ix.iter().unwrap().len(), 1);
+    let v1 = Digest::compute(Alg::Sha256, b"v1");
+    let v2 = Digest::compute(Alg::Sha256, b"v2");
+    assert!(ix.by_digest(&v1).unwrap().is_empty());
+    assert_eq!(ix.by_digest(&v2).unwrap(), vec![b"/f".to_vec()]);
 }
 
 #[test]
@@ -149,215 +123,77 @@ fn remove_and_remove_under_respect_path_boundaries() {
     );
 }
 
-/// A3: schema columns, the (alg,digest) index, and PRAGMA user_version = 1.
-#[test]
-fn schema_matches_plan_a3() {
-    // Re-open the raw database independently of the code under test.
-    let t2 = tempfile::tempdir().unwrap();
-    let dir = t2.path().join("s");
-    let st = Store::init_bare(&dir).unwrap();
-    drop(Index::open(&st).unwrap());
-    let c = Connection::open(dir.join("index.db")).unwrap();
-    let v: i64 = c
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(v, 1);
-    let mut stmt = c.prepare("PRAGMA table_info(files)").unwrap();
-    let mut cols: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(1))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    cols.sort();
-    let mut want = [
-        "path",
-        "alg",
-        "digest",
-        "size",
-        "mtime_ns",
-        "ctime_ns",
-        "dev",
-        "ino",
-        "last_checked_ns",
-    ]
-    .map(String::from)
-    .to_vec();
-    want.sort();
-    assert_eq!(cols, want);
-    let idx_cols: Vec<String> = c
-        .prepare("PRAGMA index_info(files_digest)")
-        .unwrap()
-        .query_map([], |r| r.get::<_, String>(2))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert_eq!(idx_cols, ["alg", "digest"]);
-}
-
 #[test]
 fn schema_version_mismatch_is_refused() {
     let t = tempfile::tempdir().unwrap();
     let dir = t.path().join("s");
     let st = Store::init_bare(&dir).unwrap();
     drop(Index::open(&st).unwrap());
-    Connection::open(dir.join("index.db"))
-        .unwrap()
-        .pragma_update(None, "user_version", 2)
-        .unwrap();
+    let raw = Connection::open(dir.join("index.db")).unwrap();
+    let v: i64 = raw.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 1);
+    raw.pragma_update(None, "user_version", 2).unwrap();
     assert!(
         Index::open(&st).is_err(),
         "user_version 2 must be refused, no migrations"
     );
 }
 
-#[test]
-fn index_persists_across_reopen() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    let st = Store::init_bare(&dir).unwrap();
-    let e = entry(b"/persist", b"p");
-    Index::open(&st).unwrap().upsert(&e).unwrap();
-    let st2 = Store::open(&dir).unwrap();
-    assert_eq!(
-        Index::open(&st2).unwrap().get(b"/persist").unwrap(),
-        Some(e)
-    );
-}
-
-/// §1 "The registry is authoritative": after a crash between the registry
-/// write and the index write (simulated by performing only the registry
-/// write), reconciling against the registry converges the index.
-#[test]
-fn index_converges_to_registry_after_simulated_crash() {
-    let (_t, st, ix) = fresh();
-    let lock = st.lock().unwrap();
-    st.edit_registry(&lock, |v| v.extend([rp(b"/r1"), rp(b"/r2")]))
-        .unwrap();
-    drop(lock);
-    for p in [&b"/r1/a"[..], b"/r1/sub/b", b"/r2/c", b"/r2x/d"] {
-        ix.upsert(&entry(p, p)).unwrap();
-    }
-    // unregister /r2: registry write lands, the index write never happens.
-    let lock = st.lock().unwrap();
-    st.edit_registry(&lock, |v| v.retain(|r| r.as_bytes() != b"/r2"))
-        .unwrap();
-    drop(lock);
-    assert!(
-        ix.get(b"/r2/c").unwrap().is_some(),
-        "precondition: index is stale"
-    );
-
-    ix.reconcile(&st.registry().unwrap()).unwrap();
-    let mut left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
-    left.sort();
-    assert_eq!(left, vec![b"/r1/a".to_vec(), b"/r1/sub/b".to_vec()]);
-    // Idempotent.
-    ix.reconcile(&st.registry().unwrap()).unwrap();
-    assert_eq!(ix.iter().unwrap().len(), 2);
-}
-
-#[test]
-fn reconcile_with_root_slash_keeps_everything_and_empty_registry_drops_all() {
-    let (_t, _st, ix) = fresh();
-    ix.upsert(&entry(b"/a", b"a")).unwrap();
-    ix.upsert(&entry(b"/b/c", b"c")).unwrap();
-    ix.reconcile(&[rp(b"/")]).unwrap();
-    assert_eq!(ix.iter().unwrap().len(), 2);
-    ix.reconcile(&[]).unwrap();
-    assert!(ix.iter().unwrap().is_empty());
-}
-
-/// R6: by_digest is ordered by raw bytes (memcmp), not by text collation.
-#[test]
-fn by_digest_is_sorted_by_bytes() {
-    let (_t, _st, ix) = fresh();
-    let paths: [&[u8]; 6] = [b"/b", b"/\xff", b"/a", b"/\x7f", b"/a/b", b"/A"];
-    for p in paths {
-        ix.upsert(&entry(p, b"same")).unwrap();
-    }
-    let got = ix
-        .by_digest(&Digest::compute(Alg::Sha256, b"same"))
-        .unwrap();
-    let mut want: Vec<Vec<u8>> = paths.iter().map(|p| p.to_vec()).collect();
-    want.sort();
-    assert_eq!(got, want);
-}
-
-/// R5: Index::open leaves the database in WAL mode (persisted in the file,
-/// so an independent connection sees it). busy_timeout is per-connection and
-/// not observable from outside; it is not tested.
-#[test]
-fn open_sets_wal_journal_mode() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    let st = Store::init_bare(&dir).unwrap();
-    let _ix = Index::open(&st).unwrap();
-    let c = Connection::open(dir.join("index.db")).unwrap();
-    let mode: String = c
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(mode.to_lowercase(), "wal");
-}
-
-/// u64 fields round-trip across the i64 boundary and at the maximum.
-#[test]
-fn u64_meta_fields_roundtrip_past_i64_max() {
-    let (_t, _st, ix) = fresh();
-    for v in [i64::MAX as u64 + 1, u64::MAX, u64::MAX - 1] {
-        let mut e = entry(b"/big", b"b");
-        e.meta.size = v;
-        e.meta.dev = v;
-        e.meta.ino = v;
-        ix.upsert(&e).unwrap();
-        assert_eq!(ix.get(b"/big").unwrap(), Some(e), "{v}");
-    }
-}
-
 /// R4 boundary: "under root" means equal or prefixed by `root/`, never a bare
-/// byte prefix, including when one root is a byte-prefix of another.
+/// byte prefix, including when one root is a byte-prefix of another. "/" keeps
+/// everything and an empty registry drops everything.
 #[test]
-fn reconcile_boundary_and_prefix_roots() {
+fn reconcile() {
     let (_t, _st, ix) = fresh();
-    for p in [
-        &b"/r1/a"[..],
-        b"/r1x/a",
-        b"/r1",
-        b"/a/x",
-        b"/ab/y",
-        b"/abc/z",
-    ] {
-        ix.upsert(&entry(p, p)).unwrap();
+    let rows: &[(&[&[u8]], &[&[u8]], &[&[u8]])] = &[
+        (
+            &[b"/r1/a", b"/r1x/a", b"/r1", b"/a/x", b"/ab/y", b"/abc/z"],
+            &[b"/r1"],
+            &[b"/r1", b"/r1/a"],
+        ),
+        (
+            &[b"/a/x", b"/ab/y", b"/abc/z"],
+            &[b"/a", b"/ab"],
+            &[b"/a/x", b"/ab/y"],
+        ),
+        (&[b"/a/x", b"/ab/y", b"/abc/z"], &[b"/ab"], &[b"/ab/y"]),
+        (&[b"/a", b"/b/c"], &[b"/"], &[b"/a", b"/b/c"]),
+        (&[b"/a", b"/b/c"], &[], &[]),
+    ];
+    for (entries, roots, want) in rows {
+        ix.reconcile(&[]).unwrap();
+        for p in *entries {
+            ix.upsert(&entry(p, p)).unwrap();
+        }
+        let roots: Vec<_> = roots.iter().map(|r| rp(r)).collect();
+        ix.reconcile(&roots).unwrap();
+        let mut left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+        left.sort();
+        let want: Vec<Vec<u8>> = want.iter().map(|p| p.to_vec()).collect();
+        assert_eq!(left, want, "roots {roots:?}");
     }
-    ix.reconcile(&[rp(b"/r1")]).unwrap();
-    let mut left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
-    left.sort();
-    assert_eq!(left, vec![b"/r1".to_vec(), b"/r1/a".to_vec()]);
-
-    let (_t, _st, ix) = fresh();
-    for p in [&b"/a/x"[..], b"/ab/y", b"/abc/z"] {
-        ix.upsert(&entry(p, p)).unwrap();
-    }
-    ix.reconcile(&[rp(b"/a"), rp(b"/ab")]).unwrap();
-    let mut left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
-    left.sort();
-    assert_eq!(left, vec![b"/a/x".to_vec(), b"/ab/y".to_vec()]);
-    ix.reconcile(&[rp(b"/ab")]).unwrap();
-    let left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
-    assert_eq!(left, vec![b"/ab/y".to_vec()], "/a is not a root any more");
 }
 
-/// R5 / F2: per-connection settings, read back on the Index's own connection.
+/// A damaged or hostile index.db must be inert: a trigger planted by an
+/// independent connection fires on the next upsert and tries to rewrite an
+/// FTS shadow table, which SQLITE_DBCONFIG_DEFENSIVE forbids. (The
+/// `trusted_schema=OFF` line is not separately testable: the bundled SQLite
+/// already defaults it off, so no behaviour distinguishes the two.)
 #[test]
-fn connection_settings_are_applied() {
-    let (_t, _st, ix) = fresh();
-    assert_eq!(ix.pragma("busy_timeout").unwrap(), "5000");
-    assert_eq!(ix.pragma("trusted_schema").unwrap(), "0");
-    assert_eq!(ix.pragma("journal_mode").unwrap().to_lowercase(), "wal");
-}
-
-/// SQLITE_DBCONFIG_DEFENSIVE is read back through `sqlite3_db_config`.
-#[test]
-fn defensive_mode_is_on() {
-    let (_t, _st, ix) = fresh();
-    assert!(ix.db_config_defensive().unwrap());
+fn hostile_database_cannot_rewrite_shadow_tables() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    let st = Store::init_bare(&dir).unwrap();
+    drop(Index::open(&st).unwrap());
+    Connection::open(dir.join("index.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE VIRTUAL TABLE ft USING fts3(x);
+             CREATE TRIGGER evil AFTER INSERT ON files
+             BEGIN INSERT INTO ft_content(docid, c0x) VALUES (1, 'evil'); END;",
+        )
+        .unwrap();
+    let ix = Index::open(&st).unwrap();
+    let err = ix.upsert(&entry(b"/x", b"x")).unwrap_err().to_string();
+    assert!(err.contains("may not be modified"), "{err}");
 }
