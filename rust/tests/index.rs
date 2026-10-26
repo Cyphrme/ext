@@ -180,9 +180,7 @@ fn reconcile() {
 
 /// A damaged or hostile index.db must be inert: a trigger planted by an
 /// independent connection fires on the next upsert and tries to rewrite an
-/// FTS shadow table, which SQLITE_DBCONFIG_DEFENSIVE forbids. (The
-/// `trusted_schema=OFF` line is not separately testable: the bundled SQLite
-/// already defaults it off, so no behaviour distinguishes the two.)
+/// FTS shadow table, which SQLITE_DBCONFIG_DEFENSIVE forbids.
 #[test]
 fn hostile_database_cannot_rewrite_shadow_tables() {
     let t = tempfile::tempdir().unwrap();
@@ -200,4 +198,40 @@ fn hostile_database_cannot_rewrite_shadow_tables() {
     let ix = Index::open(&st).unwrap();
     let err = ix.upsert(&entry(b"/x", b"x")).unwrap_err().to_string();
     assert!(err.contains("may not be modified"), "{err}");
+}
+
+/// `trusted_schema=OFF`: a trigger in a hostile index.db may not call into a
+/// virtual table (here the eponymous `pragma_table_info`), so the next upsert
+/// fails instead of running whatever the schema says.
+#[test]
+fn hostile_database_cannot_use_virtual_tables_from_its_schema() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    let st = Store::init_bare(&dir).unwrap();
+    drop(Index::open(&st).unwrap());
+    Connection::open(dir.join("index.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER evil AFTER INSERT ON files
+             BEGIN SELECT * FROM pragma_table_info('files'); END;",
+        )
+        .unwrap();
+    let ix = Index::open(&st).unwrap();
+    let err = ix.upsert(&entry(b"/x", b"x")).unwrap_err().to_string();
+    assert!(err.contains("unsafe use of virtual table"), "{err}");
+}
+
+/// The index is in WAL mode: persisted in the file, so a plain connection
+/// sees it.
+#[test]
+fn index_db_is_in_wal_mode() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    let st = Store::init_bare(&dir).unwrap();
+    drop(Index::open(&st).unwrap());
+    let mode: String = Connection::open(dir.join("index.db"))
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
 }

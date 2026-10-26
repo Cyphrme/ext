@@ -45,3 +45,36 @@ fn error_mid_batch_rolls_back_to_prior_state() {
     ix.batch(|ix| ix.upsert(&entry(1))).unwrap();
     assert_eq!(ix.iter().unwrap().len(), 2);
 }
+
+// IMMEDIATE, not DEFERRED: the write lock is taken before the closure runs,
+// so a second connection's batch waits (busy_timeout) instead of starting,
+// then proceeds once the first commits. A deferred BEGIN would run its
+// closure at once.
+#[test]
+fn second_batch_waits_for_the_first() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (_t, st, first) = fresh();
+    let second = Index::open(&st).unwrap();
+    let (started, started_rx) = mpsc::channel();
+    let (done, done_rx) = mpsc::channel();
+    first
+        .batch(|ix| {
+            ix.upsert(&entry(1))?;
+            std::thread::spawn(move || {
+                let r = second.batch(|ix| {
+                    started.send(()).unwrap();
+                    ix.upsert(&entry(2))
+                });
+                done.send(r.is_ok()).unwrap();
+            });
+            assert!(
+                started_rx.recv_timeout(Duration::from_millis(400)).is_err(),
+                "second batch ran while the first held the write lock"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    assert_eq!(first.iter().unwrap().len(), 2);
+}
