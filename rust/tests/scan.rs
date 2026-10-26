@@ -849,7 +849,7 @@ x --d /work/store list
 }
 
 // The walk is iterative and holds no descriptor per level: a chain far deeper
-// than the stack or the descriptor limit allows for recursion is walked.
+// than the stack, and than 256 descriptors, allows for recursion is walked.
 #[test]
 fn very_deep_tree_is_walked_without_crashing() {
     use rustix::fs::{mkdirat, openat, unlinkat, AtFlags, Mode, OFlags, CWD};
@@ -887,8 +887,14 @@ fn very_deep_tree_is_walked_without_crashing() {
     rustix::io::write(&leaf, b"x").unwrap();
     drop(leaf);
 
-    // A child process, so a stack overflow fails this test, not the binary.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ext"))
+    // A child process, so a stack overflow fails this test, not the binary;
+    // and with only 256 descriptors, so one descriptor per level fails it.
+    let out = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "ulimit -n 256 && exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_ext"),
+        ])
         .env_remove("EXTANT_DIR")
         .arg("--d")
         .arg(e.base.join("store"))
@@ -916,4 +922,20 @@ fn very_deep_tree_is_walked_without_crashing() {
         "{}",
         &stdout[..stdout.len().min(300)]
     );
+}
+
+// A `.ext` is a store only with all three files: one holding just a registry
+// is ordinary content, walked and indexed.
+#[test]
+fn dot_ext_with_only_a_registry_is_walked() {
+    let e = env();
+    fs::create_dir_all(e.root.join("d/.ext")).unwrap();
+    fs::write(e.root.join("d/f"), b"f").unwrap();
+    fs::write(e.root.join("d/.ext/registry"), b"").unwrap();
+    let (s, reps) = scan(&e, &Opts::default());
+    let mut new = kinds(&reps, K::New);
+    new.sort();
+    let want = [b(&e.root.join("d/.ext/registry")), b(&e.root.join("d/f"))];
+    assert_eq!(new, want);
+    assert_eq!(s.subextant, 0);
 }
