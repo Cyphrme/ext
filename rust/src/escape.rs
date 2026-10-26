@@ -1,7 +1,8 @@
 //! Path escaping shared by command output and the registry.
 
+/// Exactly Unicode's Bidi_Control property (12 code points).
 fn is_bidi_control(u: u32) -> bool {
-    matches!(u, 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
+    matches!(u, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
 fn push_hex(out: &mut String, b: u8) {

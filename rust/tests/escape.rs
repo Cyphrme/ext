@@ -5,7 +5,11 @@ use proptest::prelude::*;
 
 fn is_forbidden(c: char) -> bool {
     let u = c as u32;
-    u < 0x20 || u == 0x7F || (0x80..=0x9F).contains(&u)
+    u < 0x20
+        || u == 0x7F
+        || (0x80..=0x9F).contains(&u)
+        // Unicode Bidi_Control: all 12 code points
+        || matches!(u, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
 proptest! {
@@ -120,6 +124,7 @@ fn unescape_is_uppercase_only() {
 #[test]
 fn bidi_controls_are_escaped_and_roundtrip() {
     let cases = [
+        ('\u{061C}', "\\xD8\\x9C"),
         ('\u{200E}', "\\xE2\\x80\\x8E"),
         ('\u{200F}', "\\xE2\\x80\\x8F"),
         ('\u{202A}', "\\xE2\\x80\\xAA"),
@@ -138,7 +143,7 @@ fn bidi_controls_are_escaped_and_roundtrip() {
         assert_eq!(unescape(want), Ok(s.into_bytes()));
     }
     // neighbours stay literal
-    for c in ['\u{200D}', '\u{2010}', '\u{202F}', '\u{2065}', '\u{206A}'] {
+    for c in ['\u{061B}', '\u{061D}', '\u{200D}', '\u{2010}', '\u{202F}', '\u{2065}', '\u{206A}'] {
         assert_eq!(escape(c.to_string().as_bytes()), c.to_string());
     }
 }
