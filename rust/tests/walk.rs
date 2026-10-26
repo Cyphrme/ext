@@ -263,3 +263,54 @@ fn entry_swapped_before_open_is_unstable() {
     );
     assert_eq!(ev, vec![Ev::Unstable(b(&f))]);
 }
+
+/// A file swapped for a symlink or a directory, or a directory swapped for a
+/// symlink, between the metadata read and the open is Unstable, never an
+/// Error and never followed.
+#[test]
+fn entry_swapped_for_another_type_is_unstable() {
+    type Swap = fn(&Path, &Path);
+    let cases: [(&str, bool, Swap); 3] = [
+        ("file->symlink", false, |p, outside| {
+            fs::remove_file(p).unwrap();
+            symlink(outside, p).unwrap();
+        }),
+        ("file->dir", false, |p, _| {
+            fs::remove_file(p).unwrap();
+            fs::create_dir(p).unwrap();
+        }),
+        ("dir->symlink", true, |p, outside| {
+            fs::remove_dir(p).unwrap();
+            symlink(outside, p).unwrap();
+        }),
+    ];
+    for (name, is_dir, swap) in cases {
+        let (_t, d) = canon_tmp();
+        let (root, outside) = (d.join("r"), d.join("outside"));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let victim = root.join("v");
+        if is_dir {
+            fs::create_dir(&victim).unwrap();
+        } else {
+            fs::write(&victim, b"x").unwrap();
+        }
+        let mut ev = Vec::new();
+        walk_hooked(
+            &rp(&root),
+            no_store(),
+            &mut |p| {
+                if p == b(&victim) {
+                    swap(&victim, &outside);
+                }
+            },
+            &mut |e| match e {
+                Event::Unstable(p, _) => ev.push(Ev::Unstable(p)),
+                Event::Error(p, _) => ev.push(Ev::Error(p)),
+                Event::File { path, .. } => ev.push(Ev::File(path)),
+                _ => {}
+            },
+        );
+        assert_eq!(ev, vec![Ev::Unstable(b(&victim))], "{name}");
+    }
+}
