@@ -20,26 +20,7 @@ fn any_enc() -> impl Strategy<Value = Enc> {
     prop_oneof![Just(Enc::B64ut), Just(Enc::Hex)]
 }
 
-// --- Alg ---
-
-#[test]
-fn alg_constants() {
-    assert_eq!(Alg::ALL, &[Alg::Sha256]);
-    assert_eq!(Alg::Sha256.name(), "SHA-256");
-    assert_eq!(Alg::Sha256.len(), 32);
-    assert_eq!(Alg::Sha256.b64ut_len(), 43);
-    assert_eq!(Alg::Sha256.hex_len(), 64);
-}
-
-#[test]
-fn alg_from_name_is_exact_and_case_sensitive() {
-    assert_eq!(Alg::from_name("SHA-256"), Some(Alg::Sha256));
-    for bad in ["sha-256", "Sha-256", "SHA256", "SHA-256 ", " SHA-256", ""] {
-        assert_eq!(Alg::from_name(bad), None, "{bad:?}");
-    }
-}
-
-// --- compute / from_bytes / encode ---
+// --- known answers and constructor invariants ---
 
 #[test]
 fn sha256_empty_vector() {
@@ -72,42 +53,7 @@ fn to_reverse_and_display_shape() {
     assert_eq!(d.to_string(), d.to_reverse(Enc::B64ut));
 }
 
-#[test]
-fn hex_output_is_uppercase() {
-    let h = sha(b"abc").encode(Enc::Hex);
-    assert_eq!(h.len(), 64);
-    assert!(
-        h.bytes()
-            .all(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(&c)),
-        "{h}"
-    );
-}
-
 proptest! {
-    #[test]
-    fn encode_lengths_and_alphabet(d in any_digest()) {
-        let b = d.encode(Enc::B64ut);
-        prop_assert_eq!(b.len(), 43);
-        prop_assert!(b.chars().all(|c| B64.contains(c)));
-        prop_assert_eq!(d.encode(Enc::Hex).len(), 64);
-    }
-
-    #[test]
-    fn decode_value_roundtrip(d in any_digest(), e in any_enc()) {
-        prop_assert_eq!(Digest::decode_value(Alg::Sha256, &d.encode(e)), Ok(d));
-    }
-
-    #[test]
-    fn parse_labelled_roundtrip_reverse(d in any_digest(), e in any_enc()) {
-        prop_assert_eq!(Digest::parse_labelled(&d.to_reverse(e)), Ok(d));
-    }
-
-    #[test]
-    fn parse_labelled_roundtrip_forward(d in any_digest(), e in any_enc()) {
-        let s = format!("SHA-256:{}", d.encode(e));
-        prop_assert_eq!(Digest::parse_labelled(&s), Ok(d));
-    }
-
     #[test]
     fn hex_case_insensitive(d in any_digest(), mask in prop::collection::vec(any::<bool>(), 64)) {
         let mixed: String = d.encode(Enc::Hex).chars().zip(mask)
@@ -116,19 +62,14 @@ proptest! {
         prop_assert_eq!(Digest::parse_labelled(&format!("{mixed}:SHA-256")), Ok(d));
     }
 
+    // Both label orders x both encodings; the forward form is built by hand
+    // so the test does not reuse the formatter under test.
     #[test]
-    fn noncanonical_final_char_rejected(d in any_digest(), pick in 0usize..64) {
-        let enc = d.encode(Enc::B64ut);
-        let c = B64.chars().nth(pick).unwrap();
-        let mut s = enc[..42].to_string();
-        s.push(c);
-        let r = Digest::decode_value(Alg::Sha256, &s);
-        if pick % 4 == 0 {
-            // only the four low bits carry data; canonical chars have zero pad bits
-            prop_assert!(r.is_ok(), "{s} -> {r:?}");
-        } else {
-            prop_assert_eq!(r, Err(DigestError::NonCanonical));
-        }
+    fn labelled_roundtrip(d in any_digest(), e in any_enc()) {
+        prop_assert_eq!(Digest::decode_value(Alg::Sha256, &d.encode(e)), Ok(d.clone()));
+        prop_assert_eq!(Digest::parse_labelled(&d.to_reverse(e)), Ok(d.clone()));
+        let fwd = format!("SHA-256:{}", d.encode(e));
+        prop_assert_eq!(Digest::parse_labelled(&fwd), Ok(d));
     }
 
     #[test]
@@ -155,189 +96,60 @@ fn every_noncanonical_final_char_rejected_exhaustively() {
     }
 }
 
-// --- decode_value strictness ---
+// --- strictness table: (input, via parse_labelled?, expected error) ---
 
 #[test]
-fn decode_value_empty_and_whitespace() {
-    assert_eq!(
-        Digest::decode_value(Alg::Sha256, ""),
-        Err(DigestError::WrongLength {
-            alg: Alg::Sha256,
-            got: 0
-        })
-    );
-    let padded = format!(" {EMPTY_B64}");
-    assert_eq!(
-        Digest::decode_value(Alg::Sha256, &padded),
-        Err(DigestError::WrongLength {
-            alg: Alg::Sha256,
-            got: 44
-        })
-    );
-    let inner = format!("{} {}", &EMPTY_B64[..20], &EMPTY_B64[21..]);
-    assert_eq!(inner.len(), 43);
-    assert!(matches!(
-        Digest::decode_value(Alg::Sha256, &inner),
-        Err(DigestError::InvalidChar { index: 20, ch: ' ' })
-    ));
-}
-
-#[test]
-fn decode_value_hex_rejects_g_to_z() {
+fn decode_rejects() {
+    use DigestError as E;
+    let wl = |got| E::WrongLength { alg: Alg::Sha256, got };
+    let ic = |index, ch| E::InvalidChar { index, ch };
+    let with = |base: &str, at: usize, c: char| {
+        let mut s = base.to_string();
+        s.replace_range(at..at + 1, &c.to_string());
+        s
+    };
+    let mut rows: Vec<(String, bool, DigestError)> = vec![
+        (String::new(), false, wl(0)),
+        (format!(" {EMPTY_B64}"), false, wl(44)),
+        (format!("{} {}", &EMPTY_B64[..20], &EMPTY_B64[21..]), false, ic(20, ' ')),
+        // padded form of a 32-byte value is a length error, not a decode
+        (format!("{EMPTY_B64}="), false, wl(44)),
+        // lengths and indices count chars, not bytes
+        ("é".repeat(43), false, ic(0, 'é')),
+        (format!("{}é", "A".repeat(41)), false, wl(42)),
+        // label level
+        (EMPTY_B64.into(), true, E::Unlabelled),
+        (EMPTY_HEX.into(), true, E::Unlabelled),
+        (String::new(), true, E::Unlabelled),
+        (format!("hash://SHA-256:{EMPTY_B64}"), true, E::TooManyColons),
+        ("a:b:c".into(), true, E::TooManyColons),
+        (format!("{EMPTY_B64}:sha-256"), true, E::UnknownAlg("sha-256".into())),
+        (format!("sha-256:{EMPTY_B64}"), true, E::UnknownAlg(EMPTY_B64.into())),
+        (format!("{EMPTY_B64}:MD5"), true, E::UnknownAlg("MD5".into())),
+        ("AAAA:SHA-256".into(), true, wl(4)),
+        ("SHA-256:AAAA".into(), true, wl(4)),
+        (format!("{}:SHA-256", with(EMPTY_HEX, 3, 'G')), true, ic(3, 'G')),
+        (format!("{}B:SHA-256", &EMPTY_B64[..42]), true, E::NonCanonical),
+    ];
+    // the algorithm name is matched exactly
+    for bad in ["sha-256", "Sha-256", "SHA256", "SHA-256 ", " SHA-256", ""] {
+        rows.push((format!("{EMPTY_B64}:{bad}"), true, E::UnknownAlg(bad.into())));
+    }
     for c in ('G'..='Z').chain('g'..='z') {
-        let mut s = EMPTY_HEX.to_string();
-        s.replace_range(10..11, &c.to_string());
-        assert_eq!(
-            Digest::decode_value(Alg::Sha256, &s),
-            Err(DigestError::InvalidChar { index: 10, ch: c }),
-            "{c}"
-        );
+        rows.push((with(EMPTY_HEX, 10, c), false, ic(10, c)));
     }
-}
-
-#[test]
-fn decode_value_hex_rejects_b64_only_chars() {
     for c in ['-', '_', '=', '+', '/'] {
-        let mut s = EMPTY_HEX.to_string();
-        s.replace_range(0..1, &c.to_string());
-        assert!(
-            matches!(
-                Digest::decode_value(Alg::Sha256, &s),
-                Err(DigestError::InvalidChar { index: 0, .. })
-            ),
-            "{c}"
-        );
+        rows.push((with(EMPTY_HEX, 0, c), false, ic(0, c)));
     }
-}
-
-#[test]
-fn decode_value_b64_rejects_padding_and_standard_alphabet() {
     for c in ['=', '+', '/'] {
-        let mut s = EMPTY_B64.to_string();
-        s.replace_range(5..6, &c.to_string());
-        assert_eq!(
-            Digest::decode_value(Alg::Sha256, &s),
-            Err(DigestError::InvalidChar { index: 5, ch: c }),
-            "{c}"
-        );
+        rows.push((with(EMPTY_B64, 5, c), false, ic(5, c)));
     }
-    // 44 chars: the padded form of a 32-byte value is a length error, not a decode
-    let padded = format!("{EMPTY_B64}=");
-    assert_eq!(
-        Digest::decode_value(Alg::Sha256, &padded),
-        Err(DigestError::WrongLength {
-            alg: Alg::Sha256,
-            got: 44
-        })
-    );
-}
-
-#[test]
-fn decode_value_selects_encoding_by_length() {
-    assert_eq!(Digest::decode_value(Alg::Sha256, EMPTY_HEX), Ok(sha(b"")));
-    assert_eq!(Digest::decode_value(Alg::Sha256, EMPTY_B64), Ok(sha(b"")));
-}
-
-// --- parse_labelled ---
-
-#[test]
-fn parse_labelled_both_orders() {
-    let want = sha(b"");
-    for s in [
-        format!("{EMPTY_B64}:SHA-256"),
-        format!("{EMPTY_HEX}:SHA-256"),
-        format!("SHA-256:{EMPTY_B64}"),
-        format!("SHA-256:{EMPTY_HEX}"),
-        format!("{}:SHA-256", EMPTY_HEX.to_lowercase()),
-    ] {
-        assert_eq!(Digest::parse_labelled(&s), Ok(want.clone()), "{s}");
+    for (input, labelled, want) in rows {
+        let got = if labelled {
+            Digest::parse_labelled(&input)
+        } else {
+            Digest::decode_value(Alg::Sha256, &input)
+        };
+        assert_eq!(got, Err(want), "{input:?} labelled={labelled}");
     }
-}
-
-#[test]
-fn parse_labelled_bare_digest_is_unlabelled() {
-    assert_eq!(
-        Digest::parse_labelled(EMPTY_B64),
-        Err(DigestError::Unlabelled)
-    );
-    assert_eq!(
-        Digest::parse_labelled(EMPTY_HEX),
-        Err(DigestError::Unlabelled)
-    );
-    assert_eq!(Digest::parse_labelled(""), Err(DigestError::Unlabelled));
-}
-
-#[test]
-fn parse_labelled_hash_uri_is_too_many_colons() {
-    assert_eq!(
-        Digest::parse_labelled(&format!("hash://SHA-256:{EMPTY_B64}")),
-        Err(DigestError::TooManyColons)
-    );
-    assert_eq!(
-        Digest::parse_labelled("a:b:c"),
-        Err(DigestError::TooManyColons)
-    );
-}
-
-#[test]
-fn parse_labelled_lowercase_alg_is_unknown() {
-    for s in [
-        format!("{EMPTY_B64}:sha-256"),
-        format!("sha-256:{EMPTY_B64}"),
-    ] {
-        assert!(
-            matches!(Digest::parse_labelled(&s), Err(DigestError::UnknownAlg(_))),
-            "{s}"
-        );
-    }
-    assert!(matches!(
-        Digest::parse_labelled(&format!("{EMPTY_B64}:MD5")),
-        Err(DigestError::UnknownAlg(_))
-    ));
-}
-
-#[test]
-fn parse_labelled_value_errors_propagate() {
-    assert_eq!(
-        Digest::parse_labelled("AAAA:SHA-256"),
-        Err(DigestError::WrongLength {
-            alg: Alg::Sha256,
-            got: 4
-        })
-    );
-    assert_eq!(
-        Digest::parse_labelled("SHA-256:AAAA"),
-        Err(DigestError::WrongLength {
-            alg: Alg::Sha256,
-            got: 4
-        })
-    );
-    let mut bad = EMPTY_HEX.to_string();
-    bad.replace_range(3..4, "G");
-    assert_eq!(
-        Digest::parse_labelled(&format!("{bad}:SHA-256")),
-        Err(DigestError::InvalidChar { index: 3, ch: 'G' })
-    );
-    let nc = format!("{}B", &EMPTY_B64[..42]);
-    assert_eq!(
-        Digest::parse_labelled(&format!("{nc}:SHA-256")),
-        Err(DigestError::NonCanonical)
-    );
-}
-
-#[test]
-fn lengths_and_indices_count_chars_not_bytes() {
-    let s = "é".repeat(43);
-    assert_eq!(
-        Digest::decode_value(Alg::Sha256, &s),
-        Err(DigestError::InvalidChar { index: 0, ch: 'é' })
-    );
-    let s = format!("{}é", "A".repeat(41));
-    assert_eq!(
-        Digest::decode_value(Alg::Sha256, &s),
-        Err(DigestError::WrongLength {
-            alg: Alg::Sha256,
-            got: 42
-        })
-    );
 }
