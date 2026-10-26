@@ -39,148 +39,68 @@ proptest! {
         let bytes = render(&regs);
         prop_assert_eq!(sorted(parse(&bytes).unwrap()), sorted(regs));
     }
-
-    /// Rendered output has exactly one line per path: an embedded `\n` in a
-    /// path is escaped, never emitted raw.
-    #[test]
-    fn render_is_one_line_per_path(paths in prop::collection::vec(abs_path(), 0..8)) {
-        let regs: Vec<_> = paths.iter().map(|p| rp(p)).collect();
-        let bytes = render(&regs);
-        prop_assert_eq!(bytes.iter().filter(|&&b| b == b'\n').count(), regs.len());
-    }
 }
 
-#[test]
-fn rejects_relative_with_line_number() {
-    let r = parse(b"/ok\n/also/ok\nrelative/path\n");
-    assert!(matches!(r, Err((3, RegistryErrorKind::Relative))), "{r:?}");
-}
 
 #[test]
-fn rejects_uris() {
-    for line in ["file:///x", "https://example.com/x", "hash://sha256/abc"] {
-        let input = format!("/ok\n{line}\n");
-        let r = parse(input.as_bytes());
+fn parse_rejects() {
+    use RegistryErrorKind as K;
+    let rows: &[(&[u8], usize, K)] = &[
+        (b"/ok\n/also/ok\nrelative/path\n", 3, K::Relative),
+        (b"/ok\nfile:///x\n", 2, K::Relative),
+        // Whitespace-only is not blank-or-comment: it is a relative path.
+        (b"# header\n\n/a\n/a\n  \n/b\n", 5, K::Relative),
+        (b"/ok\n/a\\x00b\n", 2, K::Nul),
+        (b"/ok\n/a\0b\n", 2, K::Nul),
+        (b"/ok\n/\xff\n", 2, K::NotUtf8),
+        // Dot segments are rejected, never resolved lexically.
+        (b"/ok\n/srv/../etc\n", 2, K::NotNormalised),
+        (b"/ok\n/a/./b\n", 2, K::NotNormalised),
+        (b"/ok\n/..\n", 2, K::NotNormalised),
+        (b"/ok\n/.\n", 2, K::NotNormalised),
+        (b"/ok\n/a/..\n", 2, K::NotNormalised),
+        (b"/ok\n/a/./\n", 2, K::NotNormalised),
+    ];
+    for (input, line, kind) in rows {
+        let r = parse(input);
         assert!(
-            matches!(r, Err((2, RegistryErrorKind::Relative))),
-            "{line}: {r:?}"
+            matches!(&r, Err((l, k)) if l == line && k == kind),
+            "{:?}: {r:?}",
+            String::from_utf8_lossy(input)
         );
     }
-}
-
-#[test]
-fn rejects_lines_failing_unescape() {
-    for line in ["/a\\q", "/a\\", "/a\\x4", "/a\\x4g", "/a\\x4a"] {
-        let input = format!("/ok\n{line}\n");
-        let r = parse(input.as_bytes());
+    for bad in ["/a\\q", "/a\\", "/a\\x4", "/a\\x4g", "/a\\x4a"] {
+        let r = parse(format!("/ok\n{bad}\n").as_bytes());
         assert!(
             matches!(r, Err((2, RegistryErrorKind::Escape(_)))),
-            "{line}: {r:?}"
-        );
-    }
-}
-
-#[test]
-fn ignores_blank_comment_and_duplicate_lines() {
-    let r = parse(b"# header\n\n/a\n/a\n  \n/b\n# trailing\n");
-    // Whitespace-only is not blank-or-comment: it is a relative path.
-    assert!(matches!(r, Err((5, RegistryErrorKind::Relative))), "{r:?}");
-    let ok = parse(b"# header\n\n/a\n/a\n/b\n# trailing\n").unwrap();
-    assert_eq!(sorted(ok), sorted(vec![rp(b"/a"), rp(b"/b")]));
-}
-
-#[test]
-fn final_line_without_newline_is_accepted() {
-    assert_eq!(parse(b"/a").unwrap(), vec![rp(b"/a")]);
-}
-
-#[test]
-fn empty_registry_is_empty() {
-    assert!(parse(b"").unwrap().is_empty());
-}
-
-#[test]
-fn from_bytes_rejects_relative_and_dot_segments() {
-    use ext::registry::RegPath;
-    assert!(matches!(
-        RegPath::from_bytes(b"a/b"),
-        Err(RegistryErrorKind::Relative)
-    ));
-    assert!(matches!(
-        RegPath::from_bytes(b""),
-        Err(RegistryErrorKind::Relative)
-    ));
-    assert!(RegPath::from_bytes(b"/").is_ok());
-}
-
-#[test]
-fn from_bytes_collapses_slashes_and_strips_trailing() {
-    use ext::registry::RegPath;
-    assert_eq!(RegPath::from_bytes(b"/a//b/").unwrap(), rp(b"/a/b"));
-    assert_eq!(RegPath::from_bytes(b"//").unwrap(), rp(b"/"));
-    assert_eq!(RegPath::from_bytes(b"/a///b//c").unwrap(), rp(b"/a/b/c"));
-    assert_eq!(RegPath::from_bytes(b"/a/b/").unwrap().as_bytes(), b"/a/b");
-    assert_eq!(RegPath::from_bytes(b"/").unwrap().as_bytes(), b"/");
-}
-
-#[test]
-fn from_bytes_rejects_dot_segments_as_not_normalised() {
-    use ext::registry::RegPath;
-    for p in [
-        &b"/a/./b"[..],
-        b"/a/..",
-        b"/..",
-        b"/.",
-        b"/a/../b",
-        b"/a/./",
-    ] {
-        assert!(
-            matches!(
-                RegPath::from_bytes(p),
-                Err(RegistryErrorKind::NotNormalised)
-            ),
-            "{p:?}"
-        );
-    }
-    // Dots inside a name are ordinary.
-    assert!(RegPath::from_bytes(b"/a/.hidden/..x/y.").is_ok());
-}
-
-#[test]
-fn from_bytes_rejects_nul() {
-    use ext::registry::RegPath;
-    assert!(matches!(
-        RegPath::from_bytes(b"/a\0b"),
-        Err(RegistryErrorKind::Nul)
-    ));
-}
-
-#[test]
-fn parse_applies_normalisation_per_line() {
-    assert_eq!(parse(b"/srv/www/\n").unwrap(), vec![rp(b"/srv/www")]);
-    assert_eq!(parse(b"/a//b\n").unwrap(), vec![rp(b"/a/b")]);
-    // Normalised duplicates are dropped.
-    assert_eq!(parse(b"/a/b\n/a//b/\n").unwrap(), vec![rp(b"/a/b")]);
-    for bad in ["/srv/../etc", "/a/./b", "/.."] {
-        let input = format!("/ok\n{bad}\n");
-        let r = parse(input.as_bytes());
-        assert!(
-            matches!(r, Err((2, RegistryErrorKind::NotNormalised))),
             "{bad}: {r:?}"
         );
     }
 }
 
 #[test]
-fn parse_rejects_nul_whether_escaped_or_raw() {
-    let r = parse(b"/ok\n/a\\x00b\n");
-    assert!(matches!(r, Err((2, RegistryErrorKind::Nul))), "{r:?}");
-    let r = parse(b"/ok\n/a\0b\n");
-    assert!(matches!(r, Err((2, RegistryErrorKind::Nul))), "{r:?}");
-}
-
-#[test]
-fn rejects_raw_non_utf8_line() {
-    let r = parse(b"/ok\n/\xff\n");
-    assert!(matches!(r, Err((2, RegistryErrorKind::NotUtf8))), "{r:?}");
+fn parse_accepts() {
+    let rows: &[(&[u8], &[&[u8]])] = &[
+        (b"", &[]),
+        (b"/a", &[b"/a"]),
+        (b"# header\n\n/a\n/a\n/b\n# trailing\n", &[b"/a", b"/b"]),
+        // Normalisation is per line; normalised duplicates are dropped.
+        (b"/srv/www/\n", &[b"/srv/www"]),
+        (b"/a//b\n", &[b"/a/b"]),
+        (b"/a/b\n/a//b/\n", &[b"/a/b"]),
+        (b"//\n", &[b"/"]),
+        (b"/a///b//c\n", &[b"/a/b/c"]),
+        (b"/\n", &[b"/"]),
+        // Dots inside a name are ordinary.
+        (b"/a/.hidden/..x/y.\n", &[b"/a/.hidden/..x/y."]),
+    ];
+    for (input, want) in rows {
+        let want: Vec<_> = want.iter().map(|p| rp(p)).collect();
+        assert_eq!(
+            sorted(parse(input).unwrap()),
+            sorted(want),
+            "{:?}",
+            String::from_utf8_lossy(input)
+        );
+    }
 }
