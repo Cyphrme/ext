@@ -4,8 +4,8 @@ use crate::hash::meta_of;
 use crate::index::{Meta, RootId};
 use crate::registry::RegPath;
 use rustix::fs::{
-    fstat, makedev, openat, openat2, statx, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags,
-    Statx, StatxFlags, CWD,
+    fstat, fstatvfs, makedev, openat, openat2, statx, AtFlags, Dir, FileType, Mode, OFlags,
+    ResolveFlags, Statx, StatxFlags, CWD,
 };
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -166,10 +166,9 @@ pub(crate) fn walk_checked(
         });
     }
     let root_mnt = if use_dev { dev_of(&st) } else { st.stx_mnt_id };
-    let id = if use_dev {
-        RootId::Dev(root_mnt)
-    } else {
-        RootId::Mount(root_mnt)
+    let id = match fstatvfs(&fd) {
+        Ok(v) => RootId(v.f_fsid),
+        Err(e) => return visit(Event::Error(path, e.into())),
     };
     if let Err(e) = check(id) {
         return visit(Event::Refused(path, e));

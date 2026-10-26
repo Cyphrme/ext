@@ -28,23 +28,23 @@ pub struct Entry {
     pub last_checked_ns: i64,
 }
 
-/// Filesystem identity of a registered root, recorded at its first scan.
-/// A later mismatch means the root was unmounted, mounted over or replaced,
-/// so an apparently empty tree must not be read as mass deletion.
+/// Filesystem identity of a registered root, recorded at its first scan:
+/// the `f_fsid` of `fstatfs` on the root. A later mismatch means the root
+/// was unmounted, mounted over or replaced, so an apparently empty tree must
+/// not be read as mass deletion.
+///
+/// `f_fsid` rather than a mount id or `st_dev`: those are assigned at mount
+/// time and change across reboots, which would refuse every root after each
+/// restart. btrfs and ext4 derive `f_fsid` from the filesystem UUID (and the
+/// subvolume id on btrfs), so it is stable; an unmounted mount point shows
+/// the parent filesystem's value, so the refusal still fires. tmpfs ids are
+/// per mount, which is right: its contents do not survive a remount either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RootId {
-    /// `statx` mount id.
-    Mount(u64),
-    /// `st_dev`, used only where the kernel lacks mount ids.
-    Dev(u64),
-}
+pub struct RootId(pub u64);
 
 impl std::fmt::Display for RootId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RootId::Mount(v) => write!(f, "mount id {v}"),
-            RootId::Dev(v) => write!(f, "device {v}"),
-        }
+        write!(f, "filesystem id {:016x}", self.0)
     }
 }
 
@@ -290,25 +290,17 @@ impl Index {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        row.map(|(kind, id)| match kind.as_str() {
-            "mount" => Ok(RootId::Mount(from_sql(id))),
-            "dev" => Ok(RootId::Dev(from_sql(id))),
-            other => Err(StoreError::Corrupt(format!(
-                "root {}: unknown identity kind {other:?}",
-                crate::escape::escape(root.as_bytes())
-            ))),
-        })
-        .transpose()
+        // Any other kind was recorded by an earlier scheme; treating it as
+        // unrecorded re-baselines the root instead of refusing it forever.
+        Ok(row.and_then(|(kind, id)| (kind == "fsid").then(|| RootId(from_sql(id)))))
     }
 
     pub fn set_root_id(&self, root: &RegPath, id: RootId) -> Result<(), StoreError> {
-        let (kind, v) = match id {
-            RootId::Mount(v) => ("mount", v),
-            RootId::Dev(v) => ("dev", v),
-        };
         self.conn
-            .prepare_cached("INSERT OR REPLACE INTO roots (path, kind, id) VALUES (?1, ?2, ?3)")?
-            .execute(params![root.as_bytes(), kind, to_sql(v)])?;
+            .prepare_cached(
+                "INSERT OR REPLACE INTO roots (path, kind, id) VALUES (?1, 'fsid', ?2)",
+            )?
+            .execute(params![root.as_bytes(), to_sql(id.0)])?;
         Ok(())
     }
 
