@@ -41,6 +41,8 @@ pub enum StoreError {
     Foreign { path: PathBuf, uid: u32 },
     #[error("store path is group- or other-writable: {0}")]
     Writable(PathBuf),
+    #[error("ancestor directory is not trustworthy (foreign owner or writable by others): {0}")]
+    UnsafeAncestor(PathBuf),
     #[error("registry line {line}: {kind:?}")]
     Registry {
         line: usize,
@@ -323,5 +325,39 @@ impl Store {
         renameat(&self.dir, REGISTRY_TMP, &self.dir, REGISTRY)
             .map_err(|e| errno(e, "rename onto registry in", &self.path))?;
         fsync(self.dir.as_fd()).map_err(|e| errno(e, "sync store directory", &self.path))
+    }
+}
+
+/// Pure owner/mode judgement on raw `st_uid`/`st_mode`; `Store::open` and
+/// `lock` must delegate to it. `Foreign` takes precedence over `Writable`.
+pub fn judge_owner_mode(_uid: u32, _mode: u32, _euid: u32, _path: &Path) -> Result<(), StoreError> {
+    todo!("step 2 rework: pure owner/mode check")
+}
+
+/// Pure ancestor judgement (OpenSSH StrictModes style): owner must be root
+/// or `euid`, and the directory must not be group/other-writable unless
+/// sticky. Failure is `UnsafeAncestor(path)`.
+pub fn judge_ancestor(_uid: u32, _mode: u32, _euid: u32, _path: &Path) -> Result<(), StoreError> {
+    todo!("step 2 rework: pure ancestor check")
+}
+
+impl Store {
+    /// Like `init_bare`, but `before_publish` runs with the fully built
+    /// temp sibling's path just before it is renamed into place; an `Err`
+    /// aborts the init and nothing may remain on disk.
+    pub fn init_bare_with(
+        _path: &Path,
+        _before_publish: &mut dyn FnMut(&Path) -> io::Result<()>,
+    ) -> Result<Store, StoreError> {
+        todo!("step 2 rework: atomic init via temp sibling and renameat2")
+    }
+
+    /// Like `init_extant`; the temp store already holds its registry root
+    /// when `before_publish` runs.
+    pub fn init_extant_with(
+        _dir: &Path,
+        _before_publish: &mut dyn FnMut(&Path) -> io::Result<()>,
+    ) -> Result<Store, StoreError> {
+        todo!("step 2 rework: atomic init via temp sibling and renameat2")
     }
 }

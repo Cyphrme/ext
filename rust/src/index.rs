@@ -124,6 +124,12 @@ impl Index {
         Ok(ix)
     }
 
+    /// Value of `PRAGMA <name>` on this index's own connection, as text.
+    #[doc(hidden)]
+    pub fn pragma(&self, _name: &str) -> Result<String, StoreError> {
+        todo!("step 2 rework: test seam for per-connection settings")
+    }
+
     /// No migrations: an unknown version is refused rather than guessed at.
     fn ensure_schema(&self) -> Result<(), StoreError> {
         let tx = self.write_tx()?;

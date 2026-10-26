@@ -51,14 +51,6 @@ proptest! {
 }
 
 #[test]
-fn awkward_bytes_survive() {
-    let paths: [&[u8]; 5] = [b"/a\tb", b"/a\nb", b"/a\\b", b"/\xff\xfe", b"/a\\x41"];
-    let regs: Vec<_> = paths.iter().map(|p| rp(p)).collect();
-    let got = parse(&render(&regs)).unwrap();
-    assert_eq!(sorted(got), sorted(regs));
-}
-
-#[test]
 fn rejects_relative_with_line_number() {
     let r = parse(b"/ok\n/also/ok\nrelative/path\n");
     assert!(matches!(r, Err((3, RegistryErrorKind::Relative))), "{r:?}");
@@ -69,7 +61,10 @@ fn rejects_uris() {
     for line in ["file:///x", "https://example.com/x", "hash://sha256/abc"] {
         let input = format!("/ok\n{line}\n");
         let r = parse(input.as_bytes());
-        assert!(matches!(r, Err((2, _))), "{line}: {r:?}");
+        assert!(
+            matches!(r, Err((2, RegistryErrorKind::Relative))),
+            "{line}: {r:?}"
+        );
     }
 }
 
@@ -182,4 +177,10 @@ fn parse_rejects_nul_whether_escaped_or_raw() {
     assert!(matches!(r, Err((2, RegistryErrorKind::Nul))), "{r:?}");
     let r = parse(b"/ok\n/a\0b\n");
     assert!(matches!(r, Err((2, RegistryErrorKind::Nul))), "{r:?}");
+}
+
+#[test]
+fn rejects_raw_non_utf8_line() {
+    let r = parse(b"/ok\n/\xff\n");
+    assert!(matches!(r, Err((2, RegistryErrorKind::NotUtf8))), "{r:?}");
 }

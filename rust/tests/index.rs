@@ -53,17 +53,18 @@ fn awkward_path_bytes_roundtrip() {
     }
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-    #[test]
-    fn arbitrary_path_bytes_roundtrip(tail in prop::collection::vec(any::<u8>(), 0..40)) {
-        let (_t, _st, ix) = fresh();
+/// One store+index for all cases: creating a store per case made this test
+/// take ~10 s.
+#[test]
+fn arbitrary_path_bytes_roundtrip() {
+    let (_t, _st, ix) = fresh();
+    proptest!(ProptestConfig::with_cases(64), |(tail in prop::collection::vec(any::<u8>(), 0..40))| {
         let mut p = vec![b'/'];
         p.extend(tail);
         let e = entry(&p, b"x");
         ix.upsert(&e).unwrap();
         prop_assert_eq!(ix.get(&p).unwrap(), Some(e));
-    }
+    });
 }
 
 #[test]
@@ -148,22 +149,9 @@ fn remove_and_remove_under_respect_path_boundaries() {
     );
 }
 
-#[test]
-fn iter_yields_all_entries() {
-    let (_t, _st, ix) = fresh();
-    for i in 0..5 {
-        ix.upsert(&entry(format!("/p/{i}").as_bytes(), b"c"))
-            .unwrap();
-    }
-    assert_eq!(ix.iter().unwrap().len(), 5);
-}
-
 /// A3: schema columns, the (alg,digest) index, and PRAGMA user_version = 1.
 #[test]
 fn schema_matches_plan_a3() {
-    let (_t, st, ix) = fresh();
-    drop(ix);
-    drop(st);
     // Re-open the raw database independently of the code under test.
     let t2 = tempfile::tempdir().unwrap();
     let dir = t2.path().join("s");
@@ -310,3 +298,61 @@ fn open_sets_wal_journal_mode() {
         .unwrap();
     assert_eq!(mode.to_lowercase(), "wal");
 }
+
+/// u64 fields round-trip across the i64 boundary and at the maximum.
+#[test]
+fn u64_meta_fields_roundtrip_past_i64_max() {
+    let (_t, _st, ix) = fresh();
+    for v in [i64::MAX as u64 + 1, u64::MAX, u64::MAX - 1] {
+        let mut e = entry(b"/big", b"b");
+        e.meta.size = v;
+        e.meta.dev = v;
+        e.meta.ino = v;
+        ix.upsert(&e).unwrap();
+        assert_eq!(ix.get(b"/big").unwrap(), Some(e), "{v}");
+    }
+}
+
+/// R4 boundary: "under root" means equal or prefixed by `root/`, never a bare
+/// byte prefix, including when one root is a byte-prefix of another.
+#[test]
+fn reconcile_boundary_and_prefix_roots() {
+    let (_t, _st, ix) = fresh();
+    for p in [
+        &b"/r1/a"[..],
+        b"/r1x/a",
+        b"/r1",
+        b"/a/x",
+        b"/ab/y",
+        b"/abc/z",
+    ] {
+        ix.upsert(&entry(p, p)).unwrap();
+    }
+    ix.reconcile(&[rp(b"/r1")]).unwrap();
+    let mut left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+    left.sort();
+    assert_eq!(left, vec![b"/r1".to_vec(), b"/r1/a".to_vec()]);
+
+    let (_t, _st, ix) = fresh();
+    for p in [&b"/a/x"[..], b"/ab/y", b"/abc/z"] {
+        ix.upsert(&entry(p, p)).unwrap();
+    }
+    ix.reconcile(&[rp(b"/a"), rp(b"/ab")]).unwrap();
+    let mut left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+    left.sort();
+    assert_eq!(left, vec![b"/a/x".to_vec(), b"/ab/y".to_vec()]);
+    ix.reconcile(&[rp(b"/ab")]).unwrap();
+    let left: Vec<_> = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+    assert_eq!(left, vec![b"/ab/y".to_vec()], "/a is not a root any more");
+}
+
+/// R5 / F2: per-connection settings, read back on the Index's own connection.
+#[test]
+fn connection_settings_are_applied() {
+    let (_t, _st, ix) = fresh();
+    assert_eq!(ix.pragma("busy_timeout").unwrap(), "5000");
+    assert_eq!(ix.pragma("trusted_schema").unwrap(), "0");
+    assert_eq!(ix.pragma("journal_mode").unwrap().to_lowercase(), "wal");
+}
+// SQLITE_DBCONFIG_DEFENSIVE has no PRAGMA and no safe way to read it back
+// through this API; it is not covered by a test.

@@ -185,11 +185,34 @@ fn open_foreign_owned_store_refused() {
     }
 }
 
-/// Needs a second uid we cannot create unprivileged; kept as an explicit gap.
+/// A foreign-owned registry/index.db/lock needs a second uid we cannot
+/// create unprivileged, so the judgement is tested on raw stat values.
 #[test]
-#[ignore = "needs root to chown registry/index.db to a foreign uid"]
-fn open_foreign_owned_registry_file_refused() {
-    unimplemented!("chown registry to another uid, expect Foreign");
+fn judge_owner_mode_on_constructed_stat() {
+    use ext::store::judge_owner_mode as j;
+    let p = Path::new("/s/registry");
+    assert!(j(1000, 0o100600, 1000, p).is_ok());
+    assert!(j(1000, 0o040700, 1000, p).is_ok());
+    assert!(j(1000, 0o100640, 1000, p).is_ok());
+    assert!(matches!(
+        j(0, 0o100600, 1000, p),
+        Err(StoreError::Foreign { uid: 0, .. })
+    ));
+    assert!(matches!(
+        j(1234, 0o100600, 1000, p),
+        Err(StoreError::Foreign { uid: 1234, .. })
+    ));
+    for mode in [0o100620, 0o100602, 0o100666, 0o040770] {
+        assert!(
+            matches!(j(1000, mode, 1000, p), Err(StoreError::Writable(_))),
+            "{mode:o}"
+        );
+    }
+    // Foreign owner is reported before writability.
+    assert!(matches!(
+        j(0, 0o100777, 1000, p),
+        Err(StoreError::Foreign { .. })
+    ));
 }
 
 #[test]
@@ -303,6 +326,9 @@ fn registry_read_reports_line_number() {
 
 /// §1 "Writes ... temp file, fsync, rename": a concurrent reader never sees a
 /// torn or partial registry, and no temp file is left behind.
+// fsync of the temp file, the store directory and the registry rename cannot
+// be observed without fault injection (a crash or a failing fsync); no test
+// here claims to cover them.
 #[test]
 fn registry_write_is_atomic_to_readers() {
     const PER_EDIT: usize = 400;
