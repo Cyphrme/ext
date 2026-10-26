@@ -9,25 +9,30 @@ impl Alg {
     pub const ALL: &'static [Alg] = &[Alg::Sha256];
 
     pub fn name(self) -> &'static str {
-        todo!()
+        match self {
+            Alg::Sha256 => "SHA-256",
+        }
     }
 
-    pub fn from_name(_s: &str) -> Option<Alg> {
-        todo!()
+    /// Exact and case-sensitive: `sha-256` is not an algorithm name.
+    pub fn from_name(s: &str) -> Option<Alg> {
+        Alg::ALL.iter().copied().find(|a| a.name() == s)
     }
 
     // Digest size in bytes; an algorithm has no "empty" state.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(self) -> usize {
-        todo!()
+        match self {
+            Alg::Sha256 => 32,
+        }
     }
 
     pub fn b64ut_len(self) -> usize {
-        todo!()
+        (self.len() * 8).div_ceil(6)
     }
 
     pub fn hex_len(self) -> usize {
-        todo!()
+        self.len() * 2
     }
 }
 
@@ -45,43 +50,133 @@ pub struct Digest {
 }
 
 impl Digest {
-    pub fn from_bytes(_alg: Alg, _bytes: &[u8]) -> Result<Digest, DigestError> {
-        todo!()
+    pub fn from_bytes(alg: Alg, bytes: &[u8]) -> Result<Digest, DigestError> {
+        if bytes.len() != alg.len() {
+            return Err(DigestError::WrongByteLength {
+                alg,
+                got: bytes.len(),
+            });
+        }
+        Ok(Digest {
+            alg,
+            bytes: bytes.into(),
+        })
     }
 
-    pub fn compute(_alg: Alg, _data: &[u8]) -> Digest {
-        todo!()
+    pub fn compute(alg: Alg, data: &[u8]) -> Digest {
+        use sha2::Digest as _;
+        let bytes: Box<[u8]> = match alg {
+            Alg::Sha256 => sha2::Sha256::digest(data).as_slice().into(),
+        };
+        Digest { alg, bytes }
     }
 
     pub fn alg(&self) -> Alg {
-        todo!()
+        self.alg
     }
 
     pub fn bytes(&self) -> &[u8] {
-        todo!()
+        &self.bytes
     }
 
-    pub fn encode(&self, _enc: Enc) -> String {
-        todo!()
+    /// Value only, no label. Hex is uppercase so output has one spelling.
+    pub fn encode(&self, enc: Enc) -> String {
+        match enc {
+            Enc::B64ut => data_encoding::BASE64URL_NOPAD.encode(&self.bytes),
+            Enc::Hex => data_encoding::HEXUPPER.encode(&self.bytes),
+        }
     }
 
-    pub fn to_reverse(&self, _enc: Enc) -> String {
-        todo!()
+    /// The canonical labelled form, `<value>:<alg>`.
+    pub fn to_reverse(&self, enc: Enc) -> String {
+        format!("{}:{}", self.encode(enc), self.alg.name())
     }
 
-    pub fn decode_value(_alg: Alg, _s: &str) -> Result<Digest, DigestError> {
-        todo!()
+    /// The encoding is chosen by length alone, never by character set, so
+    /// a value cannot be read two ways.
+    pub fn decode_value(alg: Alg, s: &str) -> Result<Digest, DigestError> {
+        let got = s.chars().count();
+        let bytes = if got == alg.b64ut_len() {
+            decode_b64ut(alg, s)?
+        } else if got == alg.hex_len() {
+            decode_hex(s)?
+        } else {
+            return Err(DigestError::WrongLength { alg, got });
+        };
+        Digest::from_bytes(alg, &bytes)
     }
 
-    pub fn parse_labelled(_s: &str) -> Result<Digest, DigestError> {
-        todo!()
+    /// Accepts `<value>:<alg>` and `<alg>:<value>`. An algorithm name is
+    /// never a valid value, so the two orders cannot be confused.
+    pub fn parse_labelled(s: &str) -> Result<Digest, DigestError> {
+        let (left, right) = s.split_once(':').ok_or(DigestError::Unlabelled)?;
+        if right.contains(':') {
+            return Err(DigestError::TooManyColons);
+        }
+        if let Some(alg) = Alg::from_name(right) {
+            Digest::decode_value(alg, left)
+        } else if let Some(alg) = Alg::from_name(left) {
+            Digest::decode_value(alg, right)
+        } else {
+            // Reverse form is canonical, so blame the right-hand side.
+            Err(DigestError::UnknownAlg(right.to_owned()))
+        }
     }
 }
 
 impl std::fmt::Display for Digest {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_reverse(Enc::B64ut))
     }
+}
+
+fn b64ut_val(c: char) -> Option<u8> {
+    match c {
+        'A'..='Z' => Some(c as u8 - b'A'),
+        'a'..='z' => Some(c as u8 - b'a' + 26),
+        '0'..='9' => Some(c as u8 - b'0' + 52),
+        '-' => Some(62),
+        '_' => Some(63),
+        _ => None,
+    }
+}
+
+// Hand-rolled so that canonicality is an explicit check rather than a
+// property of whichever decoder happens to be linked.
+fn decode_b64ut(alg: Alg, s: &str) -> Result<Vec<u8>, DigestError> {
+    let mut out = Vec::with_capacity(alg.len());
+    let (mut acc, mut nbits) = (0u32, 0u32);
+    for (index, ch) in s.chars().enumerate() {
+        let v = b64ut_val(ch).ok_or(DigestError::InvalidChar { index, ch })?;
+        acc = (acc << 6) | u32::from(v);
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+            acc &= (1 << nbits) - 1;
+        }
+    }
+    // Leftover bits are padding and must be zero, or two strings would
+    // name the same digest.
+    if acc != 0 {
+        return Err(DigestError::NonCanonical);
+    }
+    Ok(out)
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, DigestError> {
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let mut hi = None;
+    for (index, ch) in s.chars().enumerate() {
+        let v = ch
+            .to_digit(16)
+            .ok_or(DigestError::InvalidChar { index, ch })? as u8;
+        match hi.take() {
+            None => hi = Some(v),
+            Some(h) => out.push((h << 4) | v),
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
