@@ -4,7 +4,6 @@ use crate::digest::{Alg, Digest};
 use crate::registry::RegPath;
 use crate::store::{wrap, Store, StoreError};
 use rusqlite::config::DbConfig;
-use rusqlite::types::Value;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -134,32 +133,6 @@ impl Index {
         let ix = Index { conn };
         ix.ensure_schema()?;
         Ok(ix)
-    }
-
-    /// Whether `SQLITE_DBCONFIG_DEFENSIVE` is set on this connection.
-    #[doc(hidden)]
-    pub fn db_config_defensive(&self) -> Result<bool, StoreError> {
-        Ok(self.conn.db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE)?)
-    }
-
-    /// Value of `PRAGMA <name>` on this index's own connection, as text.
-    #[doc(hidden)]
-    pub fn pragma(&self, name: &str) -> Result<String, StoreError> {
-        // A pragma name cannot be a bound parameter, so it is restricted
-        // instead.
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(StoreError::Corrupt(format!("invalid pragma name {name:?}")));
-        }
-        let v: Value = self
-            .conn
-            .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))?;
-        Ok(match v {
-            Value::Integer(i) => i.to_string(),
-            Value::Real(f) => f.to_string(),
-            Value::Text(t) => t,
-            Value::Blob(b) => crate::escape::escape(&b),
-            Value::Null => String::new(),
-        })
     }
 
     /// No migrations: an unknown version is refused rather than guessed at.
