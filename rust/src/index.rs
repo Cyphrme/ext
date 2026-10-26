@@ -28,6 +28,26 @@ pub struct Entry {
     pub last_checked_ns: i64,
 }
 
+/// Filesystem identity of a registered root, recorded at its first scan.
+/// A later mismatch means the root was unmounted, mounted over or replaced,
+/// so an apparently empty tree must not be read as mass deletion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootId {
+    /// `statx` mount id.
+    Mount(u64),
+    /// `st_dev`, used only where the kernel lacks mount ids.
+    Dev(u64),
+}
+
+impl std::fmt::Display for RootId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RootId::Mount(v) => write!(f, "mount id {v}"),
+            RootId::Dev(v) => write!(f, "device {v}"),
+        }
+    }
+}
+
 pub struct Index {
     conn: Connection,
 }
@@ -165,6 +185,15 @@ impl Index {
                 })
             }
         }
+        // Additive and idempotent, so stores created before root identities
+        // existed gain the table without a version bump.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS roots (
+                 path BLOB PRIMARY KEY,
+                 kind TEXT NOT NULL,
+                 id INTEGER NOT NULL
+             );",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -227,6 +256,9 @@ impl Index {
         self.conn
             .prepare_cached(&format!("DELETE FROM files WHERE {UNDER}"))?
             .execute(params![root.as_bytes(), lo, hi])?;
+        self.conn
+            .prepare_cached("DELETE FROM roots WHERE path = ?1")?
+            .execute([root.as_bytes()])?;
         Ok(())
     }
 
@@ -247,6 +279,37 @@ impl Index {
             .query_map([], RawRow::read)?
             .collect::<Result<Vec<_>, _>>()?;
         raw.into_iter().map(RawRow::into_entry).collect()
+    }
+
+    pub fn root_id(&self, root: &RegPath) -> Result<Option<RootId>, StoreError> {
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT kind, id FROM roots WHERE path = ?1",
+                [root.as_bytes()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(kind, id)| match kind.as_str() {
+            "mount" => Ok(RootId::Mount(from_sql(id))),
+            "dev" => Ok(RootId::Dev(from_sql(id))),
+            other => Err(StoreError::Corrupt(format!(
+                "root {}: unknown identity kind {other:?}",
+                crate::escape::escape(root.as_bytes())
+            ))),
+        })
+        .transpose()
+    }
+
+    pub fn set_root_id(&self, root: &RegPath, id: RootId) -> Result<(), StoreError> {
+        let (kind, v) = match id {
+            RootId::Mount(v) => ("mount", v),
+            RootId::Dev(v) => ("dev", v),
+        };
+        self.conn
+            .prepare_cached("INSERT OR REPLACE INTO roots (path, kind, id) VALUES (?1, ?2, ?3)")?
+            .execute(params![root.as_bytes(), kind, to_sql(v)])?;
+        Ok(())
     }
 
     /// Runs `f` in one `BEGIN IMMEDIATE` transaction: commit on `Ok`,
@@ -299,6 +362,19 @@ impl Index {
         {
             let mut del = tx.prepare("DELETE FROM files WHERE path = ?1")?;
             for p in &stale {
+                del.execute([p])?;
+            }
+        }
+        // Identities of roots that are no longer registered go with them, so
+        // re-registering after an unmount starts from a fresh baseline.
+        {
+            let known: Vec<Vec<u8>> = {
+                let mut stmt = tx.prepare("SELECT path FROM roots")?;
+                let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let mut del = tx.prepare("DELETE FROM roots WHERE path = ?1")?;
+            for p in known.iter().filter(|p| !set.contains(p.as_slice())) {
                 del.execute([p])?;
             }
         }
