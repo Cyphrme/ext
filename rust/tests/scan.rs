@@ -644,3 +644,275 @@ fn only_narrows_scan_not_reconcile() {
     let left: Vec<_> = ix.iter().unwrap().into_iter().map(|x| x.path).collect();
     assert_eq!(left, vec![b(&a.join("new_a")), b(&a.join("old"))]);
 }
+
+// ---------------------------------------------------------------------------
+// Amendment 26f: red tests for the scanner rework.
+
+fn assert_detail(reps: &[Report], kind: K) {
+    let r = reps
+        .iter()
+        .find(|r| r.kind == kind)
+        .unwrap_or_else(|| panic!("no {kind:?} report in {reps:?}"));
+    assert!(
+        r.detail.as_deref().is_some_and(|d| !d.is_empty()),
+        "{kind:?} report has no detail: {r:?}"
+    );
+}
+
+#[test]
+fn error_report_carries_the_detail() {
+    if support::is_root() {
+        eprintln!("skipped: root ignores mode 000");
+        return;
+    }
+    let e = env();
+    let bad = e.root.join("locked");
+    fs::write(&bad, b"x").unwrap();
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+    let (_, reps) = scan(&e, &Opts::default());
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_detail(&reps, K::Error);
+}
+
+#[test]
+fn refused_report_carries_the_detail() {
+    let (t, base) = canon_tmp();
+    let _keep = t;
+    fs::create_dir_all(base.join("real/bad")).unwrap();
+    symlink(base.join("real"), base.join("link")).unwrap();
+    let st = store_with_roots(&base, &[&base.join("link/bad")]);
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    let mut reps = Vec::new();
+    run(&st, &lock, &ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
+    assert_detail(&reps, K::Refused);
+}
+
+#[test]
+fn unstable_report_carries_the_detail() {
+    let e = env();
+    let f = e.root.join("f");
+    big_file(&f, b'a');
+    let mut reps = Vec::new();
+    let lock = e.st.lock().unwrap();
+    run_hooked(
+        &e.st,
+        &lock,
+        &e.ix,
+        &Opts::default(),
+        &mut |_, _| {
+            OpenOptions::new()
+                .append(true)
+                .open(&f)
+                .unwrap()
+                .write_all(b"x")
+                .unwrap();
+        },
+        &mut |r| reps.push(r),
+    )
+    .unwrap();
+    assert_detail(&reps, K::Unstable);
+}
+
+// A directory named `.ext` makes its parent a sub-extant only if it is a
+// real store: registry, index.db and lock present, not group/other-writable.
+// Anything else is an ordinary directory, walked and indexed normally.
+#[test]
+fn only_a_real_store_dot_ext_excludes() {
+    let e = env();
+    for d in ["empty", "loose", "real"] {
+        fs::create_dir_all(e.root.join(d)).unwrap();
+        fs::write(e.root.join(d).join("f"), d.as_bytes()).unwrap();
+    }
+    fs::create_dir(e.root.join("empty/.ext")).unwrap();
+    let loose = e.root.join("loose/.ext");
+    fs::create_dir(&loose).unwrap();
+    for f in ["registry", "index.db", "lock"] {
+        fs::write(loose.join(f), b"").unwrap();
+    }
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o770)).unwrap();
+    Store::init_extant(&e.root.join("real")).unwrap();
+
+    let (s, reps) = scan(&e, &Opts::default());
+    let mut new = kinds(&reps, K::New);
+    new.sort();
+    let mut want: Vec<_> = [
+        "empty/f",
+        "loose/f",
+        "loose/.ext/registry",
+        "loose/.ext/index.db",
+        "loose/.ext/lock",
+    ]
+    .iter()
+    .map(|p| b(&e.root.join(p)))
+    .collect();
+    want.sort();
+    assert_eq!(new, want);
+    assert_eq!(kinds(&reps, K::SubExtant), vec![b(&e.root.join("real"))]);
+    assert_eq!(s.subextant, 1);
+}
+
+// F2: a path that comes back during the walk, after its directory was
+// already listed, is not Missing and keeps its entry. A MISSING candidate is
+// re-checked against the filesystem before its entry is deleted.
+#[test]
+fn file_arriving_in_an_already_walked_directory_is_not_missing() {
+    let e = env();
+    let stash = e.base.join("stash");
+    fs::create_dir(&stash).unwrap();
+    for d in ["d1", "d2"] {
+        fs::create_dir_all(e.root.join(d)).unwrap();
+        fs::write(e.root.join(d).join("g"), d.as_bytes()).unwrap();
+    }
+    scan(&e, &Opts::default());
+    // Out of the tree for the next scan; fresh files make it hash something.
+    for d in ["d1", "d2"] {
+        fs::rename(e.root.join(d).join("g"), stash.join(d)).unwrap();
+        fs::write(e.root.join(d).join("h"), format!("fresh {d}")).unwrap();
+    }
+    let mut first_dir: Option<PathBuf> = None;
+    let mut restored: Option<PathBuf> = None;
+    let mut reps = Vec::new();
+    let lock = e.st.lock().unwrap();
+    run_hooked(
+        &e.st,
+        &lock,
+        &e.ix,
+        &Opts::default(),
+        &mut |path, _| {
+            let dir = Path::new(std::str::from_utf8(path).unwrap())
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            match &first_dir {
+                None => first_dir = Some(dir),
+                // First file of the second directory: the first directory is
+                // completely walked, and its `g` comes back now.
+                Some(first) if *first != dir && restored.is_none() => {
+                    let name = first.file_name().unwrap();
+                    fs::rename(stash.join(name), first.join("g")).unwrap();
+                    restored = Some(first.join("g"));
+                }
+                Some(_) => {}
+            }
+        },
+        &mut |r| reps.push(r),
+    )
+    .unwrap();
+    let back = restored.expect("hook never restored the file");
+    let gone = if back.starts_with(e.root.join("d1")) {
+        "d2"
+    } else {
+        "d1"
+    };
+    assert_eq!(
+        kinds(&reps, K::Missing),
+        vec![b(&e.root.join(gone).join("g"))]
+    );
+    assert!(
+        entry(&e, &back).is_some(),
+        "entry of the returned file was deleted"
+    );
+}
+
+// A root's filesystem identity is recorded when it is first scanned. If a
+// later run finds a different one (an unmounted or newly mounted filesystem),
+// the root is REFUSED, its entries are kept, and the run exits 5 rather than
+// reporting every file Missing.
+#[test]
+fn root_device_change_is_refused_and_keeps_entries() {
+    let script = r#"
+mkdir -p "$J/work/root"
+echo data > "$J/work/root/f"
+x init --bare /work/store || exit 1
+x --d /work/store register /work/root > /dev/null 2>&1 || exit 1
+mount -t tmpfs tmpfs "$J/work/root" || exit 77
+x --d /work/store check
+echo "CODE=$?"
+echo "--list"
+x --d /work/store list
+"#;
+    let Some(o) = support::in_jail(script) else {
+        eprintln!("skipped: no unprivileged user+mount namespace");
+        return;
+    };
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let (check, list) = o.stdout.split_once("--list\n").unwrap();
+    assert!(check.contains("CODE=5"), "{check}{}", o.stderr);
+    assert!(check.contains("REFUSED\t/work/root"), "{check}");
+    assert!(!check.contains("MISSING"), "{check}");
+    assert!(
+        list.contains("\t/work/root/f\n"),
+        "entry was dropped: {list}"
+    );
+}
+
+// The walk is iterative and holds no descriptor per level: a chain far deeper
+// than the stack or the descriptor limit allows for recursion is walked.
+#[test]
+fn very_deep_tree_is_walked_without_crashing() {
+    use rustix::fs::{mkdirat, openat, unlinkat, AtFlags, Mode, OFlags, CWD};
+    use rustix::process::{getrlimit, setrlimit, Resource};
+    const DEPTH: usize = 20_000;
+    // Descriptors are not what is being tested; keep them from limiting the
+    // recursion that the stack is supposed to limit.
+    let mut lim = getrlimit(Resource::Nofile);
+    lim.current = lim.maximum;
+    setrlimit(Resource::Nofile, lim).unwrap();
+    if lim.maximum.is_some_and(|m| m < DEPTH as u64 + 100) {
+        eprintln!(
+            "skipped: hard RLIMIT_NOFILE {:?} too low to build the chain",
+            lim.maximum
+        );
+        return;
+    }
+    let e = env();
+    let dir = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // mkdirat/openat by fd: the path would exceed PATH_MAX long before this.
+    let mut fds = vec![openat(CWD, &e.root, dir, Mode::empty()).unwrap()];
+    for _ in 0..DEPTH {
+        let last = fds.last().unwrap();
+        mkdirat(last, "d", Mode::from_raw_mode(0o755)).unwrap();
+        let next = openat(last, "d", dir, Mode::empty()).unwrap();
+        fds.push(next);
+    }
+    let leaf = openat(
+        fds.last().unwrap(),
+        "leaf",
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .unwrap();
+    rustix::io::write(&leaf, b"x").unwrap();
+    drop(leaf);
+
+    // A child process, so a stack overflow fails this test, not the binary.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ext"))
+        .env_remove("EXTANT_DIR")
+        .arg("--d")
+        .arg(e.base.join("store"))
+        .arg("check")
+        .output()
+        .unwrap();
+
+    // Bottom-up cleanup by fd; the temp dir's own recursive removal would
+    // hit the same depth.
+    unlinkat(fds.last().unwrap(), "leaf", AtFlags::empty()).unwrap();
+    for i in (0..DEPTH).rev() {
+        unlinkat(&fds[i], "d", AtFlags::REMOVEDIR).unwrap();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{:?} {}",
+        out.status,
+        &stderr[..stderr.len().min(300)]
+    );
+    assert!(
+        stdout.starts_with("NEW\t") && stdout.trim_end().ends_with("/leaf"),
+        "{}",
+        &stdout[..stdout.len().min(300)]
+    );
+}
