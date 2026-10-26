@@ -67,6 +67,12 @@ pub struct JailOut {
 /// `/work`). Returns `None` when the namespace or its tools are unavailable,
 /// so callers skip rather than fail.
 pub fn in_jail(script: &str) -> Option<JailOut> {
+    in_jail_with(&["-Urm"], script)
+}
+
+/// As [`in_jail`] with explicit `unshare` arguments, e.g. a namespace that
+/// also maps subordinate uids so a file can be owned by another user.
+pub fn in_jail_with(unshare_args: &[&str], script: &str) -> Option<JailOut> {
     const SETUP: &str = r#"
 J="$1"; BIN="$2"
 mount -t tmpfs tmpfs "$J" || exit 77
@@ -85,7 +91,8 @@ x() { chroot "$J" /ext "$@"; }
     let mount_point = dir.join("jail");
     fs::create_dir(&mount_point).ok()?;
     let o = std::process::Command::new("unshare")
-        .args(["-Urm", "sh", "-c"])
+        .args(unshare_args)
+        .args(["sh", "-c"])
         .arg(format!("{SETUP}\n{script}"))
         .arg("sh")
         .arg(&mount_point)
