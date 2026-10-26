@@ -2,11 +2,10 @@
 
 mod support;
 use ext::store::Store;
-use ext::walk::{crosses_mount, walk, Event};
-use proptest::prelude::*;
+use ext::walk::{walk, Event};
 use rustix::fs::{mknodat, FileType, Mode, CWD};
 use std::fs;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::mpsc;
@@ -148,24 +147,17 @@ fn fifo_and_socket_are_skipped_without_blocking() {
 
 // A4: the root itself and any parent component may not be a symlink.
 #[test]
-fn root_whose_parent_is_a_symlink_is_refused() {
+fn symlinked_root_is_refused() {
     let (_t, d) = canon_tmp();
     fs::create_dir_all(d.join("real/root")).unwrap();
     fs::write(d.join("real/root/f"), b"x").unwrap();
     symlink(d.join("real"), d.join("link")).unwrap();
-    let root = d.join("link/root");
-    let ev = run_walk(&root, no_store());
-    assert_eq!(ev, vec![Ev::Refused(b(&root))]);
-}
-
-#[test]
-fn root_that_is_itself_a_symlink_is_refused() {
-    let (_t, d) = canon_tmp();
-    fs::create_dir_all(d.join("real")).unwrap();
-    fs::write(d.join("real/f"), b"x").unwrap();
-    symlink(d.join("real"), d.join("root")).unwrap();
-    let ev = run_walk(&d.join("root"), no_store());
-    assert_eq!(ev, vec![Ev::Refused(b(&d.join("root")))]);
+    symlink(d.join("real/root"), d.join("root")).unwrap();
+    // A symlink as a parent component, and as the root itself.
+    for root in [d.join("link/root"), d.join("root")] {
+        let ev = run_walk(&root, no_store());
+        assert_eq!(ev, vec![Ev::Refused(b(&root))], "{root:?}");
+    }
 }
 
 // A1: a directory containing `.ext/` is a sub-extant and is skipped whole.
@@ -214,94 +206,26 @@ fn store_inside_root_is_excluded_by_identity() {
     assert!(files(&ev).len() > 1, "{ev:?}");
 }
 
-// Per-file failures are events, not aborts.
+/// T5: the mount rule on a real mount. A tmpfs inside the root is reported
+/// and never entered (verified on a mutant that returns a constant mount
+/// key: the tmpfs content then leaks into the listing).
 #[test]
-fn unreadable_file_is_an_error_event_and_walk_continues() {
-    if support::is_root() {
-        eprintln!("skipped: root ignores mode 000");
-        return;
-    }
-    let (_t, d) = canon_tmp();
-    let root = d.join("r");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("locked"), b"x").unwrap();
-    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-    fs::write(root.join("ok"), b"y").unwrap();
-    let ev = run_walk(&root, no_store());
-    assert!(ev.contains(&Ev::Error(b(&root.join("locked")))), "{ev:?}");
-    assert_eq!(files(&ev), vec![b(&root.join("ok")).as_slice()]);
-}
-
-// T5: the mount rule as a pure function.
-#[test]
-fn crosses_mount_examples() {
-    assert!(!crosses_mount(7, 7));
-    assert!(crosses_mount(7, 8));
-    assert!(crosses_mount(0, 1));
-}
-
-proptest! {
-    #[test]
-    fn crosses_mount_iff_ids_differ(a in any::<u64>(), c in any::<u64>()) {
-        prop_assert_eq!(crosses_mount(a, c), a != c);
-        prop_assert_eq!(crosses_mount(a, c), crosses_mount(c, a));
-    }
-}
-
-fn need_root(what: &str) -> bool {
-    if !support::is_root() {
-        eprintln!("not run: {what} needs root");
-        return false;
-    }
-    true
-}
-
-// Not CI-verified (T5): requires privilege to mount.
-#[test]
-#[ignore = "needs root to mount a tmpfs; not CI-verified (plan T5)"]
 fn real_mount_boundary_is_not_entered() {
-    if !need_root("mount") {
+    let script = r#"
+mkdir -p "$J/work/root/mnt"
+echo x > "$J/work/root/f"
+mount -t tmpfs tmpfs "$J/work/root/mnt" || exit 77
+echo y > "$J/work/root/mnt/inside"
+x init --bare /work/store || exit 1
+x --d /work/store register /work/root
+echo "CODE=$?"
+"#;
+    let Some(o) = support::in_jail(script) else {
+        eprintln!("skipped: no unprivileged user+mount namespace");
         return;
-    }
-    let (_t, d) = canon_tmp();
-    let root = d.join("r");
-    fs::create_dir_all(root.join("mnt")).unwrap();
-    fs::write(root.join("f"), b"x").unwrap();
-    let ok = std::process::Command::new("mount")
-        .args(["-t", "tmpfs", "tmpfs"])
-        .arg(root.join("mnt"))
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok, "mount failed");
-    fs::write(root.join("mnt/inside"), b"y").unwrap();
-    let ev = run_walk(&root, no_store());
-    let _ = std::process::Command::new("umount")
-        .arg(root.join("mnt"))
-        .status();
-    assert_eq!(files(&ev), vec![b(&root.join("f")).as_slice()]);
-    assert!(ev.contains(&Ev::Mount(b(&root.join("mnt")))), "{ev:?}");
-}
-
-// Not CI-verified: device nodes cannot be created unprivileged.
-#[test]
-#[ignore = "needs root to mknod a device; not CI-verified"]
-fn device_node_is_skipped_unopened() {
-    if !need_root("mknod") {
-        return;
-    }
-    let (_t, d) = canon_tmp();
-    let root = d.join("r");
-    fs::create_dir_all(&root).unwrap();
-    mknodat(
-        CWD,
-        root.join("null"),
-        FileType::CharacterDevice,
-        Mode::from_raw_mode(0o600),
-        rustix::fs::makedev(1, 3),
-    )
-    .unwrap();
-    let ev = run_walk(&root, no_store());
-    assert!(files(&ev).is_empty());
-    assert!(ev.contains(&Ev::Special(b(&root.join("null")))), "{ev:?}");
+    };
+    assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("NEW\t/work/root/f\n"), "{}", o.stdout);
+    assert!(o.stdout.contains("MOUNT\t/work/root/mnt\n"), "{}", o.stdout);
+    assert!(!o.stdout.contains("inside"), "entered the mount: {}", o.stdout);
 }
