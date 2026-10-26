@@ -143,7 +143,9 @@ fn bidi_controls_are_escaped_and_roundtrip() {
         assert_eq!(unescape(want), Ok(s.into_bytes()));
     }
     // neighbours stay literal
-    for c in ['\u{061B}', '\u{061D}', '\u{200D}', '\u{2010}', '\u{202F}', '\u{2065}', '\u{206A}'] {
+    for c in [
+        '\u{061B}', '\u{061D}', '\u{200D}', '\u{2010}', '\u{202F}', '\u{2065}', '\u{206A}',
+    ] {
         assert_eq!(escape(c.to_string().as_bytes()), c.to_string());
     }
 }
