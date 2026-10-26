@@ -6,12 +6,19 @@ use crate::index::{Entry, Meta};
 pub const RACY_WINDOW_NS: i64 = 2_000_000_000;
 
 /// `meta` and `last_checked_ns` are the values stored with the entry.
-pub fn is_racy(_meta: &Meta, _last_checked_ns: i64) -> bool {
-    todo!("step 3: racy iff max(mtime, ctime) >= last_checked - RACY_WINDOW_NS")
+///
+/// A timestamp inside the window (or in the future, after a clock step) could
+/// still be shared by a later edit, so the metadata cannot vouch for content.
+pub fn is_racy(meta: &Meta, last_checked_ns: i64) -> bool {
+    // Saturating: stored values are untrusted index contents.
+    meta.mtime_ns.max(meta.ctime_ns) >= last_checked_ns.saturating_sub(RACY_WINDOW_NS)
 }
 
-pub fn should_skip(_stored: Option<&Entry>, _current: &Meta, _full: bool) -> bool {
-    todo!("step 3: skip iff !full, stored, all five fields equal, not racy")
+pub fn should_skip(stored: Option<&Entry>, current: &Meta, full: bool) -> bool {
+    match stored {
+        Some(e) if !full => e.meta == *current && !is_racy(&e.meta, e.last_checked_ns),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +29,17 @@ pub enum Status {
     Violation,
 }
 
-pub fn classify(_stored: Option<&Entry>, _current: &Meta, _digest: &Digest) -> Status {
-    todo!("step 3")
+pub fn classify(stored: Option<&Entry>, current: &Meta, digest: &Digest) -> Status {
+    let Some(e) = stored else {
+        return Status::New;
+    };
+    if e.digest == *digest {
+        Status::Unchanged
+    } else if e.meta == *current && !is_racy(&e.meta, e.last_checked_ns) {
+        // Nothing observable changed and the metadata is trustworthy, so
+        // the content change is not an ordinary edit.
+        Status::Violation
+    } else {
+        Status::Edited
+    }
 }
