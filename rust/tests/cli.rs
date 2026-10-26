@@ -21,12 +21,10 @@ use ext::registry::RegPath;
 use ext::store::Store;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-const ESC_NAME: &[u8] = b"a\x1bb";
 
 struct Out {
     code: i32,
@@ -200,49 +198,24 @@ fn usage_errors_exit_4() {
         assert_eq!(o.code, 4, "args {args:?}: stderr={}", o.stderr);
         assert!(!o.stderr.is_empty(), "args {args:?}: silent failure");
     }
+    // A resolve argument that is not a labelled digest is a usage error, never
+    // "not found" (1); the unlabelled case says why.
+    let v = dg(b"c").encode(Enc::B64ut);
+    let unlabelled = run(fx.ext().arg("resolve").arg(&v));
+    assert_eq!(unlabelled.code, 4);
+    assert!(unlabelled.stderr.to_lowercase().contains("label"), "{}", unlabelled.stderr);
+    let bad_char = format!("{}$:SHA-256", &v[..42]);
+    let o = run(fx.ext().arg("resolve").arg(&bad_char));
+    assert_eq!((o.code, o.stdout.len()), (4, 0), "{}", o.stderr);
+    // Asking for help or the version is success.
+    for flag in ["--help", "--version"] {
+        let o = run(fx.ext().arg(flag));
+        assert_eq!(o.code, 0, "{flag}: {}", o.stderr);
+        assert!(!o.stdout.is_empty(), "{flag}: nothing printed");
+    }
 }
 
 // ---------------------------------------------------------------------- init
-
-/// §5 `init [dir]`; §1 init layout (0700 dir, 0600 files); D3.
-#[test]
-fn init_creates_extant_store_registering_the_dir() {
-    let (_t, base) = tmp_dir();
-    let dir = base.join("proj");
-    fs::create_dir(&dir).unwrap();
-    let o = run(cmd().arg("init").arg(&dir));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    let st = dir.join(".ext");
-    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&st), 0o700);
-    for f in ["registry", "index.db", "lock"] {
-        assert_eq!(mode(&st.join(f)), 0o600, "{f}");
-    }
-    let mut want = p_bytes(&dir);
-    want.push(b'\n');
-    assert_eq!(fs::read(st.join("registry")).unwrap(), want);
-}
-
-/// §5: dir defaults to cwd.
-#[test]
-fn init_without_dir_uses_cwd() {
-    let (_t, base) = tmp_dir();
-    let o = run(cmd().arg("init").current_dir(&base));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(base.join(".ext/registry").is_file());
-}
-
-/// R7 + §1: never overwrite; error names the path; exit 4.
-#[test]
-fn init_over_existing_store_exits_4_and_names_path() {
-    let (_t, base) = tmp_dir();
-    assert_eq!(run(cmd().arg("init").arg(&base)).code, 0);
-    let before = fs::read(base.join(".ext/registry")).unwrap();
-    let o = run(cmd().arg("init").arg(&base));
-    assert_eq!(o.code, 4);
-    assert!(o.stderr.contains(base.to_str().unwrap()), "{}", o.stderr);
-    assert_eq!(fs::read(base.join(".ext/registry")).unwrap(), before);
-}
 
 /// §5 "Its first `check` indexes the directory", through the cwd step (D2).
 #[test]
@@ -253,6 +226,10 @@ fn init_then_check_indexes_the_directory() {
     let (_t, base) = tmp_dir();
     fs::write(base.join("f"), b"hello").unwrap();
     assert_eq!(run(cmd().arg("init").current_dir(&base)).code, 0);
+    // `init` with no argument registers the canonical working directory.
+    let mut registered = p_bytes(&base);
+    registered.push(b'\n');
+    assert_eq!(fs::read(base.join(".ext/registry")).unwrap(), registered);
     let o = run(cmd().arg("check").current_dir(&base));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let f = base.join("f");
@@ -267,40 +244,6 @@ fn init_then_check_indexes_the_directory() {
     assert_eq!(r.code, 0);
 }
 
-/// §5 `init --bare <path>`: flat store, empty registry (D3).
-#[test]
-fn init_bare_creates_flat_store_with_empty_registry() {
-    let (_t, base) = tmp_dir();
-    let st = base.join("sys");
-    let o = run(cmd().args(["init", "--bare"]).arg(&st));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    for f in ["registry", "index.db", "lock"] {
-        assert!(st.join(f).is_file(), "missing {f}");
-    }
-    assert!(!st.join(".ext").exists(), "bare store must be flat");
-    assert_eq!(fs::read(st.join("registry")).unwrap(), b"");
-    assert_eq!(
-        fs::metadata(&st).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-    // and it is usable
-    let l = run(cmd().arg("list").arg("--d").arg(&st));
-    assert_eq!((l.code, l.stdout.len()), (0, 0), "{}", l.stderr);
-}
-
-/// R7: init_bare never overwrites.
-#[test]
-fn init_bare_over_existing_path_exits_4() {
-    let (_t, base) = tmp_dir();
-    let st = base.join("sys");
-    fs::create_dir(&st).unwrap();
-    fs::write(st.join("keep"), b"x").unwrap();
-    let o = run(cmd().args(["init", "--bare"]).arg(&st));
-    assert_eq!(o.code, 4);
-    assert!(o.stderr.contains(st.to_str().unwrap()), "{}", o.stderr);
-    assert_eq!(fs::read(st.join("keep")).unwrap(), b"x");
-}
-
 // ---------------------------------------------------------- store resolution
 
 fn two_stores() -> (Fx, Fx) {
@@ -308,39 +251,6 @@ fn two_stores() -> (Fx, Fx) {
     a.seed(b"/only/in/a", b"A");
     b.seed(b"/only/in/b", b"B");
     (a, b)
-}
-
-/// §1 order step 1 beats step 2.
-#[test]
-fn flag_beats_env() {
-    let (a, b) = two_stores();
-    let o = run(cmd()
-        .env("EXTANT_DIR", &b.store)
-        .arg("list")
-        .arg("--d")
-        .arg(&a.store));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(o.out().contains("/only/in/a") && !o.out().contains("/only/in/b"));
-}
-
-/// §1 step 2.
-#[test]
-fn env_selects_store_without_flag() {
-    let (_a, b) = two_stores();
-    let o = run(cmd().env("EXTANT_DIR", &b.store).arg("list"));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(o.out().contains("/only/in/b"));
-}
-
-/// §1: for steps 1-2, `<p>` may be a directory whose `.ext/` is a store.
-#[test]
-fn flag_accepts_dir_containing_dot_ext() {
-    let (_t, base) = tmp_dir();
-    assert_eq!(run(cmd().arg("init").arg(&base)).code, 0);
-    let o = run(cmd().arg("list").arg("--d").arg(&base));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    let o = run(cmd().env("EXTANT_DIR", &base).arg("list"));
-    assert_eq!(o.code, 0, "{}", o.stderr);
 }
 
 /// §1: an explicit path that is no store is an error; never falls through,
@@ -367,88 +277,7 @@ fn explicit_missing_store_exits_4_without_fallthrough() {
     assert!(o.stderr.contains(plain.to_str().unwrap()), "{}", o.stderr);
 }
 
-/// §1 step 4 (D2: `./.ext/`), and "an empty value counts as unset".
-#[test]
-fn cwd_dot_ext_is_the_last_resort_and_empty_env_is_unset() {
-    if system_store_present() {
-        return;
-    }
-    let (_t, base) = tmp_dir();
-    assert_eq!(run(cmd().arg("init").arg(&base)).code, 0);
-    let o = run(cmd().arg("list").current_dir(&base));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    let o = run(cmd().env("EXTANT_DIR", "").arg("list").current_dir(&base));
-    assert_eq!(
-        o.code, 0,
-        "empty EXTANT_DIR must count as unset: {}",
-        o.stderr
-    );
-}
-
-/// §1 step 5: otherwise error.
-#[test]
-fn no_store_anywhere_exits_4() {
-    if system_store_present() {
-        return;
-    }
-    let (_t, base) = tmp_dir();
-    let o = run(cmd().arg("list").current_dir(&base));
-    assert_eq!(o.code, 4);
-    assert!(!o.stderr.is_empty());
-}
-
 // --------------------------------------------------------- foreign / unsafe
-
-/// §1 open: group/other-writable store -> exit 4, path named.
-#[test]
-fn writable_store_dir_exits_4_naming_it() {
-    let fx = Fx::new();
-    fs::set_permissions(&fx.store, fs::Permissions::from_mode(0o770)).unwrap();
-    for sub in ["list", "check"] {
-        let o = run(fx.ext().arg(sub));
-        assert_eq!(o.code, 4, "{sub}: {}", o.stderr);
-        assert!(
-            o.stderr.contains(fx.store.to_str().unwrap()),
-            "{}",
-            o.stderr
-        );
-    }
-}
-
-/// §1 open: the checks also cover `registry`.
-#[test]
-fn writable_registry_file_exits_4_naming_it() {
-    let fx = Fx::new();
-    let reg = fx.store.join("registry");
-    fs::set_permissions(&reg, fs::Permissions::from_mode(0o666)).unwrap();
-    let o = run(fx.ext().arg("list"));
-    assert_eq!(o.code, 4);
-    assert!(o.stderr.contains(reg.to_str().unwrap()), "{}", o.stderr);
-}
-
-/// Amendment 26d: unsafe ancestor of the store.
-#[test]
-fn store_under_world_writable_ancestor_exits_4() {
-    let fx = Fx::new();
-    let parent = fx.base.join("shared");
-    fs::create_dir(&parent).unwrap();
-    let inner = parent.join("store");
-    fs::rename(&fx.store, &inner).unwrap();
-    fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
-    let o = run(cmd().env("EXTANT_DIR", &inner).arg("list"));
-    assert_eq!(o.code, 4);
-    assert!(o.stderr.contains(parent.to_str().unwrap()), "{}", o.stderr);
-}
-
-/// §1 registry: parse error with a line number -> exit 4.
-#[test]
-fn malformed_registry_exits_4_with_line_number() {
-    let fx = Fx::new();
-    fs::write(fx.store.join("registry"), b"# c\nrelative/path\n").unwrap();
-    let o = run(fx.ext().arg("list"));
-    assert_eq!(o.code, 4);
-    assert!(o.stderr.contains('2'), "line number missing: {}", o.stderr);
-}
 
 // ------------------------------------------------------------------ register
 
@@ -466,79 +295,7 @@ fn register_then_resolve_finds_the_file() {
     assert_eq!(r.out(), format!("{}\n", other.join("f").display()));
 }
 
-/// §5 `-r` alias; §1 "register canonicalises its argument with realpath".
-#[test]
-fn register_short_flag_canonicalises_and_is_idempotent() {
-    let fx = Fx::new();
-    let other = fx.base.join("other");
-    fs::create_dir_all(other.join("sub")).unwrap();
-    let messy = other.join("sub/..");
-    for _ in 0..2 {
-        let o = run(fx.ext().arg("-r").arg(&messy));
-        assert_eq!(o.code, 0, "{}", o.stderr);
-    }
-    let reg = fx.registry_text();
-    let want = p_bytes(&other);
-    let hits = split(&reg, b'\n').iter().filter(|l| **l == want).count();
-    assert_eq!(hits, 1, "registry: {}", String::from_utf8_lossy(&reg));
-    assert!(!String::from_utf8_lossy(&reg).contains(".."));
-}
-
-#[test]
-fn register_nonexistent_path_exits_4_naming_it() {
-    let fx = Fx::new();
-    let ghost = fx.base.join("ghost");
-    let before = fx.registry_text();
-    let o = run(fx.ext().arg("register").arg(&ghost));
-    assert_eq!(o.code, 4);
-    assert!(o.stderr.contains(ghost.to_str().unwrap()), "{}", o.stderr);
-    assert_eq!(fx.registry_text(), before);
-}
-
-/// §1: a registered root may not be named through a symlink; `register`
-/// canonicalises, so registering via a link records the real directory.
-#[test]
-fn register_via_symlink_records_the_real_path() {
-    let fx = Fx::new();
-    let real = fx.base.join("real");
-    fs::create_dir(&real).unwrap();
-    let link = fx.base.join("link");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    assert_eq!(run(fx.ext().arg("register").arg(&link)).code, 0);
-    let reg = String::from_utf8_lossy(&fx.registry_text()).into_owned();
-    assert!(reg.lines().any(|l| l == real.to_str().unwrap()), "{reg}");
-    assert!(!reg.lines().any(|l| l == link.to_str().unwrap()), "{reg}");
-}
-
 // ---------------------------------------------------------------- unregister
-
-/// §5 unregister: removes the registry line and the entries under it.
-#[test]
-fn unregister_removes_line_and_entries() {
-    let fx = Fx::new();
-    fx.write("f", b"gone-soon");
-    assert_eq!(fx.check().code, 0);
-    assert_eq!(run(fx.ext().arg("resolve").arg(rev(b"gone-soon"))).code, 0);
-    let o = run(fx.ext().arg("unregister").arg(&fx.tree));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(
-        fx.registry_text().is_empty()
-            || !String::from_utf8_lossy(&fx.registry_text()).contains("tree")
-    );
-    assert_eq!(run(fx.ext().arg("resolve").arg(rev(b"gone-soon"))).code, 1);
-    assert!(run(fx.ext().arg("list")).stdout.is_empty());
-    // the file itself is untouched
-    assert!(fx.tree.join("f").exists());
-}
-
-/// §5 `-u` alias.
-#[test]
-fn unregister_short_flag() {
-    let fx = Fx::new();
-    let o = run(fx.ext().arg("-u").arg(&fx.tree));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(!String::from_utf8_lossy(&fx.registry_text()).contains("tree"));
-}
 
 /// §5: "must match a registry entry exactly". Prefix or child -> exit 4,
 /// nothing removed. (Exit 4 is an invented choice; see report.)
@@ -562,118 +319,6 @@ fn unregister_requires_an_exact_entry() {
 }
 
 // ------------------------------------------------------------------- resolve
-
-/// §5 + digest.rs: both labelled orders, both encodings, hex any case.
-#[test]
-fn resolve_accepts_both_labelled_orders_and_encodings() {
-    let fx = Fx::new();
-    fx.seed(b"/x/file", b"content");
-    let d = dg(b"content");
-    let b64 = d.encode(Enc::B64ut);
-    let hex = d.encode(Enc::Hex);
-    let forms = [
-        format!("{b64}:SHA-256"),
-        format!("SHA-256:{b64}"),
-        format!("{hex}:SHA-256"),
-        format!("SHA-256:{}", hex.to_lowercase()),
-    ];
-    for f in forms {
-        let o = run(fx.ext().arg("resolve").arg(&f));
-        assert_eq!(o.code, 0, "{f}: {}", o.stderr);
-        assert_eq!(o.out(), "/x/file\n", "{f}");
-    }
-}
-
-/// §5: one path per line, sorted by bytes.
-#[test]
-fn resolve_lists_every_path_sorted() {
-    let fx = Fx::new();
-    for p in ["/z/b", "/a/z", "/a/B", "/m"] {
-        fx.seed(p.as_bytes(), b"same");
-    }
-    let o = run(fx.ext().arg("resolve").arg(rev(b"same")));
-    assert_eq!(o.code, 0);
-    assert_eq!(o.out(), "/a/B\n/a/z\n/m\n/z/b\n");
-}
-
-/// §1 exit 1: not found, nothing on stdout.
-#[test]
-fn resolve_unknown_digest_exits_1() {
-    let fx = Fx::new();
-    fx.seed(b"/x", b"present");
-    let o = run(fx.ext().arg("resolve").arg(rev(b"absent")));
-    assert_eq!(o.code, 1);
-    assert!(o.stdout.is_empty());
-}
-
-/// §5 + digest.rs: unlabelled, `hash://`, unknown algorithm, wrong length,
-/// bad chars -> exit 4 (usage), never 1, with an explanation.
-#[test]
-fn resolve_rejects_unlabelled_and_malformed_input_with_exit_4() {
-    let fx = Fx::new();
-    fx.seed(b"/x", b"c");
-    let v = dg(b"c").encode(Enc::B64ut);
-    for bad in [
-        v.clone(),                        // unlabelled
-        dg(b"c").encode(Enc::Hex),        // unlabelled hex
-        format!("hash://sha256/{v}"),     // hash:// URI
-        format!("{v}:sha-256"),           // case-sensitive algorithm
-        format!("{v}:MD5"),               // unknown algorithm
-        format!("{}:SHA-256", &v[..42]),  // wrong length
-        format!("{}$:SHA-256", &v[..42]), // bad character
-        String::new(),
-    ] {
-        let o = run(fx.ext().arg("resolve").arg(&bad));
-        assert_eq!(o.code, 4, "input {bad:?}: {}", o.stderr);
-        assert!(o.stdout.is_empty(), "input {bad:?}");
-        assert!(!o.stderr.is_empty(), "input {bad:?}: no message");
-    }
-    let o = run(fx.ext().arg("resolve").arg(&v));
-    assert!(
-        o.stderr.to_lowercase().contains("label"),
-        "unlabelled input must say it is unlabelled: {}",
-        o.stderr
-    );
-}
-
-/// §2.2 + §5: control, bidi and invalid-UTF-8 bytes in a path never reach
-/// the terminal raw.
-#[test]
-fn resolve_escapes_hostile_paths() {
-    let fx = Fx::new();
-    let path = b"/x/a\x1b[31m\xe2\x80\xaeb\xff\\c\td".to_vec();
-    fx.seed(&path, b"evil");
-    let o = run(fx.ext().arg("resolve").arg(rev(b"evil")));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    for raw in [0x1bu8, 0xff, b'\t'] {
-        assert!(!o.stdout.contains(&raw), "raw byte {raw:#x} in output");
-    }
-    assert!(!o.out().contains('\u{202e}'));
-    let want = format!("{}\n", escape(&path));
-    assert_eq!(o.out(), want);
-    assert!(want.contains("\\x1B") && want.contains("\\xE2\\x80\\xAE"));
-    assert!(want.contains("\\xFF") && want.contains("\\\\c"));
-}
-
-/// §5 `-0`: raw paths, NUL-terminated; a newline-bearing name round-trips.
-#[test]
-fn resolve_nul_mode_round_trips_raw_paths() {
-    let fx = Fx::new();
-    let paths: [&[u8]; 3] = [b"/x/plain", b"/x/new\nline", b"/x/\xff\x1b"];
-    for p in paths {
-        fx.seed(p, b"nul");
-    }
-    for o in [
-        run(fx.ext().arg("-0").arg("resolve").arg(rev(b"nul"))),
-        run(fx.ext().arg("resolve").arg("-0").arg(rev(b"nul"))),
-    ] {
-        assert_eq!(o.code, 0, "{}", o.stderr);
-        let mut want: Vec<Vec<u8>> = paths.iter().map(|p| p.to_vec()).collect();
-        want.sort();
-        assert_eq!(split(&o.stdout, 0), want);
-        assert!(o.stdout.ends_with(&[0]));
-    }
-}
 
 // ---------------------------------------------------------------------- list
 
@@ -716,105 +361,16 @@ fn list_format_and_order() {
         .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::B64ut), escape(p)))
         .collect();
     assert_eq!(o.out(), expect);
-}
-
-/// §5 `--hex`: uppercase hex, same `<value>:<alg>` shape (L125).
-#[test]
-fn list_hex_is_uppercase() {
-    let fx = Fx::new();
-    fx.seed(b"/h", b"hexme");
+    // --hex: uppercase hex, same `<value>:<alg>` shape.
     let o = run(fx.ext().arg("--hex").arg("list"));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert_eq!(o.out(), format!("{}\t/h\n", rev_hex(b"hexme")));
-    let (val, alg) = o
-        .out()
-        .split_once(':')
-        .map(|(a, b)| (a.to_owned(), b.to_owned()))
-        .unwrap();
-    assert_eq!(val.len(), 64);
-    assert!(val
-        .bytes()
-        .all(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(&c)));
-    assert!(alg.starts_with("SHA-256\t"));
-}
-
-/// §5 `-0`: NUL-terminated records, raw path, tab-separated fields.
-#[test]
-fn list_nul_mode() {
-    let fx = Fx::new();
-    let path = b"/x/ta\tb\nc\xff".to_vec();
-    fx.seed(&path, b"nl");
-    let o = run(fx.ext().arg("list").arg("-0"));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    let mut want = rev(b"nl").into_bytes();
-    want.push(b'\t');
-    want.extend_from_slice(&path);
-    want.push(0);
-    assert_eq!(o.stdout, want);
-}
-
-#[test]
-fn list_empty_store_is_silent_success() {
-    let fx = Fx::new();
-    let o = run(fx.ext().arg("list"));
-    assert_eq!((o.code, o.stdout.len()), (0, 0));
+    let expect: String = want
+        .iter()
+        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::Hex), escape(p)))
+        .collect();
+    assert_eq!(o.out(), expect);
 }
 
 // --------------------------------------------------------------------- check
-
-/// §5 check: `NEW\t<escaped path>`; unchanged is not printed; counts on
-/// stderr; index written.
-#[test]
-fn check_reports_new_then_goes_quiet() {
-    let fx = Fx::new();
-    let f = fx.write("f", b"one");
-    let o = fx.check();
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert_eq!(o.out(), format!("NEW\t{}\n", f.display()));
-    assert!(!o.stderr.is_empty(), "counts belong on stderr");
-    assert!(fx.index().get(&p_bytes(&f)).unwrap().is_some());
-    let o2 = fx.check();
-    assert_eq!(o2.code, 0);
-    assert!(
-        o2.stdout.is_empty(),
-        "unchanged must not print: {}",
-        o2.out()
-    );
-}
-
-/// §5 + C3: EDITED carries expected (stored) and actual digests.
-#[test]
-fn check_edited_prints_expected_and_actual() {
-    let fx = Fx::new();
-    let f = fx.write("f", b"before");
-    assert_eq!(fx.check().code, 0);
-    fs::write(&f, b"after, longer").unwrap();
-    let o = fx.check();
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert_eq!(
-        o.out(),
-        format!(
-            "EDITED\t{}\t{}\t{}\n",
-            f.display(),
-            rev(b"before"),
-            rev(b"after, longer")
-        )
-    );
-    let o = run(fx.ext().arg("resolve").arg(rev(b"after, longer")));
-    assert_eq!(o.code, 0);
-    // --hex reaches check's digests too
-    fs::write(&f, b"third").unwrap();
-    let o = run(fx.ext().args(["--hex", "check"]));
-    assert_eq!(
-        o.out(),
-        format!(
-            "EDITED\t{}\t{}\t{}\n",
-            f.display(),
-            rev_hex(b"after, longer"),
-            rev_hex(b"third")
-        )
-    );
-}
 
 /// Index a file, then forge a different digest under matching, non-racy
 /// metadata. Returns the file path and the forged digest's source bytes.
@@ -828,88 +384,6 @@ fn tamper(fx: &Fx, f: &Path) {
         ..e
     })
     .unwrap();
-}
-
-/// D1: VIOLATION only under --full; exit 2; path, expected, actual shown;
-/// index NOT written. Without --full the skip rule applies (metamorphic).
-#[test]
-fn check_full_reports_violation_exit_2_and_does_not_write() {
-    let fx = Fx::new();
-    let f = fx.write("f", b"truth");
-    assert_eq!(fx.check().code, 0);
-    tamper(&fx, &f);
-
-    let plain = fx.check();
-    assert_eq!(
-        (plain.code, plain.stdout.len()),
-        (0, 0),
-        "skip rule: {}",
-        plain.stderr
-    );
-
-    let o = run(fx.ext().args(["check", "--full"]));
-    assert_eq!(o.code, 2, "{}", o.stderr);
-    assert_eq!(
-        o.out(),
-        format!(
-            "VIOLATION\t{}\t{}\t{}\n",
-            f.display(),
-            rev(b"FORGED"),
-            rev(b"truth")
-        )
-    );
-    let e = fx.index().get(&p_bytes(&f)).unwrap().unwrap();
-    assert_eq!(
-        e.digest,
-        dg(b"FORGED"),
-        "violation was written without --accept"
-    );
-    // and it keeps being reported
-    assert_eq!(run(fx.ext().args(["check", "--full"])).code, 2);
-}
-
-/// D1 / C5: --accept writes it, exits 0, still visible.
-#[test]
-fn check_full_accept_writes_and_exits_0() {
-    let fx = Fx::new();
-    let f = fx.write("f", b"truth");
-    assert_eq!(fx.check().code, 0);
-    tamper(&fx, &f);
-    let o = run(fx.ext().args(["check", "--full", "--accept"]));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    let acc = status_lines(&o, "ACCEPTED");
-    assert_eq!(acc.len(), 1, "{}", o.out());
-    assert_eq!(acc[0][1], p_bytes(&f));
-    assert_eq!(acc[0][2], rev(b"FORGED").into_bytes());
-    assert_eq!(acc[0][3], rev(b"truth").into_bytes());
-    assert_eq!(
-        fx.index().get(&p_bytes(&f)).unwrap().unwrap().digest,
-        dg(b"truth")
-    );
-    assert_eq!(run(fx.ext().args(["check", "--full"])).code, 0);
-}
-
-/// `--accept` alone changes nothing when there is no violation.
-#[test]
-fn check_accept_without_violation_is_a_no_op() {
-    let fx = Fx::new();
-    fx.write("f", b"x");
-    assert_eq!(fx.check().code, 0);
-    let o = run(fx.ext().args(["check", "--accept"]));
-    assert_eq!((o.code, o.stdout.len()), (0, 0), "{}", o.stderr);
-}
-
-/// C4: MISSING reported, entry removed, exit 0.
-#[test]
-fn check_missing_removes_entry_exit_0() {
-    let fx = Fx::new();
-    let f = fx.write("f", b"bye");
-    assert_eq!(fx.check().code, 0);
-    fs::remove_file(&f).unwrap();
-    let o = fx.check();
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert_eq!(o.out(), format!("MISSING\t{}\n", f.display()));
-    assert!(fx.index().get(&p_bytes(&f)).unwrap().is_none());
 }
 
 /// A1/§1: a file now under a new sub-extant is EXCLUDED and the subtree is
@@ -947,48 +421,6 @@ fn check_unreadable_file_exits_5() {
     assert!(fx.index().get(&p_bytes(&f)).unwrap().is_some());
 }
 
-/// §1 exit 5 + C8: root behind a symlink -> REFUSED, entries kept, exit 5.
-#[test]
-fn check_refused_root_exits_5() {
-    let fx = Fx::new();
-    let real = fx.base.join("real");
-    fs::create_dir_all(real.join("r")).unwrap();
-    fs::write(real.join("r/f"), b"x").unwrap();
-    let link = fx.base.join("link");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    let root = link.join("r");
-    let st = Store::open(&fx.store).unwrap();
-    let lock = st.lock().unwrap();
-    st.edit_registry(&lock, |v| {
-        *v = vec![RegPath::from_bytes(&p_bytes(&root)).unwrap()]
-    })
-    .unwrap();
-    drop(lock);
-    fx.seed(&p_bytes(&root.join("f")), b"x");
-    let o = fx.check();
-    assert_eq!(o.code, 5, "{}", o.stderr);
-    assert_eq!(status_lines(&o, "REFUSED")[0][1], p_bytes(&root));
-    assert!(fx.index().get(&p_bytes(&root.join("f"))).unwrap().is_some());
-}
-
-/// §1 precedence: an unaccepted VIOLATION (2) outranks incomplete (5).
-#[test]
-fn violation_outranks_incomplete() {
-    if is_root() {
-        return;
-    }
-    let fx = Fx::new();
-    let a = fx.write("a", b"truth");
-    let b = fx.write("b", b"other");
-    assert_eq!(fx.check().code, 0);
-    tamper(&fx, &a);
-    fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
-    let o = run(fx.ext().args(["check", "--full"]));
-    assert_eq!(o.code, 2, "{}", o.stderr);
-    assert_eq!(status_lines(&o, "VIOLATION").len(), 1);
-    assert_eq!(status_lines(&o, "ERROR").len(), 1);
-}
-
 /// §5: symlinks and special files are counted on stderr, never listed on
 /// stdout, never followed or opened.
 #[test]
@@ -1015,45 +447,6 @@ fn check_counts_symlinks_and_special_files_on_stderr() {
     assert!(!o.out().contains("lnk") && !o.out().contains("fifo"));
 }
 
-/// §2.2 on `check` output: an ESC in a file name is shown as `\x1B`.
-#[test]
-fn check_escapes_hostile_file_names() {
-    let fx = Fx::new();
-    let name = std::ffi::OsString::from_vec(ESC_NAME.to_vec());
-    fs::write(fx.tree.join(&name), b"e").unwrap();
-    let o = fx.check();
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(!o.stdout.contains(&0x1b));
-    let mut raw = p_bytes(&fx.tree);
-    raw.push(b'/');
-    raw.extend_from_slice(ESC_NAME);
-    assert_eq!(o.out(), format!("NEW\t{}\n", escape(&raw)));
-    assert!(o.out().contains("a\\x1Bb"));
-}
-
-/// §5 `-0` on check: NUL-terminated, raw path (newline and all), tab fields.
-#[test]
-fn check_nul_mode_round_trips() {
-    let fx = Fx::new();
-    let name = OsStr::from_bytes(b"n\nl");
-    let f = fx.tree.join(name);
-    fs::write(&f, b"v1").unwrap();
-    let o = run(fx.ext().args(["check", "-0"]));
-    assert_eq!(o.code, 0, "{}", o.stderr);
-    let mut want = b"NEW\t".to_vec();
-    want.extend_from_slice(&p_bytes(&f));
-    want.push(0);
-    assert_eq!(o.stdout, want);
-
-    fs::write(&f, b"version two").unwrap();
-    let o = run(fx.ext().arg("-0").arg("check"));
-    let mut want = b"EDITED\t".to_vec();
-    want.extend_from_slice(&p_bytes(&f));
-    want.extend_from_slice(format!("\t{}\t{}", rev(b"v1"), rev(b"version two")).as_bytes());
-    want.push(0);
-    assert_eq!(o.stdout, want);
-}
-
 /// §5 rebuild: clear + full re-hash accepting everything (new baseline).
 #[test]
 fn rebuild_resets_the_baseline() {
@@ -1068,15 +461,6 @@ fn rebuild_resets_the_baseline() {
     assert_eq!(ix.get(&p_bytes(&f)).unwrap().unwrap().digest, dg(b"truth"));
     assert_eq!(ix.iter().unwrap().len(), 1, "stale entries must be gone");
     assert_eq!(run(fx.ext().args(["check", "--full"])).code, 0);
-}
-
-#[test]
-fn check_with_empty_registry_succeeds() {
-    let (_t, base) = tmp_dir();
-    let st = base.join("sys");
-    assert_eq!(run(cmd().args(["init", "--bare"]).arg(&st)).code, 0);
-    let o = run(cmd().arg("check").arg("--d").arg(&st));
-    assert_eq!((o.code, o.stdout.len()), (0, 0), "{}", o.stderr);
 }
 
 // --------------------------------------------------------------- concurrency
@@ -1111,4 +495,226 @@ fn readers_do_not_block_but_writers_wait_for_the_lock() {
         "writer finished ({early:?}) while the lock was held"
     );
     assert_eq!(status.code(), Some(0));
+}
+
+// ------------------------------------------------- store resolution wiring
+
+/// §1 order, as far as the binary has to prove it: the semantics live in
+/// store::precedence_table_all_combinations, here only that `--d` and
+/// EXTANT_DIR are wired in the right order and the cwd step is `./.ext`.
+#[test]
+fn store_resolution_wiring() {
+    let (a, b) = two_stores();
+    let listed = |c: &mut Command| run(c.arg("list")).out();
+    // --d beats EXTANT_DIR
+    let o = run(cmd()
+        .env("EXTANT_DIR", &b.store)
+        .arg("list")
+        .arg("--d")
+        .arg(&a.store));
+    assert!(o.out().contains("/only/in/a") && !o.out().contains("/only/in/b"));
+    // EXTANT_DIR alone selects
+    assert!(listed(cmd().env("EXTANT_DIR", &b.store)).contains("/only/in/b"));
+    if system_store_present() {
+        return; // would shadow ./.ext at resolution step 3
+    }
+    // ./.ext is the last resort, and an empty EXTANT_DIR counts as unset
+    let (_t, base) = tmp_dir();
+    assert_eq!(run(cmd().arg("init").arg(&base)).code, 0);
+    for env in [None, Some("")] {
+        let mut c = cmd();
+        c.current_dir(&base);
+        if let Some(v) = env {
+            c.env("EXTANT_DIR", v);
+        }
+        let o = run(c.arg("list"));
+        assert_eq!(o.code, 0, "EXTANT_DIR={env:?}: {}", o.stderr);
+    }
+}
+
+// ----------------------------------------------------------- init, roots
+
+/// R7: init never overwrites: exit 4, the path named, bytes untouched.
+#[test]
+fn init_never_overwrites() {
+    let (_t, base) = tmp_dir();
+    assert_eq!(run(cmd().arg("init").arg(&base)).code, 0);
+    let before = fs::read(base.join(".ext/registry")).unwrap();
+    let o = run(cmd().arg("init").arg(&base));
+    assert_eq!(o.code, 4);
+    assert!(o.stderr.contains(base.to_str().unwrap()), "{}", o.stderr);
+    assert_eq!(fs::read(base.join(".ext/registry")).unwrap(), before);
+
+    let st = base.join("sys");
+    fs::create_dir(&st).unwrap();
+    fs::write(st.join("keep"), b"x").unwrap();
+    let o = run(cmd().args(["init", "--bare"]).arg(&st));
+    assert_eq!(o.code, 4);
+    assert!(o.stderr.contains(st.to_str().unwrap()), "{}", o.stderr);
+    assert_eq!(fs::read(st.join("keep")).unwrap(), b"x");
+}
+
+/// S3: register, canonicalise, unregister, through the binary.
+#[test]
+fn roots() {
+    let fx = Fx::new();
+    let registry_lines = |fx: &Fx| split(&fx.registry_text(), b'\n');
+    let other = fx.base.join("other");
+    fs::create_dir_all(other.join("sub")).unwrap();
+    fs::write(other.join("f"), b"payload").unwrap();
+
+    // `-r`, through a messy path, twice: one canonical line.
+    let messy = other.join("sub/..");
+    for _ in 0..2 {
+        let o = run(fx.ext().arg("-r").arg(&messy));
+        assert_eq!(o.code, 0, "{}", o.stderr);
+    }
+    let hits = registry_lines(&fx).iter().filter(|l| **l == p_bytes(&other)).count();
+    assert_eq!(hits, 1, "{}", String::from_utf8_lossy(&fx.registry_text()));
+    assert!(!String::from_utf8_lossy(&fx.registry_text()).contains(".."));
+
+    // Through a symlink: the real directory is recorded, not the link.
+    let real = fx.base.join("real");
+    fs::create_dir(&real).unwrap();
+    let link = fx.base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(run(fx.ext().arg("register").arg(&link)).code, 0);
+    assert!(registry_lines(&fx).contains(&p_bytes(&real)));
+    assert!(!registry_lines(&fx).contains(&p_bytes(&link)));
+
+    // A path that does not exist: exit 4, named, registry unchanged.
+    let ghost = fx.base.join("ghost");
+    let before = fx.registry_text();
+    let o = run(fx.ext().arg("register").arg(&ghost));
+    assert_eq!(o.code, 4);
+    assert!(o.stderr.contains(ghost.to_str().unwrap()), "{}", o.stderr);
+    assert_eq!(fx.registry_text(), before);
+
+    // `-u` drops the line and the entries; the files are untouched.
+    assert_eq!(run(fx.ext().arg("resolve").arg(rev(b"payload"))).code, 0);
+    let o = run(fx.ext().arg("-u").arg(&other));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(!registry_lines(&fx).contains(&p_bytes(&other)));
+    assert_eq!(run(fx.ext().arg("resolve").arg(rev(b"payload"))).code, 1);
+    assert!(other.join("f").exists());
+}
+
+// ------------------------------------------------- what e2e.rs does not say
+
+/// Rows the lifecycle in e2e.rs lacks: resolve's accepted spellings and its
+/// miss, `--hex` on check, and a deletion reported as MISSING.
+#[test]
+fn resolve_and_check_wiring() {
+    let fx = Fx::new();
+    fx.seed(b"/x/file", b"content");
+    let d = dg(b"content");
+    for form in [
+        format!("{}:SHA-256", d.encode(Enc::Hex).to_lowercase()),
+        format!("SHA-256:{}", d.encode(Enc::B64ut)),
+    ] {
+        let o = run(fx.ext().arg("resolve").arg(&form));
+        assert_eq!((o.code, o.out().as_str()), (0, "/x/file\n"), "{form}: {}", o.stderr);
+    }
+    let o = run(fx.ext().arg("resolve").arg(rev(b"absent")));
+    assert_eq!((o.code, o.stdout.len()), (1, 0));
+
+    let f = fx.write("f", b"before");
+    assert_eq!(fx.check().code, 0);
+    fs::write(&f, b"after, longer").unwrap();
+    let o = run(fx.ext().args(["--hex", "check"]));
+    assert_eq!(
+        o.out(),
+        format!(
+            "EDITED\t{}\t{}\t{}\n",
+            f.display(),
+            rev_hex(b"before"),
+            rev_hex(b"after, longer")
+        )
+    );
+    fs::remove_file(&f).unwrap();
+    let o = fx.check();
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.out(), format!("MISSING\t{}\n", f.display()));
+    assert!(fx.index().get(&p_bytes(&f)).unwrap().is_none());
+}
+
+/// S4: control, bidi, tab, newline and invalid-UTF-8 bytes in file names
+/// never reach a terminal raw, in text mode, and survive exactly under `-0`.
+#[test]
+fn hostile_names() {
+    let fx = Fx::new();
+    let names: [&[u8]; 5] = [
+        b"a\x1b[31m",
+        b"n\nl",
+        b"t\tb",
+        "\u{202e}rtl".as_bytes(),
+        b"\xffbad",
+    ];
+    let mut files: Vec<(Vec<u8>, String)> = Vec::new();
+    for (i, n) in names.iter().enumerate() {
+        let content = format!("content {i}");
+        let p = fx.tree.join(OsStr::from_bytes(n));
+        fs::write(&p, &content).unwrap();
+        files.push((p_bytes(&p), content));
+    }
+    let sorted = |mut v: Vec<String>| {
+        v.sort();
+        v
+    };
+
+    let o = fx.check();
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    for raw in [0x1bu8, 0xff] {
+        assert!(!o.stdout.contains(&raw), "raw byte {raw:#x} in check output");
+    }
+    assert!(!o.out().contains('\u{202e}'));
+    let text: Vec<String> = o.out().lines().map(str::to_owned).collect();
+    assert!(text.iter().all(|l| l.split('\t').count() == 2), "{text:?}");
+    let want = files
+        .iter()
+        .map(|(p, _)| format!("NEW\t{}", escape(p)))
+        .collect();
+    assert_eq!(sorted(text), sorted(want));
+
+    for (p, c) in &files {
+        let o = run(fx.ext().arg("resolve").arg(rev(c.as_bytes())));
+        assert_eq!((o.code, o.out()), (0, format!("{}\n", escape(p))));
+    }
+    let o = run(fx.ext().arg("list"));
+    let want = files
+        .iter()
+        .map(|(p, c)| format!("{}\t{}", rev(c.as_bytes()), escape(p)))
+        .collect();
+    assert_eq!(sorted(o.out().lines().map(str::to_owned).collect()), sorted(want));
+
+    // -0: raw paths, NUL-terminated records.
+    let nul_sorted = |o: &Out| {
+        let mut v = split(&o.stdout, 0);
+        v.sort();
+        v
+    };
+    let raw_records = |prefix: &dyn Fn(&str) -> Vec<u8>| {
+        let mut v: Vec<Vec<u8>> = files
+            .iter()
+            .map(|(p, c)| {
+                let mut r = prefix(c);
+                r.extend_from_slice(p);
+                r
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let o = run(fx.ext().args(["-0", "rebuild"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(nul_sorted(&o), raw_records(&|_| b"NEW\t".to_vec()));
+    let o = run(fx.ext().args(["-0", "list"]));
+    assert_eq!(
+        nul_sorted(&o),
+        raw_records(&|c| format!("{}\t", rev(c.as_bytes())).into_bytes())
+    );
+    for (p, c) in &files {
+        let o = run(fx.ext().args(["-0", "resolve"]).arg(rev(c.as_bytes())));
+        assert_eq!(o.stdout, [p.as_slice(), b"\0"].concat());
+    }
 }
