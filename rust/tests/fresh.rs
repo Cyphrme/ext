@@ -79,9 +79,21 @@ fn should_skip_table() {
     let settled = meta(7, T - 100 * W, T - 100 * W, 1, 2);
     let racy = meta(7, T - W / 2, T - 100 * W, 1, 2);
     let rows: &[(&str, Option<Entry>, Meta, bool, bool)] = &[
-        ("settled and equal", Some(entry(settled, T, b"x")), settled, false, true),
+        (
+            "settled and equal",
+            Some(entry(settled, T, b"x")),
+            settled,
+            false,
+            true,
+        ),
         ("racy", Some(entry(racy, T, b"x")), racy, false, false),
-        ("--full", Some(entry(settled, T, b"x")), settled, true, false),
+        (
+            "--full",
+            Some(entry(settled, T, b"x")),
+            settled,
+            true,
+            false,
+        ),
         ("no entry", None, settled, false, false),
         (
             "field differs",
@@ -92,7 +104,11 @@ fn should_skip_table() {
         ),
     ];
     for (name, stored, current, full, want) in rows {
-        assert_eq!(should_skip(stored.as_ref(), current, *full), *want, "{name}");
+        assert_eq!(
+            should_skip(stored.as_ref(), current, *full),
+            *want,
+            "{name}"
+        );
     }
 }
 
@@ -107,12 +123,48 @@ fn classify_table() {
     let racy = entry(old, T - 100 * W + 1, b"old");
     let rows: &[(&str, Option<&Entry>, Meta, Digest, Status)] = &[
         ("no entry", None, old, dg(b"x"), Status::New),
-        ("same digest, same meta", Some(&settled), old, dg(b"old"), Status::Unchanged),
-        ("same digest, new meta", Some(&settled), moved, dg(b"old"), Status::Unchanged),
-        ("same digest, racy", Some(&racy), old, dg(b"old"), Status::Unchanged),
-        ("new digest, same meta, settled", Some(&settled), old, dg(b"new"), Status::Violation),
-        ("new digest, same meta, racy", Some(&racy), old, dg(b"new"), Status::Edited),
-        ("new digest, new meta", Some(&settled), moved, dg(b"new"), Status::Edited),
+        (
+            "same digest, same meta",
+            Some(&settled),
+            old,
+            dg(b"old"),
+            Status::Unchanged,
+        ),
+        (
+            "same digest, new meta",
+            Some(&settled),
+            moved,
+            dg(b"old"),
+            Status::Unchanged,
+        ),
+        (
+            "same digest, racy",
+            Some(&racy),
+            old,
+            dg(b"old"),
+            Status::Unchanged,
+        ),
+        (
+            "new digest, same meta, settled",
+            Some(&settled),
+            old,
+            dg(b"new"),
+            Status::Violation,
+        ),
+        (
+            "new digest, same meta, racy",
+            Some(&racy),
+            old,
+            dg(b"new"),
+            Status::Edited,
+        ),
+        (
+            "new digest, new meta",
+            Some(&settled),
+            moved,
+            dg(b"new"),
+            Status::Edited,
+        ),
     ];
     for (name, stored, cur, digest, want) in rows {
         assert_eq!(classify(*stored, cur, digest), *want, "{name}");

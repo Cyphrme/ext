@@ -80,7 +80,10 @@ fn unescape_rejects() {
         let r = unescape(s);
         assert!(r.is_err(), "{s:?}");
         if let Some(index) = idx {
-            assert!(matches!(r, Err(EscapeError::BadEscape { index: i }) if i == *index), "{s:?}: {r:?}");
+            assert!(
+                matches!(r, Err(EscapeError::BadEscape { index: i }) if i == *index),
+                "{s:?}: {r:?}"
+            );
         }
     }
 }

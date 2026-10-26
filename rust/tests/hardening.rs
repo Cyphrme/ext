@@ -155,9 +155,17 @@ fn index_open_after_swap() {
             Index::open(&st).is_err(),
             "decoy_db={decoy_db}: opened the swapped-in directory"
         );
-        assert_eq!(listing(&dir), listed, "decoy_db={decoy_db}: wal/shm/db created");
+        assert_eq!(
+            listing(&dir),
+            listed,
+            "decoy_db={decoy_db}: wal/shm/db created"
+        );
         if let Some(before) = before {
-            assert_eq!(fs::read(dir.join("index.db")).unwrap(), before, "decoy modified");
+            assert_eq!(
+                fs::read(dir.join("index.db")).unwrap(),
+                before,
+                "decoy modified"
+            );
         }
     }
 }
@@ -405,4 +413,3 @@ fn ancestor_check_uses_the_canonical_path() {
     symlink(&b, trusted.join("link")).unwrap();
     assert!(is_unsafe(&Store::open(&trusted.join("link/s")), &a));
 }
-

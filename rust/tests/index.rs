@@ -130,7 +130,9 @@ fn schema_version_mismatch_is_refused() {
     let st = Store::init_bare(&dir).unwrap();
     drop(Index::open(&st).unwrap());
     let raw = Connection::open(dir.join("index.db")).unwrap();
-    let v: i64 = raw.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    let v: i64 = raw
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(v, 1);
     raw.pragma_update(None, "user_version", 2).unwrap();
     assert!(

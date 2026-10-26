@@ -41,7 +41,6 @@ proptest! {
     }
 }
 
-
 #[test]
 fn parse_rejects() {
     use RegistryErrorKind as K;

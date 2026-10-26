@@ -203,7 +203,11 @@ fn usage_errors_exit_4() {
     let v = dg(b"c").encode(Enc::B64ut);
     let unlabelled = run(fx.ext().arg("resolve").arg(&v));
     assert_eq!(unlabelled.code, 4);
-    assert!(unlabelled.stderr.to_lowercase().contains("label"), "{}", unlabelled.stderr);
+    assert!(
+        unlabelled.stderr.to_lowercase().contains("label"),
+        "{}",
+        unlabelled.stderr
+    );
     let bad_char = format!("{}$:SHA-256", &v[..42]);
     let o = run(fx.ext().arg("resolve").arg(&bad_char));
     assert_eq!((o.code, o.stdout.len()), (4, 0), "{}", o.stderr);
@@ -569,7 +573,10 @@ fn roots() {
         let o = run(fx.ext().arg("-r").arg(&messy));
         assert_eq!(o.code, 0, "{}", o.stderr);
     }
-    let hits = registry_lines(&fx).iter().filter(|l| **l == p_bytes(&other)).count();
+    let hits = registry_lines(&fx)
+        .iter()
+        .filter(|l| **l == p_bytes(&other))
+        .count();
     assert_eq!(hits, 1, "{}", String::from_utf8_lossy(&fx.registry_text()));
     assert!(!String::from_utf8_lossy(&fx.registry_text()).contains(".."));
 
@@ -613,7 +620,12 @@ fn resolve_and_check_wiring() {
         format!("SHA-256:{}", d.encode(Enc::B64ut)),
     ] {
         let o = run(fx.ext().arg("resolve").arg(&form));
-        assert_eq!((o.code, o.out().as_str()), (0, "/x/file\n"), "{form}: {}", o.stderr);
+        assert_eq!(
+            (o.code, o.out().as_str()),
+            (0, "/x/file\n"),
+            "{form}: {}",
+            o.stderr
+        );
     }
     let o = run(fx.ext().arg("resolve").arg(rev(b"absent")));
     assert_eq!((o.code, o.stdout.len()), (1, 0));
@@ -665,7 +677,10 @@ fn hostile_names() {
     let o = fx.check();
     assert_eq!(o.code, 0, "{}", o.stderr);
     for raw in [0x1bu8, 0xff] {
-        assert!(!o.stdout.contains(&raw), "raw byte {raw:#x} in check output");
+        assert!(
+            !o.stdout.contains(&raw),
+            "raw byte {raw:#x} in check output"
+        );
     }
     assert!(!o.out().contains('\u{202e}'));
     let text: Vec<String> = o.out().lines().map(str::to_owned).collect();
@@ -685,7 +700,10 @@ fn hostile_names() {
         .iter()
         .map(|(p, c)| format!("{}\t{}", rev(c.as_bytes()), escape(p)))
         .collect();
-    assert_eq!(sorted(o.out().lines().map(str::to_owned).collect()), sorted(want));
+    assert_eq!(
+        sorted(o.out().lines().map(str::to_owned).collect()),
+        sorted(want)
+    );
 
     // -0: raw paths, NUL-terminated records.
     let nul_sorted = |o: &Out| {

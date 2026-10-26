@@ -101,7 +101,10 @@ fn every_noncanonical_final_char_rejected_exhaustively() {
 #[test]
 fn decode_rejects() {
     use DigestError as E;
-    let wl = |got| E::WrongLength { alg: Alg::Sha256, got };
+    let wl = |got| E::WrongLength {
+        alg: Alg::Sha256,
+        got,
+    };
     let ic = |index, ch| E::InvalidChar { index, ch };
     let with = |base: &str, at: usize, c: char| {
         let mut s = base.to_string();
@@ -111,7 +114,11 @@ fn decode_rejects() {
     let mut rows: Vec<(String, bool, DigestError)> = vec![
         (String::new(), false, wl(0)),
         (format!(" {EMPTY_B64}"), false, wl(44)),
-        (format!("{} {}", &EMPTY_B64[..20], &EMPTY_B64[21..]), false, ic(20, ' ')),
+        (
+            format!("{} {}", &EMPTY_B64[..20], &EMPTY_B64[21..]),
+            false,
+            ic(20, ' '),
+        ),
         // padded form of a 32-byte value is a length error, not a decode
         (format!("{EMPTY_B64}="), false, wl(44)),
         // lengths and indices count chars, not bytes
@@ -121,19 +128,47 @@ fn decode_rejects() {
         (EMPTY_B64.into(), true, E::Unlabelled),
         (EMPTY_HEX.into(), true, E::Unlabelled),
         (String::new(), true, E::Unlabelled),
-        (format!("hash://SHA-256:{EMPTY_B64}"), true, E::TooManyColons),
+        (
+            format!("hash://SHA-256:{EMPTY_B64}"),
+            true,
+            E::TooManyColons,
+        ),
         ("a:b:c".into(), true, E::TooManyColons),
-        (format!("{EMPTY_B64}:sha-256"), true, E::UnknownAlg("sha-256".into())),
-        (format!("sha-256:{EMPTY_B64}"), true, E::UnknownAlg(EMPTY_B64.into())),
-        (format!("{EMPTY_B64}:MD5"), true, E::UnknownAlg("MD5".into())),
+        (
+            format!("{EMPTY_B64}:sha-256"),
+            true,
+            E::UnknownAlg("sha-256".into()),
+        ),
+        (
+            format!("sha-256:{EMPTY_B64}"),
+            true,
+            E::UnknownAlg(EMPTY_B64.into()),
+        ),
+        (
+            format!("{EMPTY_B64}:MD5"),
+            true,
+            E::UnknownAlg("MD5".into()),
+        ),
         ("AAAA:SHA-256".into(), true, wl(4)),
         ("SHA-256:AAAA".into(), true, wl(4)),
-        (format!("{}:SHA-256", with(EMPTY_HEX, 3, 'G')), true, ic(3, 'G')),
-        (format!("{}B:SHA-256", &EMPTY_B64[..42]), true, E::NonCanonical),
+        (
+            format!("{}:SHA-256", with(EMPTY_HEX, 3, 'G')),
+            true,
+            ic(3, 'G'),
+        ),
+        (
+            format!("{}B:SHA-256", &EMPTY_B64[..42]),
+            true,
+            E::NonCanonical,
+        ),
     ];
     // the algorithm name is matched exactly
     for bad in ["sha-256", "Sha-256", "SHA256", "SHA-256 ", " SHA-256", ""] {
-        rows.push((format!("{EMPTY_B64}:{bad}"), true, E::UnknownAlg(bad.into())));
+        rows.push((
+            format!("{EMPTY_B64}:{bad}"),
+            true,
+            E::UnknownAlg(bad.into()),
+        ));
     }
     for c in ('G'..='Z').chain('g'..='z') {
         rows.push((with(EMPTY_HEX, 10, c), false, ic(10, c)));
