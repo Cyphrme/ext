@@ -65,6 +65,11 @@ impl Store {
         todo!("step 2: create flat store")
     }
 
+    /// `(dev, ino)` of the store directory, taken from its held fd.
+    pub fn id(&self) -> (u64, u64) {
+        todo!("step 2: fstat the held dir fd")
+    }
+
     pub fn lock(&self) -> Result<WriteLock, StoreError> {
         todo!("step 2: flock")
     }

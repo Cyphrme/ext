@@ -206,7 +206,7 @@ fn open_group_or_other_writable_refused() {
             r.err()
         );
     }
-    for f in ["registry", "index.db"] {
+    for f in ["registry", "index.db", "lock"] {
         let t = tempfile::tempdir().unwrap();
         let dir = t.path().join("s");
         Store::init_bare(&dir).unwrap();
@@ -367,4 +367,108 @@ fn lock_excludes_second_writer() {
     rx.recv_timeout(Duration::from_secs(10))
         .expect("second lock after release");
     h.join().unwrap();
+}
+
+/// R3: `lock()` creates a missing lock file (0600); open tolerates its absence.
+#[test]
+fn lock_creates_missing_lock_file() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    Store::init_bare(&dir).unwrap();
+    fs::remove_file(dir.join("lock")).unwrap();
+    let st = Store::open(&dir).expect("store without lock file still opens");
+    let _g = st.lock().unwrap();
+    let md = fs::metadata(dir.join("lock")).unwrap();
+    assert!(md.is_file());
+    assert_eq!(md.permissions().mode() & 0o777, 0o600);
+}
+
+/// R3: the registry is replaced by rename, so the lock must be a separate
+/// file whose inode survives registry rewrites.
+#[test]
+fn lock_file_survives_registry_rewrites() {
+    use std::os::unix::fs::MetadataExt;
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    let st = Store::init_bare(&dir).unwrap();
+    let before = fs::metadata(dir.join("lock")).unwrap().ino();
+    let g = st.lock().unwrap();
+    st.edit_registry(&g, |v| v.push(rp(b"/x"))).unwrap();
+    assert_eq!(fs::metadata(dir.join("lock")).unwrap().ino(), before);
+}
+
+/// R7: init never overwrites an existing store.
+#[test]
+fn init_bare_refuses_existing_path() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    let st = Store::init_bare(&dir).unwrap();
+    let g = st.lock().unwrap();
+    st.edit_registry(&g, |v| v.push(rp(b"/keep"))).unwrap();
+    drop(g);
+    match Store::init_bare(&dir) {
+        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
+        other => panic!("expected Io(AlreadyExists), got {:?}", other.err()),
+    }
+    assert_eq!(
+        Store::open(&dir).unwrap().registry().unwrap(),
+        vec![rp(b"/keep")]
+    );
+    // Any pre-existing path counts, even an empty directory.
+    let empty = t.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    assert!(matches!(
+        Store::init_bare(&empty),
+        Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+}
+
+#[test]
+fn init_extant_refuses_existing_dot_ext() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = fs::canonicalize(t.path()).unwrap();
+    Store::init_extant(&dir).unwrap();
+    match Store::init_extant(&dir) {
+        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
+        other => panic!("expected Io(AlreadyExists), got {:?}", other.err()),
+    }
+    let t2 = tempfile::tempdir().unwrap();
+    let d2 = fs::canonicalize(t2.path()).unwrap();
+    fs::create_dir(d2.join(".ext")).unwrap();
+    assert!(matches!(
+        Store::init_extant(&d2),
+        Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+}
+
+/// R9: id() is the (dev, ino) of the store directory, for every way of
+/// obtaining a Store.
+#[test]
+fn id_matches_store_directory_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    let want = |p: &Path| {
+        let m = fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    assert_eq!(Store::init_bare(&dir).unwrap().id(), want(&dir));
+    assert_eq!(Store::open(&dir).unwrap().id(), want(&dir));
+    let ext = fs::canonicalize(t.path()).unwrap();
+    assert_eq!(
+        Store::init_extant(&ext).unwrap().id(),
+        want(&ext.join(".ext"))
+    );
+}
+
+/// R9: the directory fd is opened O_NOFOLLOW, so a symlink to a store is not
+/// a store.
+#[test]
+fn open_refuses_symlinked_store_dir() {
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real");
+    Store::init_bare(&real).unwrap();
+    let link = t.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert!(Store::open(&link).is_err());
 }

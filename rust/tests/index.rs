@@ -91,14 +91,14 @@ fn meta_fields_roundtrip_exactly() {
 #[test]
 fn by_digest_returns_every_path_with_that_digest() {
     let (_t, _st, ix) = fresh();
-    for p in [&b"/r/one"[..], b"/r/two", b"/other/root/three"] {
+    for p in [&b"/r/two"[..], b"/r/one", b"/other/root/three"] {
         ix.upsert(&entry(p, b"same content")).unwrap();
     }
     ix.upsert(&entry(b"/r/different", b"other content"))
         .unwrap();
     let d = Digest::compute(Alg::Sha256, b"same content");
     assert_eq!(
-        sorted(ix.by_digest(&d).unwrap()),
+        ix.by_digest(&d).unwrap(),
         vec![
             b"/other/root/three".to_vec(),
             b"/r/one".to_vec(),
@@ -277,4 +277,36 @@ fn reconcile_with_root_slash_keeps_everything_and_empty_registry_drops_all() {
     assert_eq!(ix.iter().unwrap().len(), 2);
     ix.reconcile(&[]).unwrap();
     assert!(ix.iter().unwrap().is_empty());
+}
+
+/// R6: by_digest is ordered by raw bytes (memcmp), not by text collation.
+#[test]
+fn by_digest_is_sorted_by_bytes() {
+    let (_t, _st, ix) = fresh();
+    let paths: [&[u8]; 6] = [b"/b", b"/\xff", b"/a", b"/\x7f", b"/a/b", b"/A"];
+    for p in paths {
+        ix.upsert(&entry(p, b"same")).unwrap();
+    }
+    let got = ix
+        .by_digest(&Digest::compute(Alg::Sha256, b"same"))
+        .unwrap();
+    let mut want: Vec<Vec<u8>> = paths.iter().map(|p| p.to_vec()).collect();
+    want.sort();
+    assert_eq!(got, want);
+}
+
+/// R5: Index::open leaves the database in WAL mode (persisted in the file,
+/// so an independent connection sees it). busy_timeout is per-connection and
+/// not observable from outside; it is not tested.
+#[test]
+fn open_sets_wal_journal_mode() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    let st = Store::init_bare(&dir).unwrap();
+    let _ix = Index::open(&st).unwrap();
+    let c = Connection::open(dir.join("index.db")).unwrap();
+    let mode: String = c
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
 }

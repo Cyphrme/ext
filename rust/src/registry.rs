@@ -11,6 +11,7 @@ pub struct RegPath(Vec<u8>);
 pub enum RegistryErrorKind {
     Relative,
     NotNormalised,
+    Nul,
     Escape(EscapeError),
 }
 

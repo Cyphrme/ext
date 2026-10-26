@@ -117,3 +117,69 @@ fn from_bytes_rejects_relative_and_dot_segments() {
     ));
     assert!(RegPath::from_bytes(b"/").is_ok());
 }
+
+#[test]
+fn from_bytes_collapses_slashes_and_strips_trailing() {
+    use ext::registry::RegPath;
+    assert_eq!(RegPath::from_bytes(b"/a//b/").unwrap(), rp(b"/a/b"));
+    assert_eq!(RegPath::from_bytes(b"//").unwrap(), rp(b"/"));
+    assert_eq!(RegPath::from_bytes(b"/a///b//c").unwrap(), rp(b"/a/b/c"));
+    assert_eq!(RegPath::from_bytes(b"/a/b/").unwrap().as_bytes(), b"/a/b");
+    assert_eq!(RegPath::from_bytes(b"/").unwrap().as_bytes(), b"/");
+}
+
+#[test]
+fn from_bytes_rejects_dot_segments_as_not_normalised() {
+    use ext::registry::RegPath;
+    for p in [
+        &b"/a/./b"[..],
+        b"/a/..",
+        b"/..",
+        b"/.",
+        b"/a/../b",
+        b"/a/./",
+    ] {
+        assert!(
+            matches!(
+                RegPath::from_bytes(p),
+                Err(RegistryErrorKind::NotNormalised)
+            ),
+            "{p:?}"
+        );
+    }
+    // Dots inside a name are ordinary.
+    assert!(RegPath::from_bytes(b"/a/.hidden/..x/y.").is_ok());
+}
+
+#[test]
+fn from_bytes_rejects_nul() {
+    use ext::registry::RegPath;
+    assert!(matches!(
+        RegPath::from_bytes(b"/a\0b"),
+        Err(RegistryErrorKind::Nul)
+    ));
+}
+
+#[test]
+fn parse_applies_normalisation_per_line() {
+    assert_eq!(parse(b"/srv/www/\n").unwrap(), vec![rp(b"/srv/www")]);
+    assert_eq!(parse(b"/a//b\n").unwrap(), vec![rp(b"/a/b")]);
+    // Normalised duplicates are dropped.
+    assert_eq!(parse(b"/a/b\n/a//b/\n").unwrap(), vec![rp(b"/a/b")]);
+    for bad in ["/srv/../etc", "/a/./b", "/.."] {
+        let input = format!("/ok\n{bad}\n");
+        let r = parse(input.as_bytes());
+        assert!(
+            matches!(r, Err((2, RegistryErrorKind::NotNormalised))),
+            "{bad}: {r:?}"
+        );
+    }
+}
+
+#[test]
+fn parse_rejects_nul_whether_escaped_or_raw() {
+    let r = parse(b"/ok\n/a\\x00b\n");
+    assert!(matches!(r, Err((2, RegistryErrorKind::Nul))), "{r:?}");
+    let r = parse(b"/ok\n/a\0b\n");
+    assert!(matches!(r, Err((2, RegistryErrorKind::Nul))), "{r:?}");
+}
