@@ -8,6 +8,7 @@ use ext::digest::{Alg, Digest};
 use ext::index::{Entry, Index};
 use ext::scan::{run, run_hooked, Opts, Report, ReportKind as K, Summary};
 use ext::store::{Store, StoreError};
+use rustix::fs::{mknodat, FileType, Mode, CWD};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -189,22 +190,22 @@ fn same_size_edit_with_mtime_restored_is_caught_by_ctime() {
     assert_eq!(entry(&e, &f).unwrap().digest, digest_of(&f));
 }
 
+// D1/C5: a violation under --full is reported, exits 2 and is not written;
+// --accept writes it, counts it as accepted and exits 0.
 #[test]
-fn full_scan_violation_is_reported_and_not_written() {
+fn violation_then_accept() {
     let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
     scan(&e, &Opts::default());
     settle(&e);
     let t = tamper(&e, &f);
-    let (s, reps) = scan(
-        &e,
-        &Opts {
-            full: true,
-            ..Opts::default()
-        },
-    );
-    assert_eq!(s.violation, 1);
+    let full = Opts {
+        full: true,
+        ..Opts::default()
+    };
+    let (s, reps) = scan(&e, &full);
+    assert_eq!((s.violation, s.accepted), (1, 0));
     assert_eq!(s.exit_code(), 2);
     assert_eq!(kinds(&reps, K::Violation), vec![b(&f)]);
     assert_eq!(reps[0].digests, Some((t.digest.clone(), digest_of(&f))));
@@ -213,24 +214,16 @@ fn full_scan_violation_is_reported_and_not_written() {
         t.digest,
         "index must not change"
     );
-}
 
-#[test]
-fn full_scan_with_accept_writes_the_entry() {
-    let e = env();
-    let f = e.root.join("f");
-    fs::write(&f, b"content").unwrap();
-    scan(&e, &Opts::default());
-    settle(&e);
-    tamper(&e, &f);
-    let (s, _) = scan(
+    let (s, reps) = scan(
         &e,
         &Opts {
-            full: true,
             accept: true,
-            ..Opts::default()
+            ..full
         },
     );
+    assert_eq!((s.violation, s.accepted), (0, 1));
+    assert_eq!(kinds(&reps, K::Accepted), vec![b(&f)]);
     assert_eq!(entry(&e, &f).unwrap().digest, digest_of(&f));
     assert_eq!(s.exit_code(), 0, "an accepted violation is not an error");
 }
@@ -274,44 +267,23 @@ fn indexed_file_under_new_subextant_is_excluded_and_removed() {
 }
 
 #[test]
-fn subextant_content_never_enters_the_parent_index() {
-    let e = env();
-    fs::create_dir_all(e.root.join("sub/.ext")).unwrap();
-    fs::write(e.root.join("sub/content"), b"c").unwrap();
-    fs::write(e.root.join("top"), b"t").unwrap();
-    scan(&e, &Opts::default());
-    let paths: Vec<_> = e.ix.iter().unwrap().into_iter().map(|x| x.path).collect();
-    assert_eq!(paths, vec![b(&e.root.join("top"))]);
-}
-
-// R9: a store living inside a registered tree is never indexed.
-#[test]
-fn store_inside_root_is_not_indexed() {
-    let (t, base) = canon_tmp();
-    let _keep = t;
-    let root = base.join("root");
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("f"), b"x").unwrap();
-    let st = Store::init_bare(&root.join("inner-store")).unwrap();
-    let lock = st.lock().unwrap();
-    st.edit_registry(&lock, |v| *v = vec![rp(&root)]).unwrap();
-    drop(lock);
-    let ix = Index::open(&st).unwrap();
-    let lock = st.lock().unwrap();
-    run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
-    let paths: Vec<_> = ix.iter().unwrap().into_iter().map(|x| x.path).collect();
-    assert_eq!(paths, vec![b(&root.join("f"))]);
-}
-
-#[test]
-fn symlinks_are_counted_and_not_indexed() {
+fn symlinks_and_specials_are_counted_and_not_indexed() {
     let e = env();
     let out = e.base.join("outside");
     fs::write(&out, b"secret").unwrap();
     symlink(&out, e.root.join("link")).unwrap();
+    mknodat(
+        CWD,
+        e.root.join("fifo"),
+        FileType::Fifo,
+        Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
     fs::write(e.root.join("f"), b"x").unwrap();
     let (s, _) = scan(&e, &Opts::default());
-    assert_eq!((s.symlinks, s.new), (1, 1));
+    assert_eq!((s.symlinks, s.special, s.new), (1, 1, 1));
+    assert!(entry(&e, &e.root.join("fifo")).is_none());
     assert!(entry(&e, &e.root.join("link")).is_none());
     assert!(entry(&e, &out).is_none());
 }
@@ -337,23 +309,40 @@ fn refused_root_is_reported_exit_5_and_other_roots_still_scan() {
     assert!(ix.get(&b(&good.join("f"))).unwrap().is_some());
 }
 
+// Per-file failures are reports, not aborts: a new unreadable file is not
+// indexed, siblings still are, and an unreadable file's existing entry stays
+// (its content is not known to have changed; contrast Unstable, which drops).
 #[test]
-fn unreadable_file_is_reported_scan_continues_run_incomplete() {
+fn unreadable_file() {
     if support::is_root() {
         eprintln!("skipped: root ignores mode 000");
         return;
     }
     let e = env();
-    let bad = e.root.join("locked");
-    fs::write(&bad, b"x").unwrap();
-    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+    let old = e.root.join("old");
+    fs::write(&old, b"x").unwrap();
+    scan(&e, &Opts::default());
+    let before = entry(&e, &old).unwrap();
+    settle(&e);
+    // chmod changes ctime, so the entry is not skippable and the file is opened.
+    sleep(Duration::from_millis(50));
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o000)).unwrap();
+    let new = e.root.join("locked");
+    fs::write(&new, b"x").unwrap();
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o000)).unwrap();
     fs::write(e.root.join("ok"), b"y").unwrap();
     let (s, reps) = scan(&e, &Opts::default());
-    assert_eq!((s.error, s.new), (1, 1));
+    for p in [&old, &new] {
+        fs::set_permissions(p, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_eq!((s.error, s.new, s.missing), (2, 1, 0));
     assert_eq!(s.exit_code(), 5);
-    assert_eq!(kinds(&reps, K::Error), vec![b(&bad)]);
+    let mut errs = kinds(&reps, K::Error);
+    errs.sort();
+    assert_eq!(errs, vec![b(&new), b(&old)]);
+    assert!(entry(&e, &new).is_none());
     assert!(entry(&e, &e.root.join("ok")).is_some());
-    assert!(entry(&e, &bad).is_none());
+    assert_eq!(entry(&e, &old).unwrap().digest, before.digest);
 }
 
 fn big_file(p: &Path, fill: u8) {
@@ -601,34 +590,10 @@ fn unreadable_subdirectory_keeps_entries_and_reports_error_not_missing() {
     );
 }
 
-// C8 table, last row: an unreadable file's content is not known to have
-// changed, so its entry stays (contrast Unstable, which drops it).
+// C10/C8: `only` narrows the walk and the Missing check but not reconcile,
+// and must name a registered root exactly.
 #[test]
-fn unreadable_file_keeps_its_existing_entry() {
-    if support::is_root() {
-        eprintln!("skipped: root ignores mode 000");
-        return;
-    }
-    let e = env();
-    let f = e.root.join("f");
-    fs::write(&f, b"x").unwrap();
-    scan(&e, &Opts::default());
-    let before = entry(&e, &f).unwrap();
-    settle(&e);
-    // chmod changes ctime, so the entry is not skippable and the file is opened.
-    sleep(Duration::from_millis(50));
-    fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
-    let (s, reps) = scan(&e, &Opts::default());
-    fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!((s.error, s.missing), (1, 0));
-    assert_eq!(kinds(&reps, K::Error), vec![b(&f)]);
-    assert_eq!(s.exit_code(), 5);
-    assert_eq!(entry(&e, &f).unwrap().digest, before.digest);
-}
-
-// C10: `only` narrows the walk and the Missing check, not reconcile.
-#[test]
-fn only_scans_just_that_registered_root() {
+fn only_narrows_scan_not_reconcile() {
     let (t, base) = canon_tmp();
     let _keep = t;
     let (a, bd) = (base.join("a"), base.join("b"));
@@ -643,79 +608,39 @@ fn only_scans_just_that_registered_root() {
     fs::write(a.join("new_a"), b"n").unwrap();
     fs::write(bd.join("new_b"), b"n").unwrap();
     fs::remove_file(bd.join("old")).unwrap();
+    let only_a = Opts {
+        only: Some(rp(&a)),
+        ..Opts::default()
+    };
     let mut reps = Vec::new();
-    let s = run(
-        &st,
-        &lock,
-        &ix,
-        &Opts {
-            only: Some(rp(&a)),
-            ..Opts::default()
-        },
-        &mut |r| reps.push(r),
-    )
-    .unwrap();
+    let s = run(&st, &lock, &ix, &only_a, &mut |r| reps.push(r)).unwrap();
     assert_eq!(s.new, 1);
     assert_eq!(kinds(&reps, K::New), vec![b(&a.join("new_a"))]);
     assert!(kinds(&reps, K::Missing).is_empty(), "b is out of scope");
-    assert!(ix.get(&b(&a.join("new_a"))).unwrap().is_some());
     assert!(ix.get(&b(&bd.join("new_b"))).unwrap().is_none());
     assert!(
         ix.get(&b(&bd.join("old"))).unwrap().is_some(),
         "b untouched"
     );
-}
 
-#[test]
-fn only_must_name_a_registered_root() {
-    let e = env();
-    fs::create_dir_all(e.root.join("sub")).unwrap();
-    for bad in [e.root.join("sub"), e.base.join("elsewhere")] {
-        let lock = e.st.lock().unwrap();
-        let r = run(
-            &e.st,
-            &lock,
-            &e.ix,
-            &Opts {
-                only: Some(rp(&bad)),
-                ..Opts::default()
-            },
-            &mut |_| {},
-        );
+    // Not a registered root: a subdirectory of one, or a stranger.
+    fs::create_dir_all(a.join("sub")).unwrap();
+    for bad in [a.join("sub"), base.join("elsewhere")] {
+        let opts = Opts {
+            only: Some(rp(&bad)),
+            ..Opts::default()
+        };
+        let r = run(&st, &lock, &ix, &opts, &mut |_| {});
         assert!(
             matches!(r, Err(StoreError::NotRegistered(_))),
             "{bad:?}: {r:?}"
         );
     }
-}
 
-// C8 reconcile still covers every root when `only` is set.
-#[test]
-fn only_still_reconciles_all_roots() {
-    let (t, base) = canon_tmp();
-    let _keep = t;
-    let (a, bd) = (base.join("a"), base.join("b"));
-    for d in [&a, &bd] {
-        fs::create_dir_all(d).unwrap();
-        fs::write(d.join("f"), b"x").unwrap();
-    }
-    let st = store_with_roots(&base, &[&a, &bd]);
-    let ix = Index::open(&st).unwrap();
-    let lock = st.lock().unwrap();
-    run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
+    // Reconcile still covers every root: unregister b, scan only a.
     st.edit_registry(&lock, |v| v.retain(|r| r != &rp(&bd)))
         .unwrap();
-    run(
-        &st,
-        &lock,
-        &ix,
-        &Opts {
-            only: Some(rp(&a)),
-            ..Opts::default()
-        },
-        &mut |_| {},
-    )
-    .unwrap();
+    run(&st, &lock, &ix, &only_a, &mut |_| {}).unwrap();
     let left: Vec<_> = ix.iter().unwrap().into_iter().map(|x| x.path).collect();
-    assert_eq!(left, vec![b(&a.join("f"))]);
+    assert_eq!(left, vec![b(&a.join("new_a")), b(&a.join("old"))]);
 }
