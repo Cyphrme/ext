@@ -270,10 +270,14 @@ comparisons for filesystems where they are unstable (some FUSE and network
 filesystems).
 
 **Racy entries** - A file modified within the filesystem's timestamp
-granularity after it was hashed can show an unchanged mtime. An entry whose
-`mtime` is not earlier than its `last_checked` (minus the timestamp
-granularity) is racy, and is re-hashed on the next run regardless of matching
-metadata. This is the same problem and remedy as git's "racy git" handling.
+granularity after it was hashed can show unchanged metadata. `last_checked` is
+sampled before the file is first examined (before its metadata is read and
+before it is hashed). An entry is racy when the later of its `mtime` and
+`ctime` is not earlier than `last_checked` minus a fixed window of 2 seconds,
+which covers coarse filesystem timestamps without needing to know the
+filesystem's granularity. A racy entry is re-hashed on the next run regardless
+of matching metadata. This is the same problem and remedy as git's "racy git"
+handling.
 
 Skipping by metadata is a performance heuristic, not an integrity guarantee:
 an adversary able to write a file and control its metadata can evade it.
