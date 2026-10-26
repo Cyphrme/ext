@@ -190,6 +190,7 @@ pub enum DigestError {
     #[error("{alg:?} value has wrong length {got}")]
     WrongLength { alg: Alg, got: usize },
     #[error("invalid character {ch:?} at index {index}")]
+    /// `index` is a char offset into the value, not a byte offset.
     InvalidChar { index: usize, ch: char },
     #[error("non-canonical base64 trailing bits")]
     NonCanonical,

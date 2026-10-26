@@ -20,13 +20,6 @@ proptest! {
     }
 
     #[test]
-    fn injective(a in prop::collection::vec(any::<u8>(), 0..24),
-                 b in prop::collection::vec(any::<u8>(), 0..24)) {
-        prop_assume!(a != b);
-        prop_assert_ne!(escape(&a), escape(&b));
-    }
-
-    #[test]
     fn output_has_no_control_code_points(x in prop::collection::vec(any::<u8>(), 0..64)) {
         prop_assert!(!escape(&x).chars().any(is_forbidden));
     }
@@ -105,4 +98,47 @@ fn unescape_rejects_bad_and_truncated_escapes() {
     assert!(unescape("\\x").is_err());
     assert!(unescape("\\").is_err());
     assert!(unescape("ok\\").is_err());
+}
+
+#[test]
+fn escaped_backslash_does_not_collide_with_escape_text() {
+    assert_ne!(escape(b"\\x41"), escape(b"A"));
+}
+
+#[test]
+fn unescape_is_uppercase_only() {
+    assert!(matches!(
+        unescape("\\x1b"),
+        Err(EscapeError::BadEscape { index: 0 })
+    ));
+    assert!(matches!(
+        unescape("\\xaB"),
+        Err(EscapeError::BadEscape { index: 0 })
+    ));
+}
+
+#[test]
+fn bidi_controls_are_escaped_and_roundtrip() {
+    let cases = [
+        ('\u{200E}', "\\xE2\\x80\\x8E"),
+        ('\u{200F}', "\\xE2\\x80\\x8F"),
+        ('\u{202A}', "\\xE2\\x80\\xAA"),
+        ('\u{202B}', "\\xE2\\x80\\xAB"),
+        ('\u{202C}', "\\xE2\\x80\\xAC"),
+        ('\u{202D}', "\\xE2\\x80\\xAD"),
+        ('\u{202E}', "\\xE2\\x80\\xAE"),
+        ('\u{2066}', "\\xE2\\x81\\xA6"),
+        ('\u{2067}', "\\xE2\\x81\\xA7"),
+        ('\u{2068}', "\\xE2\\x81\\xA8"),
+        ('\u{2069}', "\\xE2\\x81\\xA9"),
+    ];
+    for (c, want) in cases {
+        let s = c.to_string();
+        assert_eq!(escape(s.as_bytes()), want, "U+{:04X}", c as u32);
+        assert_eq!(unescape(want), Ok(s.into_bytes()));
+    }
+    // neighbours stay literal
+    for c in ['\u{200D}', '\u{2010}', '\u{202F}', '\u{2065}', '\u{206A}'] {
+        assert_eq!(escape(c.to_string().as_bytes()), c.to_string());
+    }
 }

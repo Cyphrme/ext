@@ -324,3 +324,20 @@ fn parse_labelled_value_errors_propagate() {
         Err(DigestError::NonCanonical)
     );
 }
+
+#[test]
+fn lengths_and_indices_count_chars_not_bytes() {
+    let s = "é".repeat(43);
+    assert_eq!(
+        Digest::decode_value(Alg::Sha256, &s),
+        Err(DigestError::InvalidChar { index: 0, ch: 'é' })
+    );
+    let s = format!("{}é", "A".repeat(41));
+    assert_eq!(
+        Digest::decode_value(Alg::Sha256, &s),
+        Err(DigestError::WrongLength {
+            alg: Alg::Sha256,
+            got: 42
+        })
+    );
+}
