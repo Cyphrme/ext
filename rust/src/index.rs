@@ -238,6 +238,15 @@ impl Index {
         raw.into_iter().map(RawRow::into_entry).collect()
     }
 
+    /// Runs `f` in one `BEGIN IMMEDIATE` transaction: commit on `Ok`,
+    /// rollback on `Err`.
+    pub fn batch<T>(
+        &self,
+        _f: impl FnOnce(&Index) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        todo!("step 3")
+    }
+
     /// Drops every entry not under one of `roots` (registry is authoritative).
     /// An entry is under a root when it equals it or lies below `root/`.
     pub fn reconcile(&self, roots: &[RegPath]) -> Result<(), StoreError> {

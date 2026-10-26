@@ -1,5 +1,9 @@
 pub mod digest;
 pub mod escape;
+pub mod fresh;
+pub mod hash;
 pub mod index;
 pub mod registry;
+pub mod scan;
 pub mod store;
+pub mod walk;
