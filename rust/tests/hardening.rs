@@ -302,6 +302,12 @@ fn open_refuses_symlinked_or_non_regular_store_files() {
             );
         }
     }
+    // A directory without its registry is not a store.
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("s");
+    Store::init_bare(&dir).unwrap();
+    fs::remove_file(dir.join("registry")).unwrap();
+    assert!(matches!(Store::open(&dir), Err(StoreError::NotAStore(_))));
     // The store directory itself is opened O_NOFOLLOW.
     let t = tempfile::tempdir().unwrap();
     let real = t.path().join("real");
