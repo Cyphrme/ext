@@ -253,7 +253,8 @@ fn indexed_file_under_new_subextant_is_excluded_and_removed() {
     fs::write(&f, b"content").unwrap();
     scan(&e, &Opts::default());
     assert!(entry(&e, &f).is_some());
-    fs::create_dir_all(e.root.join("d/.ext")).unwrap();
+    // 26f: only a real store makes `d` a sub-extant.
+    Store::init_extant(&e.root.join("d")).unwrap();
     let (s, reps) = scan(&e, &Opts::default());
     assert_eq!((s.excluded, s.missing, s.subextant), (1, 0, 1));
     assert_eq!(kinds(&reps, K::Excluded), vec![b(&f)]);

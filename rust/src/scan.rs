@@ -7,9 +7,12 @@ use crate::hash::{hash_stable, HashError};
 use crate::index::{Entry, Index, Meta};
 use crate::registry::RegPath;
 use crate::store::{Store, StoreError, WriteLock};
-use crate::walk::{walk, ChangedDuringWalk, Event};
+use crate::walk::{walk_checked, Event};
+use rustix::fs::{openat2, statx, AtFlags, FileType, Mode, OFlags, ResolveFlags, StatxFlags, CWD};
 use std::collections::HashSet;
 use std::fs::File;
+use std::io;
+use std::os::fd::OwnedFd;
 
 /// Files per index transaction: bounds the work a crash can lose.
 const BATCH: usize = 1000;
@@ -43,8 +46,7 @@ pub struct Report {
     pub path: Vec<u8>,
     /// (stored, actual); `Some` for Edited, Violation and Accepted.
     pub digests: Option<(Digest, Digest)>,
-    /// The cause; `Some(non-empty)` for Error, Refused and Unstable
-    /// (amendment 26f). Scaffold: nothing sets it yet.
+    /// The cause; `Some(non-empty)` for Error, Refused and Unstable.
     pub detail: Option<String>,
 }
 
@@ -175,16 +177,78 @@ fn covered(set: &HashSet<Vec<u8>>, p: &[u8]) -> bool {
             .any(|(i, &b)| b == b'/' && i > 0 && set.contains(&p[..i]))
 }
 
+fn open_root(root: &RegPath) -> io::Result<OwnedFd> {
+    Ok(openat2(
+        CWD,
+        root.as_bytes(),
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )?)
+}
+
+/// True only if `path` demonstrably is no longer a regular file. Any doubt
+/// (permissions, a path too long to re-resolve) counts as present: a stale
+/// entry is repaired by the next scan, a deleted one is lost.
+fn confirmed_absent(rootfd: &OwnedFd, root: &RegPath, path: &[u8]) -> bool {
+    use rustix::io::Errno;
+    let base = root.as_bytes();
+    let rel = path.strip_prefix(base).unwrap_or(path);
+    let rel = rel.strip_prefix(b"/").unwrap_or(rel);
+    let (parent, name) = match rel.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&rel[..i], &rel[i + 1..]),
+        None => (&b"."[..], rel),
+    };
+    let dir = match openat2(
+        rootfd,
+        parent,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(e) => return matches!(e, Errno::NOENT | Errno::NOTDIR | Errno::LOOP),
+    };
+    match statx(&dir, name, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE) {
+        Ok(st) => FileType::from_raw_mode(st.stx_mode.into()) != FileType::RegularFile,
+        Err(e) => matches!(e, Errno::NOENT | Errno::NOTDIR),
+    }
+}
+
 impl RootScan<'_> {
     fn scan(&mut self, root: &RegPath, store_id: (u64, u64)) -> Result<(), StoreError> {
-        walk(root, store_id, &mut |ev| {
-            if self.fatal.is_none() {
-                if let Err(e) = self.handle(ev) {
-                    self.fatal = Some(e);
+        let idx = self.idx;
+        let mut id_err: Option<StoreError> = None;
+        walk_checked(
+            root,
+            store_id,
+            &mut |id| match idx.root_id(root) {
+                Ok(None) => idx.set_root_id(root, id).map_err(|e| {
+                    id_err = Some(e);
+                    io::Error::other("cannot record the root's filesystem identity")
+                }),
+                Ok(Some(was)) if was == id => Ok(()),
+                Ok(Some(was)) => Err(io::Error::other(format!(
+                    "filesystem identity of the root changed (was {was}, now {id}); \
+                     unmounted, mounted over or replaced"
+                ))),
+                Err(e) => {
+                    id_err = Some(e);
+                    Err(io::Error::other(
+                        "cannot read the root's filesystem identity",
+                    ))
                 }
-            }
-        });
-        if let Some(e) = self.fatal.take() {
+            },
+            &mut |_| {},
+            &mut |ev| {
+                if self.fatal.is_none() {
+                    if let Err(e) = self.handle(ev) {
+                        self.fatal = Some(e);
+                    }
+                }
+            },
+        );
+        if let Some(e) = id_err.or_else(|| self.fatal.take()) {
             return Err(e);
         }
         self.flush()?;
@@ -194,6 +258,11 @@ impl RootScan<'_> {
             return Ok(());
         }
         let stored = self.idx.paths_under(root)?;
+        let rootfd = if self.root_gone {
+            None
+        } else {
+            open_root(root).ok()
+        };
         let mut gone = Vec::new();
         for p in stored {
             let kind = if self.root_gone {
@@ -203,18 +272,19 @@ impl RootScan<'_> {
             } else if covered(&self.excluded, &p) {
                 ReportKind::Excluded
             } else {
-                ReportKind::Missing
+                // The walk may have listed this directory before the file
+                // arrived; deleting on that evidence alone would lose it.
+                match &rootfd {
+                    Some(fd) if !confirmed_absent(fd, root, &p) => continue,
+                    None => continue,
+                    _ => ReportKind::Missing,
+                }
             };
             match kind {
                 ReportKind::Excluded => self.summary.excluded += 1,
                 _ => self.summary.missing += 1,
             }
-            (self.out)(Report {
-                kind,
-                path: p.clone(),
-                digests: None,
-                detail: None,
-            });
+            self.report(kind, p.clone(), None, None);
             gone.push(p);
         }
         for chunk in gone.chunks(BATCH) {
@@ -224,12 +294,18 @@ impl RootScan<'_> {
         Ok(())
     }
 
-    fn report(&mut self, kind: ReportKind, path: Vec<u8>, digests: Option<(Digest, Digest)>) {
+    fn report(
+        &mut self,
+        kind: ReportKind,
+        path: Vec<u8>,
+        digests: Option<(Digest, Digest)>,
+        detail: Option<String>,
+    ) {
         (self.out)(Report {
             kind,
             path,
             digests,
-            detail: None,
+            detail,
         });
     }
 
@@ -267,12 +343,12 @@ impl RootScan<'_> {
             Event::Mount(p) => {
                 self.summary.mount += 1;
                 self.excluded.insert(p.clone());
-                self.report(ReportKind::Mount, p, None);
+                self.report(ReportKind::Mount, p, None, None);
             }
             Event::SubExtant(p) => {
                 self.summary.subextant += 1;
                 self.excluded.insert(p.clone());
-                self.report(ReportKind::SubExtant, p, None);
+                self.report(ReportKind::SubExtant, p, None, None);
             }
             Event::Refused(p, e) => {
                 if e.raw_os_error() == Some(rustix::io::Errno::NOENT.raw_os_error()) {
@@ -280,20 +356,19 @@ impl RootScan<'_> {
                 } else {
                     self.root_refused = true;
                     self.summary.refused += 1;
-                    self.report(ReportKind::Refused, p, None);
+                    self.report(ReportKind::Refused, p, None, Some(e.to_string()));
                 }
             }
-            Event::Unstable(..) => todo!("Event::Unstable: amendment 26f #6"),
+            Event::Unstable(p, e) => {
+                self.unverified.insert(p.clone());
+                self.push(Op::Del(p.clone()))?;
+                self.summary.unstable += 1;
+                self.report(ReportKind::Unstable, p, None, Some(e.to_string()));
+            }
             Event::Error(p, e) => {
                 self.unverified.insert(p.clone());
-                if ChangedDuringWalk::is(&e) {
-                    self.push(Op::Del(p.clone()))?;
-                    self.summary.unstable += 1;
-                    self.report(ReportKind::Unstable, p, None);
-                } else {
-                    self.summary.error += 1;
-                    self.report(ReportKind::Error, p, None);
-                }
+                self.summary.error += 1;
+                self.report(ReportKind::Error, p, None, Some(e.to_string()));
             }
         }
         Ok(())
@@ -327,13 +402,18 @@ impl RootScan<'_> {
                 // the entry must not be served.
                 self.push(Op::Del(path.clone()))?;
                 self.summary.unstable += 1;
-                self.report(ReportKind::Unstable, path, None);
+                self.report(
+                    ReportKind::Unstable,
+                    path,
+                    None,
+                    Some(HashError::Unstable.to_string()),
+                );
                 return Ok(());
             }
-            Err(HashError::Io(_)) => {
+            Err(HashError::Io(e)) => {
                 // Content not known to have changed: the entry stays.
                 self.summary.error += 1;
-                self.report(ReportKind::Error, path, None);
+                self.report(ReportKind::Error, path, None, Some(e.to_string()));
                 return Ok(());
             }
         };
@@ -348,12 +428,17 @@ impl RootScan<'_> {
             Status::New => {
                 self.summary.new += 1;
                 self.push(Op::Put(entry))?;
-                self.report(ReportKind::New, path, None);
+                self.report(ReportKind::New, path, None, None);
             }
             Status::Edited => {
                 self.summary.edited += 1;
                 self.push(Op::Put(entry))?;
-                self.report(ReportKind::Edited, path, stored_digest.map(|s| (s, digest)));
+                self.report(
+                    ReportKind::Edited,
+                    path,
+                    stored_digest.map(|s| (s, digest)),
+                    None,
+                );
             }
             Status::Unchanged => {
                 self.summary.unchanged += 1;
@@ -364,10 +449,10 @@ impl RootScan<'_> {
                 if self.opts.accept {
                     self.summary.accepted += 1;
                     self.push(Op::Put(entry))?;
-                    self.report(ReportKind::Accepted, path, pair);
+                    self.report(ReportKind::Accepted, path, pair, None);
                 } else {
                     self.summary.violation += 1;
-                    self.report(ReportKind::Violation, path, pair);
+                    self.report(ReportKind::Violation, path, pair, None);
                 }
             }
         }
