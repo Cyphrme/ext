@@ -277,12 +277,26 @@ impl Index {
     }
 
     /// Runs `f` in one `BEGIN IMMEDIATE` transaction: commit on `Ok`,
-    /// rollback on `Err`.
+    /// rollback on `Err`. Callers cap a batch at 1000 files so a crash loses
+    /// bounded work.
     pub fn batch<T>(
         &self,
-        _f: impl FnOnce(&Index) -> Result<T, StoreError>,
+        f: impl FnOnce(&Index) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        todo!("step 3")
+        let tx = self.write_tx()?;
+        match f(self) {
+            Ok(v) => {
+                tx.commit()?;
+                Ok(v)
+            }
+            Err(e) => {
+                // `f`'s error is the cause worth reporting; a failed rollback
+                // leaves the transaction open, which the next `batch` surfaces
+                // loudly as a nested BEGIN.
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
     }
 
     /// Drops every entry not under one of `roots` (registry is authoritative).
