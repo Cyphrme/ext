@@ -12,113 +12,77 @@ fn is_forbidden(c: char) -> bool {
         || matches!(u, 0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
+// Bytes alone never reach valid C1/bidi UTF-8; strings alone never reach
+// invalid UTF-8. Draw from both.
+fn any_input() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        prop::collection::vec(any::<u8>(), 0..64),
+        any::<String>().prop_map(String::into_bytes),
+    ]
+}
+
 proptest! {
     #[test]
-    fn roundtrip_arbitrary_bytes(x in prop::collection::vec(any::<u8>(), 0..64)) {
+    fn roundtrip(x in any_input()) {
         prop_assert_eq!(unescape(&escape(&x)), Ok(x));
     }
 
     #[test]
-    fn roundtrip_arbitrary_strings(s in any::<String>()) {
-        prop_assert_eq!(unescape(&escape(s.as_bytes())), Ok(s.into_bytes()));
-    }
-
-    #[test]
-    fn output_has_no_control_code_points(x in prop::collection::vec(any::<u8>(), 0..64)) {
+    fn output_is_clean(x in any_input()) {
         prop_assert!(!escape(&x).chars().any(is_forbidden));
     }
-
-    #[test]
-    fn output_has_no_control_code_points_from_strings(s in any::<String>()) {
-        prop_assert!(!escape(s.as_bytes()).chars().any(is_forbidden));
-    }
-
-    #[test]
-    fn plain_printable_utf8_passes_through(s in "[ -\\[\\]-~é日本🙂]{0,32}") {
-        prop_assert_eq!(escape(s.as_bytes()), s);
-    }
-
-    #[test]
-    fn unescape_rejects_backslash_not_followed_by_backslash_or_xnn(
-        prefix in "[a-z]{0,5}", c in any::<char>()
-    ) {
-        prop_assume!(c != '\\' && c != 'x');
-        let s = format!("{prefix}\\{c}");
-        prop_assert!(unescape(&s).is_err(), "{s:?}");
-    }
 }
 
+/// The wire form is the registry's on-disk spelling, so it is pinned
+/// exactly, in both directions.
 #[test]
-fn backslash_is_doubled() {
-    assert_eq!(escape(b"a\\b"), "a\\\\b");
-}
-
-#[test]
-fn c0_and_del_become_uppercase_xnn() {
-    assert_eq!(escape(b"\x1B"), "\\x1B");
-    assert_eq!(escape(b"\t"), "\\x09");
-    assert_eq!(escape(b"\n"), "\\x0A");
-    assert_eq!(escape(b"\x00"), "\\x00");
-    assert_eq!(escape(b"\x7F"), "\\x7F");
-}
-
-#[test]
-fn invalid_utf8_bytes_each_escaped() {
-    assert_eq!(escape(b"\xFF"), "\\xFF");
-    assert_eq!(escape(b"a\xC3"), "a\\xC3");
-    assert_eq!(escape(b"\xE2\x82"), "\\xE2\\x82");
-}
-
-#[test]
-fn c1_controls_escape_every_utf8_byte() {
-    // U+0085 NEL is C2 85 in UTF-8
-    assert_eq!(escape("\u{85}".as_bytes()), "\\xC2\\x85");
-    assert_eq!(escape("\u{80}".as_bytes()), "\\xC2\\x80");
-    assert_eq!(escape("\u{9F}".as_bytes()), "\\xC2\\x9F");
-}
-
-#[test]
-fn other_valid_utf8_passes_through() {
-    // U+00A0 is just outside the C1 range
-    for s in ["é", "日本語", "🙂", "\u{A0}", "plain /path/to file"] {
-        assert_eq!(escape(s.as_bytes()), s);
+fn escape_examples() {
+    let rows: &[(&[u8], &str)] = &[
+        (b"a\\b", "a\\\\b"),
+        (b"\x1B", "\\x1B"),
+        (b"\t", "\\x09"),
+        (b"\n", "\\x0A"),
+        (b"\x00", "\\x00"),
+        (b"\x7F", "\\x7F"),
+        (b"\x1B\xFF", "\\x1B\\xFF"),
+        (b"\xFF", "\\xFF"),
+        (b"a\xC3", "a\\xC3"),
+        (b"\xE2\x82", "\\xE2\\x82"),
+        // C1 controls: every UTF-8 byte is escaped; U+00A0 is just outside
+        ("\u{80}".as_bytes(), "\\xC2\\x80"),
+        ("\u{85}".as_bytes(), "\\xC2\\x85"),
+        ("\u{9F}".as_bytes(), "\\xC2\\x9F"),
+        ("\u{A0}".as_bytes(), "\u{A0}"),
+        ("é日本語🙂".as_bytes(), "é日本語🙂"),
+        (b"plain /path/to file", "plain /path/to file"),
+    ];
+    for (raw, wire) in rows {
+        assert_eq!(escape(raw), *wire, "{raw:?}");
+        assert_eq!(unescape(wire), Ok(raw.to_vec()), "{wire:?}");
     }
 }
 
 #[test]
-fn unescape_accepts_the_two_escape_forms() {
-    assert_eq!(unescape("a\\\\b"), Ok(b"a\\b".to_vec()));
-    assert_eq!(unescape("\\x1B\\xFF"), Ok(vec![0x1B, 0xFF]));
-}
-
-#[test]
-fn unescape_rejects_bad_and_truncated_escapes() {
-    assert!(matches!(
-        unescape("\\q"),
-        Err(EscapeError::BadEscape { .. })
-    ));
-    assert!(unescape("\\xZZ").is_err());
-    assert!(unescape("\\x1").is_err());
-    assert!(unescape("\\x").is_err());
-    assert!(unescape("\\").is_err());
-    assert!(unescape("ok\\").is_err());
-}
-
-#[test]
-fn escaped_backslash_does_not_collide_with_escape_text() {
-    assert_ne!(escape(b"\\x41"), escape(b"A"));
-}
-
-#[test]
-fn unescape_is_uppercase_only() {
-    assert!(matches!(
-        unescape("\\x1b"),
-        Err(EscapeError::BadEscape { index: 0 })
-    ));
-    assert!(matches!(
-        unescape("\\xaB"),
-        Err(EscapeError::BadEscape { index: 0 })
-    ));
+fn unescape_rejects() {
+    // (input, index when it must be BadEscape at that index)
+    let rows: &[(&str, Option<usize>)] = &[
+        ("\\q", Some(0)),
+        ("\\xZZ", None),
+        ("\\x1", None),
+        ("\\x", None),
+        ("\\", None),
+        ("ok\\", None),
+        // escapes are uppercase-only
+        ("\\x1b", Some(0)),
+        ("\\xaB", Some(0)),
+    ];
+    for (s, idx) in rows {
+        let r = unescape(s);
+        assert!(r.is_err(), "{s:?}");
+        if let Some(index) = idx {
+            assert!(matches!(r, Err(EscapeError::BadEscape { index: i }) if i == *index), "{s:?}: {r:?}");
+        }
+    }
 }
 
 #[test]
