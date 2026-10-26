@@ -37,6 +37,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
     Init {
+        #[arg(conflicts_with = "bare")]
         dir: Option<PathBuf>,
         #[arg(long)]
         bare: Option<PathBuf>,
@@ -83,6 +84,10 @@ enum CliError {
         path: PathBuf,
         kind: crate::registry::RegistryErrorKind,
     },
+    #[error("--d names a store to open, but init creates one; give the location as an argument")]
+    InitWithStoreFlag,
+    #[error("not a directory: {}", .0.display())]
+    NotADirectory(PathBuf),
     #[error("not a registry entry (unregister needs an exact match): {0}")]
     NotAnEntry(String),
     #[error("cannot determine the current directory: {0}")]
@@ -167,25 +172,44 @@ fn dispatch(cli: &Cli) -> Result<u8, CliError> {
     };
     let stdout = io::stdout();
     let mut w = BufWriter::new(stdout.lock());
+    let result = command(cli, fmt, &mut w);
+    // A reader that went away is a quiet stop, not a failure.
+    let flushed = w.flush();
+    match result {
+        Err(CliError::Out(e)) if e.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        Ok(code) => match flushed {
+            Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e.into()),
+            _ => Ok(code),
+        },
+        Err(e) => Err(e),
+    }
+}
+
+fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
     let code = match &cli.cmd {
-        Cmd::Init { dir, bare } => init(dir.as_deref(), bare.as_deref())?,
+        Cmd::Init { dir, bare } => {
+            if cli.d.is_some() {
+                return Err(CliError::InitWithStoreFlag);
+            }
+            init(dir.as_deref(), bare.as_deref())?
+        }
         Cmd::Register { path } => {
             let store = open_store(cli)?;
-            register(&store, path, fmt, &mut w)?
+            register(&store, path, fmt, w)?
         }
         Cmd::Unregister { path } => unregister(&open_store(cli)?, path)?,
         Cmd::Resolve { digest } => {
             let d = Digest::parse_labelled(digest)?;
-            resolve(&open_store(cli)?, &d, fmt, &mut w)?
+            resolve(&open_store(cli)?, &d, fmt, w)?
         }
-        Cmd::List => list(&open_store(cli)?, fmt, &mut w)?,
+        Cmd::List => list(&open_store(cli)?, fmt, w)?,
         Cmd::Check { full, accept } => {
             let opts = Opts {
                 full: *full,
                 accept: *accept,
                 only: None,
             };
-            scan_locked(&open_store(cli)?, &opts, false, fmt, &mut w)?
+            scan_locked(&open_store(cli)?, &opts, false, fmt, w)?
         }
         Cmd::Rebuild => {
             let opts = Opts {
@@ -193,10 +217,9 @@ fn dispatch(cli: &Cli) -> Result<u8, CliError> {
                 accept: true,
                 only: None,
             };
-            scan_locked(&open_store(cli)?, &opts, true, fmt, &mut w)?
+            scan_locked(&open_store(cli)?, &opts, true, fmt, w)?
         }
     };
-    w.flush()?;
     Ok(code)
 }
 
@@ -225,6 +248,9 @@ fn register(store: &Store, path: &Path, fmt: Fmt, w: &mut impl Write) -> Result<
         path: path.to_path_buf(),
         source,
     })?;
+    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
+        return Err(CliError::NotADirectory(path.to_path_buf()));
+    }
     let root = RegPath::from_bytes(canon.as_os_str().as_bytes())
         .map_err(|kind| CliError::BadRoot { path: canon, kind })?;
     store.edit_registry(&lock, |v| {
@@ -324,21 +350,29 @@ fn report_scan(
         if write_err.is_some() {
             return;
         }
-        let tail: Vec<String> = r
+        let mut tail: Vec<String> = r
             .digests
             .iter()
             .flat_map(|(exp, act)| [exp.to_reverse(fmt.enc), act.to_reverse(fmt.enc)])
             .collect();
+        // The cause is text from the OS; escape it like a path so it cannot
+        // carry control bytes, and keep it a single tab-separated field.
+        tail.extend(r.detail.iter().map(|d| escape(d.as_bytes())));
         if let Err(e) = fmt.record(w, &[label(r.kind)], &r.path, &tail) {
             write_err = Some(e);
         }
     })?;
-    if let Some(e) = write_err {
-        return Err(e.into());
+    let code = u8::try_from(summary.exit_code()).unwrap_or(EXIT_USAGE);
+    let broken = |e: &io::Error| e.kind() == io::ErrorKind::BrokenPipe;
+    // The scan finished and the index is written; only the report was cut
+    // short. A vanished reader is a quiet stop with the summary's code.
+    match write_err.map_or_else(|| w.flush(), Err) {
+        Err(e) if broken(&e) => return Ok(code),
+        Err(e) => return Err(e.into()),
+        Ok(()) => {}
     }
-    w.flush()?;
     eprintln!("{}", summary_line(&summary));
-    Ok(u8::try_from(summary.exit_code()).unwrap_or(EXIT_USAGE))
+    Ok(code)
 }
 
 fn summary_line(s: &Summary) -> String {
