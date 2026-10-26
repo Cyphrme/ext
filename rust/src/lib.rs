@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod digest;
 pub mod escape;
 pub mod fresh;

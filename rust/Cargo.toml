@@ -5,13 +5,19 @@ edition = "2021"
 rust-version = "1.90"
 publish = false
 
+[[bin]]
+name = "ext"
+path = "src/main.rs"
+
 [dependencies]
 sha2 = "0.10"
 data-encoding = "2"
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+assert_cmd = "2"
