@@ -167,11 +167,11 @@ fn symlinked_root_is_refused() {
 fn subextant_is_skipped_whole_and_reported() {
     let (_t, d) = canon_tmp();
     let root = d.join("r");
-    fs::create_dir_all(root.join("sub/.ext")).unwrap();
     fs::create_dir_all(root.join("sub/deeper")).unwrap();
+    // 26f: only a real store makes `sub` a sub-extant.
+    Store::init_extant(&root.join("sub")).unwrap();
     fs::write(root.join("sub/content"), b"c").unwrap();
     fs::write(root.join("sub/deeper/content"), b"c").unwrap();
-    fs::write(root.join("sub/.ext/registry"), b"").unwrap();
     fs::write(root.join("top"), b"t").unwrap();
     let ev = run_walk(&root, no_store());
     assert_eq!(files(&ev), vec![b(&root.join("top")).as_slice()]);

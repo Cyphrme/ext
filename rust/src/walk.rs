@@ -1,16 +1,18 @@
 //! fd-relative tree walk that never follows symlinks or opens specials.
 
 use crate::hash::meta_of;
-use crate::index::Meta;
+use crate::index::{Meta, RootId};
 use crate::registry::RegPath;
 use rustix::fs::{
     fstat, makedev, openat, openat2, statx, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags,
     Statx, StatxFlags, CWD,
 };
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::rc::Rc;
 use std::sync::Once;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,47 +31,50 @@ pub enum Event {
     Refused(Vec<u8>, io::Error),
     Error(Vec<u8>, io::Error),
     /// The entry changed type or identity between the metadata read and the
-    /// open: known to be moving, so not merely unreadable. Replaces the
-    /// `ChangedDuringWalk` marker carried by `Error`.
+    /// open: known to be moving, so not merely unreadable.
     Unstable(Vec<u8>, io::Error),
-}
-
-/// Carried by an `Event::Error` when the entry changed type or identity
-/// between the metadata read and the open: the file is known to be moving,
-/// so `scan` treats it as unstable rather than merely unreadable.
-#[derive(Debug)]
-pub struct ChangedDuringWalk;
-
-impl std::fmt::Display for ChangedDuringWalk {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("entry changed type or identity while it was being opened")
-    }
-}
-
-impl std::error::Error for ChangedDuringWalk {}
-
-impl ChangedDuringWalk {
-    pub fn is(e: &io::Error) -> bool {
-        e.get_ref().is_some_and(|i| i.is::<ChangedDuringWalk>())
-    }
 }
 
 const STAT_MASK: StatxFlags = StatxFlags::TYPE
     .union(StatxFlags::MODE)
+    .union(StatxFlags::UID)
     .union(StatxFlags::INO)
     .union(StatxFlags::SIZE)
     .union(StatxFlags::MTIME)
     .union(StatxFlags::CTIME)
     .union(StatxFlags::MNT_ID);
 
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::DIRECTORY);
+
 static NO_MNT_ID: Once = Once::new();
+
+/// A directory held open while any of its children are still to be visited.
+struct DirHandle {
+    fd: OwnedFd,
+    path: Vec<u8>,
+}
+
+/// A subdirectory found while listing its parent, opened only when popped.
+/// Sharing the parent handle keeps open descriptors proportional to the
+/// directories that still have unvisited children, not to tree depth.
+struct Pending {
+    parent: Rc<DirHandle>,
+    name: CString,
+    id: (u64, u64),
+}
 
 struct Ctx<'a> {
     store_id: (u64, u64),
     root_mnt: u64,
+    root_uid: u32,
     /// Kernel without `STATX_MNT_ID`: mount identity degrades to `st_dev`.
     /// Wrong on btrfs subvolumes, hence only a fallback.
     use_dev: bool,
+    stack: Vec<Pending>,
+    before_open: &'a mut dyn FnMut(&[u8]),
     visit: &'a mut dyn FnMut(Event),
 }
 
@@ -87,14 +92,6 @@ fn dev_of(st: &Statx) -> u64 {
     makedev(st.stx_dev_major, st.stx_dev_minor)
 }
 
-fn mount_key(ctx: &Ctx<'_>, st: &Statx) -> u64 {
-    if ctx.use_dev {
-        dev_of(st)
-    } else {
-        st.stx_mnt_id
-    }
-}
-
 fn is_type(st: &Statx, t: FileType) -> bool {
     FileType::from_raw_mode(st.stx_mode.into()) == t
 }
@@ -109,27 +106,44 @@ fn child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     p
 }
 
-/// Test seam (amendment 26f, #6): as [`walk`], but `before_open(path)` runs
-/// for each regular file and directory after its metadata is read and before
-/// it is opened, so a test can swap the entry in that window.
-// Scaffold for the red tests; the implementation walk replaces the body.
-pub fn walk_hooked(
-    _root: &RegPath,
-    _store_id: (u64, u64),
-    _before_open: &mut dyn FnMut(&[u8]),
-    _visit: &mut dyn FnMut(Event),
-) {
-    todo!("walk_hooked: amendment 26f #6")
+fn changed(what: &str) -> io::Error {
+    io::Error::other(format!(
+        "{what} changed type or identity while being opened"
+    ))
 }
 
 /// Every descent is relative to a held descriptor, so no component can be
 /// swapped for a symlink after it was checked.
 pub fn walk(root: &RegPath, store_id: (u64, u64), visit: &mut dyn FnMut(Event)) {
+    walk_hooked(root, store_id, &mut |_| {}, visit)
+}
+
+/// As [`walk`], but `before_open(path)` runs for each regular file and
+/// directory after its metadata is read and before it is opened, so a test
+/// can swap the entry in that window.
+pub fn walk_hooked(
+    root: &RegPath,
+    store_id: (u64, u64),
+    before_open: &mut dyn FnMut(&[u8]),
+    visit: &mut dyn FnMut(Event),
+) {
+    walk_checked(root, store_id, &mut |_| Ok(()), before_open, visit)
+}
+
+/// As [`walk_hooked`], and `check` sees the root's filesystem identity once
+/// the root is open; an `Err` refuses the root before anything is listed.
+pub(crate) fn walk_checked(
+    root: &RegPath,
+    store_id: (u64, u64),
+    check: &mut dyn FnMut(RootId) -> io::Result<()>,
+    before_open: &mut dyn FnMut(&[u8]),
+    visit: &mut dyn FnMut(Event),
+) {
     let path = root.as_bytes().to_vec();
     let fd = match openat2(
         CWD,
         root.as_bytes(),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        DIR_FLAGS,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     ) {
@@ -151,101 +165,154 @@ pub fn walk(root: &RegPath, store_id: (u64, u64), visit: &mut dyn FnMut(Event)) 
             eprintln!("warning: kernel lacks STATX_MNT_ID; mount boundaries compared by st_dev");
         });
     }
+    let root_mnt = if use_dev { dev_of(&st) } else { st.stx_mnt_id };
+    let id = if use_dev {
+        RootId::Dev(root_mnt)
+    } else {
+        RootId::Mount(root_mnt)
+    };
+    if let Err(e) = check(id) {
+        return visit(Event::Refused(path, e));
+    }
     let mut ctx = Ctx {
         store_id,
-        root_mnt: 0,
+        root_mnt,
+        root_uid: st.stx_uid,
         use_dev,
+        stack: Vec::new(),
+        before_open,
         visit,
     };
-    ctx.root_mnt = mount_key(&ctx, &st);
-    walk_dir(&mut ctx, fd, path);
+    list_dir(&mut ctx, Rc::new(DirHandle { fd, path }));
+    // Explicit stack: depth costs heap, never call-stack or one fd per level.
+    while let Some(p) = ctx.stack.pop() {
+        let path = child_path(&p.parent.path, p.name.to_bytes());
+        (ctx.before_open)(&path);
+        let fd = match openat(&p.parent.fd, &p.name, DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) => {
+                (ctx.visit)(Event::Error(path, e.into()));
+                continue;
+            }
+        };
+        match fstat(&fd) {
+            Ok(f) if (f.st_dev, f.st_ino) == p.id => {
+                // Release the parent before descending; if this was its last
+                // pending child, its descriptor closes here.
+                drop(p);
+                list_dir(&mut ctx, Rc::new(DirHandle { fd, path }));
+            }
+            Ok(_) => (ctx.visit)(Event::Unstable(path, changed("directory"))),
+            Err(e) => (ctx.visit)(Event::Error(path, e.into())),
+        }
+    }
 }
 
-fn walk_dir(ctx: &mut Ctx<'_>, fd: OwnedFd, path: Vec<u8>) {
-    // A `.ext` directory that is not our own store makes this a sub-extant
-    // with its own index; its content never enters ours.
+/// A `.ext` directory makes its parent a sub-extant only if it is a real
+/// store: registry, index.db and lock present as regular files, owned by the
+/// root's owner or by root, and not group/other-writable. Any other `.ext`
+/// is ordinary content, so planting one cannot hide a subtree.
+fn is_real_store(ctx: &Ctx<'_>, parent: &OwnedFd, ext: &Statx) -> bool {
+    let trusted =
+        |st: &Statx| (st.stx_uid == 0 || st.stx_uid == ctx.root_uid) && st.stx_mode & 0o022 == 0;
+    if !trusted(ext) {
+        return false;
+    }
+    let Ok(dir) = openat(parent, ".ext", DIR_FLAGS, Mode::empty()) else {
+        return false;
+    };
+    ["registry", "index.db", "lock"].iter().all(|f| {
+        statx(
+            &dir,
+            *f,
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID,
+        )
+        .is_ok_and(|st| is_type(&st, FileType::RegularFile) && trusted(&st))
+    })
+}
+
+fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>) {
     match statx(
-        &fd,
+        &dir.fd,
         ".ext",
         AtFlags::SYMLINK_NOFOLLOW,
-        StatxFlags::TYPE | StatxFlags::INO,
+        StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::INO,
     ) {
         Ok(st)
-            if is_type(&st, FileType::Directory) && (dev_of(&st), st.stx_ino) != ctx.store_id =>
+            if is_type(&st, FileType::Directory)
+                && (dev_of(&st), st.stx_ino) != ctx.store_id
+                && is_real_store(ctx, &dir.fd, &st) =>
         {
-            return (ctx.visit)(Event::SubExtant(path));
+            return (ctx.visit)(Event::SubExtant(dir.path.clone()));
         }
         Ok(_) => {}
         Err(rustix::io::Errno::NOENT) => {}
         // Not knowing whether this is a sub-extant means not walking it.
-        Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
+        Err(e) => return (ctx.visit)(Event::Error(dir.path.clone(), e.into())),
     }
-    let mut dir = match Dir::read_from(&fd) {
+    let mut listing = match Dir::read_from(&dir.fd) {
         Ok(d) => d,
-        Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
+        Err(e) => return (ctx.visit)(Event::Error(dir.path.clone(), e.into())),
     };
-    while let Some(ent) = dir.read() {
+    while let Some(ent) = listing.read() {
         let ent = match ent {
             Ok(ent) => ent,
             // A failed listing cannot be resumed; the directory as a whole
             // is unverified.
-            Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
+            Err(e) => return (ctx.visit)(Event::Error(dir.path.clone(), e.into())),
         };
         let name: &CStr = ent.file_name();
         if matches!(name.to_bytes(), b"." | b"..") {
             continue;
         }
-        walk_child(ctx, &fd, &path, name);
+        visit_child(ctx, &dir, name);
     }
 }
 
-fn walk_child(ctx: &mut Ctx<'_>, dirfd: &OwnedFd, parent: &[u8], name: &CStr) {
+fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
     // Sampled before the metadata read (PR #12): anything modified after this
     // instant is at worst reported racy, never trusted.
     let last_checked_ns = now_ns();
-    let path = child_path(parent, name.to_bytes());
-    let st = match statx(dirfd, name, AtFlags::SYMLINK_NOFOLLOW, STAT_MASK) {
+    let path = child_path(&dir.path, name.to_bytes());
+    let st = match statx(&dir.fd, name, AtFlags::SYMLINK_NOFOLLOW, STAT_MASK) {
         Ok(st) => st,
         // Vanished since the listing: simply absent from this scan.
         Err(rustix::io::Errno::NOENT) => return,
         Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
     };
+    let id = (dev_of(&st), st.stx_ino);
     match FileType::from_raw_mode(st.stx_mode.into()) {
         FileType::Symlink => (ctx.visit)(Event::Symlink(path)),
         FileType::Directory => {
-            if (dev_of(&st), st.stx_ino) == ctx.store_id {
+            if id == ctx.store_id {
                 return;
             }
-            if crosses_mount(ctx.root_mnt, mount_key(ctx, &st)) {
+            let child_mnt = if ctx.use_dev { id.0 } else { st.stx_mnt_id };
+            if crosses_mount(ctx.root_mnt, child_mnt) {
                 return (ctx.visit)(Event::Mount(path));
             }
-            let fd = match openat(
-                dirfd,
-                name,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
-            };
-            match fstat(&fd) {
-                Ok(f) if (f.st_dev, f.st_ino) == (dev_of(&st), st.stx_ino) => {
-                    walk_dir(ctx, fd, path)
-                }
-                Ok(_) => (ctx.visit)(Event::Error(path, io::Error::other(ChangedDuringWalk))),
-                Err(e) => (ctx.visit)(Event::Error(path, e.into())),
-            }
+            ctx.stack.push(Pending {
+                parent: Rc::clone(dir),
+                name: name.to_owned(),
+                id,
+            });
         }
         FileType::RegularFile => {
+            (ctx.before_open)(&path);
             // NONBLOCK: should the name be swapped for a FIFO after the
             // check above, the open still cannot hang.
             let fd = match openat(
-                dirfd,
+                &dir.fd,
                 name,
                 OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
                 Mode::empty(),
             ) {
                 Ok(fd) => fd,
+                // A name swapped for a symlink fails O_NOFOLLOW with ELOOP.
+                Err(rustix::io::Errno::LOOP) => {
+                    return (ctx.visit)(Event::Unstable(path, changed("file")))
+                }
                 Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
             };
             let file = File::from(fd);
@@ -253,8 +320,8 @@ fn walk_child(ctx: &mut Ctx<'_>, dirfd: &OwnedFd, parent: &[u8], name: &CStr) {
                 Ok(md) => md,
                 Err(e) => return (ctx.visit)(Event::Error(path, e)),
             };
-            if !md.file_type().is_file() || std::os::unix::fs::MetadataExt::ino(&md) != st.stx_ino {
-                return (ctx.visit)(Event::Error(path, io::Error::other(ChangedDuringWalk)));
+            if !md.file_type().is_file() || (md.dev(), md.ino()) != id {
+                return (ctx.visit)(Event::Unstable(path, changed("file")));
             }
             (ctx.visit)(Event::File {
                 path,
