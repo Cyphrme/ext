@@ -44,7 +44,7 @@ Path Index: <path>\t<digest>:<alg>
 Tag:        <tag>\t<digest>:<alg>
 Cache:      <digest>:<alg>\t<path>
 Cache Time: <digest>:<alg>\t<time>
-Timestamp:  <path>\t<last_checked>\t<last_modified>
+Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>
 
 The same digest may appear more than once when multiple paths contain
 identical content. Lookup by digest returns every matching path. The path index,
@@ -254,14 +254,34 @@ ignores them and re-hashes every registered path for a complete integrity
 verification.
 
 **Timestamp Index** - For each registered path the following are stored:
-- `last_checked` - Unix time of the last examination by `ext`
-- `last_modified` - the path’s mtime (or platform equivalent) at that moment
+- `last_checked` - time of the last examination by `ext`, in nanoseconds
+- `mtime`, `ctime` - the file's modification and status-change times, in
+  nanoseconds, as observed at that examination
+- `size` - the file's size in bytes
+- `inode` - the file's inode number (or platform equivalent)
 
 On run (CLI or watcher):
 
-1. If the current mtime matches the stored `last_modified`, the path is skipped.
-2. Otherwise the file is re-hashed, indexes are updated, and both timestamps are
+1. A path is skipped only if its current `mtime`, `ctime`, `size`, and `inode`
+   all match the stored values, and the entry is not *racy* (below).
+2. Otherwise the file is re-hashed, indexes are updated, and the record is
    rewritten.
+
+mtime alone is not sufficient: it can be set by any process (`touch -d`,
+`utimensat`, `cp -p`, `rsync -t`, archive extraction), whereas ctime cannot be
+set from userspace. A configuration option may disable the ctime and inode
+comparisons for filesystems where they are unstable (some FUSE and network
+filesystems).
+
+**Racy entries** - A file modified within the filesystem's timestamp
+granularity after it was hashed can show an unchanged mtime. An entry whose
+`mtime` is not earlier than its `last_checked` (minus the timestamp
+granularity) is racy, and is re-hashed on the next run regardless of matching
+metadata. This is the same problem and remedy as git's "racy git" handling.
+
+Skipping by metadata is a performance heuristic, not an integrity guarantee:
+an adversary able to write a file and control its metadata can evade it.
+Integrity audits use `ext check --full`.
 
 Large directories (either by size or number of files) may also be added to the
 timestamp index as a further optimization. This allows only some child
