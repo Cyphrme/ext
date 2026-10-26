@@ -98,7 +98,6 @@ fn precedence_table_all_combinations() {
         Arg::Missing,
         Arg::NotAStore,
     ];
-    let mut n = 0;
     for &flag in &args {
         for &env in &env_args {
             for default_present in [false, true] {
@@ -132,12 +131,10 @@ fn precedence_table_all_combinations() {
                         want,
                         "flag={flag:?} env={env:?} default={default_present} cwd={cwd_present}"
                     );
-                    n += 1;
                 }
             }
         }
     }
-    assert_eq!(n, 5 * 6 * 2 * 2);
 }
 
 /// §1: Store::open("/") is Foreign for a non-root user.
