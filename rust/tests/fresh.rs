@@ -73,100 +73,59 @@ proptest! {
 }
 
 // Skip only when the stored metadata equals the current, is not racy, and
-// the run is not --full. Literal rows, no oracle.
+// the run is not --full. Literal rows, no oracle. Columns: stored metadata,
+// current metadata, --full, expected skip.
 #[test]
 fn should_skip_table() {
     let settled = meta(7, T - 100 * W, T - 100 * W, 1, 2);
     let racy = meta(7, T - W / 2, T - 100 * W, 1, 2);
-    let rows: &[(&str, Option<Entry>, Meta, bool, bool)] = &[
-        (
-            "settled and equal",
-            Some(entry(settled, T, b"x")),
-            settled,
-            false,
-            true,
-        ),
-        ("racy", Some(entry(racy, T, b"x")), racy, false, false),
-        (
-            "--full",
-            Some(entry(settled, T, b"x")),
-            settled,
-            true,
-            false,
-        ),
+    let moved = meta(8, T - 100 * W, T - 100 * W, 1, 2);
+    let rows = [
+        ("settled and equal", Some(settled), settled, false, true),
+        ("racy", Some(racy), racy, false, false),
+        ("--full", Some(settled), settled, true, false),
         ("no entry", None, settled, false, false),
-        (
-            "field differs",
-            Some(entry(settled, T, b"x")),
-            meta(8, T - 100 * W, T - 100 * W, 1, 2),
-            false,
-            false,
-        ),
+        ("field differs", Some(settled), moved, false, false),
     ];
     for (name, stored, current, full, want) in rows {
-        assert_eq!(
-            should_skip(stored.as_ref(), current, *full),
-            *want,
-            "{name}"
-        );
+        let e = stored.map(|m| entry(m, T, b"x"));
+        assert_eq!(should_skip(e.as_ref(), &current, full), want, "{name}");
     }
 }
 
 // The D1 status table. A violation is a content change with nothing
-// observable having changed, on metadata that is trustworthy.
+// observable having changed, on metadata that is trustworthy. Columns: stored
+// entry (settled or racy), current metadata moved?, new content, status.
 #[test]
 fn classify_table() {
     let old = meta(3, T - 100 * W, T - 100 * W, 1, 1);
     let moved = meta(4, T - 100 * W, T - 100 * W, 1, 1);
-    let dg = |c: &[u8]| Digest::compute(Alg::Sha256, c);
     let settled = entry(old, T, b"old");
     let racy = entry(old, T - 100 * W + 1, b"old");
-    let rows: &[(&str, Option<&Entry>, Meta, Digest, Status)] = &[
-        ("no entry", None, old, dg(b"x"), Status::New),
+    let rows = [
+        ("no entry", None, false, &b"x"[..], Status::New),
+        ("same", Some(&settled), false, b"old", Status::Unchanged),
         (
-            "same digest, same meta",
+            "same, moved",
             Some(&settled),
-            old,
-            dg(b"old"),
+            true,
+            b"old",
             Status::Unchanged,
         ),
+        ("same, racy", Some(&racy), false, b"old", Status::Unchanged),
         (
-            "same digest, new meta",
+            "new, settled",
             Some(&settled),
-            moved,
-            dg(b"old"),
-            Status::Unchanged,
-        ),
-        (
-            "same digest, racy",
-            Some(&racy),
-            old,
-            dg(b"old"),
-            Status::Unchanged,
-        ),
-        (
-            "new digest, same meta, settled",
-            Some(&settled),
-            old,
-            dg(b"new"),
+            false,
+            b"new",
             Status::Violation,
         ),
-        (
-            "new digest, same meta, racy",
-            Some(&racy),
-            old,
-            dg(b"new"),
-            Status::Edited,
-        ),
-        (
-            "new digest, new meta",
-            Some(&settled),
-            moved,
-            dg(b"new"),
-            Status::Edited,
-        ),
+        ("new, racy", Some(&racy), false, b"new", Status::Edited),
+        ("new, moved", Some(&settled), true, b"new", Status::Edited),
     ];
-    for (name, stored, cur, digest, want) in rows {
-        assert_eq!(classify(*stored, cur, digest), *want, "{name}");
+    for (name, stored, is_moved, content, want) in rows {
+        let cur = if is_moved { moved } else { old };
+        let dg = Digest::compute(Alg::Sha256, content);
+        assert_eq!(classify(stored, &cur, &dg), want, "{name}");
     }
 }
