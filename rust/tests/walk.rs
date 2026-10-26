@@ -2,7 +2,7 @@
 
 mod support;
 use ext::store::Store;
-use ext::walk::{walk, Event};
+use ext::walk::{walk, walk_hooked, Event};
 use rustix::fs::{mknodat, FileType, Mode, CWD};
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt};
@@ -229,5 +229,37 @@ echo "CODE=$?"
     assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
     assert!(o.stdout.contains("NEW\t/work/root/f\n"), "{}", o.stdout);
     assert!(o.stdout.contains("MOUNT\t/work/root/mnt\n"), "{}", o.stdout);
-    assert!(!o.stdout.contains("inside"), "entered the mount: {}", o.stdout);
+    assert!(
+        !o.stdout.contains("inside"),
+        "entered the mount: {}",
+        o.stdout
+    );
+}
+
+/// Amendment 26f #6: an entry swapped between its metadata read and its open
+/// is Unstable (it is known to be moving), not a generic Error.
+#[test]
+fn entry_swapped_before_open_is_unstable() {
+    let (_t, d) = canon_tmp();
+    let root = d.join("r");
+    fs::create_dir_all(&root).unwrap();
+    let f = root.join("f");
+    fs::write(&f, b"x").unwrap();
+    fs::write(root.join("other"), b"y").unwrap();
+    let mut ev = Vec::new();
+    walk_hooked(
+        &rp(&root),
+        no_store(),
+        &mut |p| {
+            if p == b(&f) {
+                fs::rename(root.join("other"), &f).unwrap(); // new inode under the name
+            }
+        },
+        &mut |e| match e {
+            Event::Unstable(p, _) => ev.push(Ev::Unstable(p)),
+            Event::Error(p, _) => ev.push(Ev::Error(p)),
+            _ => {}
+        },
+    );
+    assert_eq!(ev, vec![Ev::Unstable(b(&f))]);
 }
