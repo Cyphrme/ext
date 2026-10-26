@@ -147,7 +147,9 @@ fn schema_version_mismatch_is_refused() {
 #[test]
 fn reconcile() {
     let (_t, _st, ix) = fresh();
-    let rows: &[(&[&[u8]], &[&[u8]], &[&[u8]])] = &[
+    // (entries, roots, entries kept)
+    type Row<'a> = (&'a [&'a [u8]], &'a [&'a [u8]], &'a [&'a [u8]]);
+    let rows: &[Row] = &[
         (
             &[b"/r1/a", b"/r1x/a", b"/r1", b"/a/x", b"/ab/y", b"/abc/z"],
             &[b"/r1"],
