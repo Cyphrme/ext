@@ -283,9 +283,12 @@ Skipping by metadata is a performance heuristic, not an integrity guarantee:
 an adversary able to write a file and control its metadata can evade it.
 Integrity audits use `ext check --full`.
 
-Large directories (either by size or number of files) may also be added to the
-timestamp index as a further optimization. This allows only some child
-directories in a parent to be re-examined.
+**Directories** - Large directories may also be recorded in the timestamp
+index as a further optimization. A directory's mtime changes only when an
+entry directly inside it is created, removed, or renamed; it does not change
+when a file's contents change, or when anything changes in a subdirectory.
+An unchanged directory record therefore permits skipping only the re-listing
+of that one directory. Every entry in it is still checked by rule 1.
 
 **Watcher** - `ext watch` monitors registered paths via the platform mechanism (Linux:
 inotify/fanotify). On create/modify/delete events it re-hash (or removes) and
