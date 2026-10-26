@@ -47,8 +47,9 @@ pub fn hash_stable(
         after_chunk(off);
     }
     let after = meta_of(&file.metadata()?);
-    // A short read means the file shrank (or its size is not its content
-    // length, e.g. procfs); no metadata comparison can vouch for either.
+    // A short read means the file shrank after the first fstat; the
+    // metadata comparison normally catches that too, so this is plain
+    // defence against a read that ends early for any other reason.
     if before != after || off != before.size {
         return Err(HashError::Unstable);
     }
