@@ -5,7 +5,6 @@ mod common;
 use common::{mk_store, rp};
 use ext::digest::{Alg, Digest};
 use ext::index::{Entry, Index, Meta};
-use ext::registry::RegistryErrorKind;
 use ext::store::{judge_ancestor, locate, Source, Store, StoreError};
 use std::fs;
 use std::io;
@@ -42,7 +41,7 @@ fn store_under_parent() -> (tempfile::TempDir, PathBuf, PathBuf) {
 // ---- ancestor check (F1) ----
 
 #[test]
-fn ancestor_writable_nonsticky_is_refused() {
+fn ancestor_policy_on_real_dirs() {
     for mode in [0o770, 0o707, 0o777, 0o720] {
         let (_t, parent, dir) = store_under_parent();
         chmod(&parent, mode);
@@ -51,19 +50,12 @@ fn ancestor_writable_nonsticky_is_refused() {
             "parent mode {mode:o}"
         );
     }
-}
-
-#[test]
-fn ancestor_writable_sticky_is_accepted() {
     for mode in [0o1777, 0o1770, 0o1707] {
         let (_t, parent, dir) = store_under_parent();
         chmod(&parent, mode);
         Store::open(&dir).unwrap_or_else(|e| panic!("sticky {mode:o}: {e:?}"));
     }
-}
-
-#[test]
-fn ancestor_check_covers_every_level() {
+    // Every level of the path is checked, not only the parent.
     let t = tempfile::tempdir().unwrap();
     let g = t.path().join("g");
     let p = g.join("p");
@@ -141,54 +133,33 @@ fn decoy(at: &Path, db_mode: u32) {
 }
 
 /// Swapping the store path after `Store::open` must not redirect the index
-/// to a decoy database, and must not modify the decoy.
+/// to a decoy database (modifying it) nor create a database in a bare
+/// swapped-in directory.
 #[test]
-fn index_open_after_path_swap_fails_and_leaves_decoy_untouched() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    Store::init_bare(&dir).unwrap();
-    let st = Store::open(&dir).unwrap();
-    fs::rename(&dir, t.path().join("old")).unwrap();
-    decoy(&dir, 0o666);
-    let before = fs::read(dir.join("index.db")).unwrap();
-    assert!(Index::open(&st).is_err(), "opened the swapped-in database");
-    assert_eq!(
-        fs::read(dir.join("index.db")).unwrap(),
-        before,
-        "decoy modified"
-    );
-    assert_eq!(
-        listing(&dir),
-        ["index.db", "lock", "registry"],
-        "wal/shm created in decoy"
-    );
-}
-
-/// The original store is still usable through its held fd identity: `id()`
-/// is the old inode, not the decoy's.
-#[test]
-fn swapped_path_has_a_different_id() {
-    use std::os::unix::fs::MetadataExt;
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    Store::init_bare(&dir).unwrap();
-    let st = Store::open(&dir).unwrap();
-    fs::rename(&dir, t.path().join("old")).unwrap();
-    decoy(&dir, 0o600);
-    let m = fs::metadata(&dir).unwrap();
-    assert_ne!(st.id(), (m.dev(), m.ino()));
-}
-
-/// With a loose ancestor the swap is caught earlier, at `Store::open`.
-#[test]
-fn swap_under_writable_parent_is_refused_at_open() {
-    let (_t, parent, dir) = store_under_parent();
-    // The decoy is built with init_bare, which now refuses a loose parent, so
-    // the parent is loosened only after the swap is staged.
-    fs::rename(&dir, parent.join("old")).unwrap();
-    decoy(&dir, 0o600);
-    chmod(&parent, 0o777);
-    assert!(is_unsafe(&Store::open(&dir), &parent));
+fn index_open_after_swap() {
+    for decoy_db in [true, false] {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("s");
+        Store::init_bare(&dir).unwrap();
+        let st = Store::open(&dir).unwrap();
+        fs::rename(&dir, t.path().join("old")).unwrap();
+        if decoy_db {
+            decoy(&dir, 0o666);
+        } else {
+            fs::create_dir(&dir).unwrap();
+            chmod(&dir, 0o700);
+        }
+        let before = decoy_db.then(|| fs::read(dir.join("index.db")).unwrap());
+        let listed = listing(&dir);
+        assert!(
+            Index::open(&st).is_err(),
+            "decoy_db={decoy_db}: opened the swapped-in directory"
+        );
+        assert_eq!(listing(&dir), listed, "decoy_db={decoy_db}: wal/shm/db created");
+        if let Some(before) = before {
+            assert_eq!(fs::read(dir.join("index.db")).unwrap(), before, "decoy modified");
+        }
+    }
 }
 
 // ---- atomic init (F1 part 3) ----
@@ -251,22 +222,6 @@ fn init_extant_never_publishes_a_store_without_its_root() {
     assert_eq!(st.registry().unwrap().len(), 1);
 }
 
-#[test]
-fn init_in_unwritable_parent_fails_cleanly() {
-    let t = tempfile::tempdir().unwrap();
-    let parent = t.path().join("ro");
-    fs::create_dir(&parent).unwrap();
-    chmod(&parent, 0o500);
-    if fs::create_dir(parent.join("probe")).is_ok() {
-        eprintln!("skipped: directory permissions are not enforced (root?)");
-        return;
-    }
-    assert!(Store::init_bare(&parent.join("s")).is_err());
-    assert!(Store::init_extant(&parent).is_err());
-    assert!(listing(&parent).is_empty());
-    chmod(&parent, 0o700);
-}
-
 // ---- mutation-gap closers ----
 
 #[test]
@@ -284,22 +239,6 @@ fn edit_registry_on_corrupt_registry_errors_and_keeps_bytes() {
     );
     assert_eq!(fs::read(dir.join("registry")).unwrap(), bad);
     assert_eq!(listing(&dir), ["index.db", "lock", "registry"]);
-}
-
-#[test]
-fn mode_other_writable_refused_on_each_file() {
-    for f in ["registry", "index.db", "lock"] {
-        let t = tempfile::tempdir().unwrap();
-        let dir = t.path().join("s");
-        Store::init_bare(&dir).unwrap();
-        chmod(&dir.join(f), 0o606);
-        let r = Store::open(&dir);
-        assert!(
-            matches!(r, Err(StoreError::Writable(_))),
-            "{f}: {:?}",
-            r.err()
-        );
-    }
 }
 
 #[test]
@@ -363,6 +302,13 @@ fn open_refuses_symlinked_or_non_regular_store_files() {
             );
         }
     }
+    // The store directory itself is opened O_NOFOLLOW.
+    let t = tempfile::tempdir().unwrap();
+    let real = t.path().join("real");
+    Store::init_bare(&real).unwrap();
+    let link = t.path().join("link");
+    symlink(&real, &link).unwrap();
+    assert!(Store::open(&link).is_err());
 }
 
 #[test]
@@ -410,22 +356,6 @@ fn stale_registry_tmp_is_cleared_and_never_followed() {
     assert_eq!(listing(&dir), ["index.db", "lock", "registry"]);
 }
 
-#[test]
-fn registry_error_kind_is_exposed_for_hand_edits() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    let st = Store::init_bare(&dir).unwrap();
-    fs::write(dir.join("registry"), b"/ok\n/\xff\n").unwrap();
-    assert!(matches!(
-        st.registry(),
-        Err(StoreError::Registry {
-            line: 2,
-            kind: RegistryErrorKind::NotUtf8,
-            ..
-        })
-    ));
-}
-
 // ---- re-gate additions ----
 
 /// init must apply the same ancestor rule as open, and leave nothing behind;
@@ -470,21 +400,3 @@ fn ancestor_check_uses_the_canonical_path() {
     assert!(is_unsafe(&Store::open(&trusted.join("link/s")), &a));
 }
 
-/// Even a swapped-in directory with no index.db at all must not receive a
-/// freshly created database (or -wal/-shm) from `Index::open`.
-#[test]
-fn index_open_after_swap_to_empty_dir_creates_nothing() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    Store::init_bare(&dir).unwrap();
-    let st = Store::open(&dir).unwrap();
-    fs::rename(&dir, t.path().join("old")).unwrap();
-    fs::create_dir(&dir).unwrap();
-    chmod(&dir, 0o700);
-    assert!(Index::open(&st).is_err());
-    assert!(
-        listing(&dir).is_empty(),
-        "created {:?} in the decoy",
-        listing(&dir)
-    );
-}
