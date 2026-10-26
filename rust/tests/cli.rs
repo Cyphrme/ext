@@ -718,3 +718,160 @@ fn hostile_names() {
         assert_eq!(o.stdout, [p.as_slice(), b"\0"].concat());
     }
 }
+
+// ----------------------------------------------- amendment 26f: CLI changes
+
+/// Spawns `ext ARGS` against the fixture's store with piped output, so the
+/// test can close the reading end.
+fn spawn_piped(fx: &Fx, args: &[&str]) -> std::process::Child {
+    use std::process::Stdio;
+    std::process::Command::new(env!("CARGO_BIN_EXE_ext"))
+        .env("EXTANT_DIR", &fx.store)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Well past a 64 KiB pipe, so the writer is still writing when the reader
+/// goes away.
+fn long_name_pad() -> String {
+    "p".repeat(150)
+}
+
+/// A reader that goes away is a quiet stop, not an error:
+/// `ext list | head -1` exits 0 with nothing on stderr.
+#[test]
+fn list_under_broken_pipe_exits_0_silently() {
+    use std::io::BufRead;
+    let fx = Fx::new();
+    let pad = long_name_pad();
+    fx.index()
+        .batch(|ix| {
+            (0..2000).try_for_each(|i: usize| {
+                ix.upsert(&Entry {
+                    path: format!("/seed/{pad}{i:05}").into_bytes(),
+                    digest: dg(b"seed"),
+                    meta: Meta {
+                        size: 1,
+                        mtime_ns: 1,
+                        ctime_ns: 1,
+                        dev: 1,
+                        ino: i as u64,
+                    },
+                    last_checked_ns: 1_000_000_000_000,
+                })
+            })
+        })
+        .unwrap();
+    let mut child = spawn_piped(&fx, &["list"]);
+    let mut first = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap(); // the reader is dropped here
+    assert!(first.starts_with(&rev(b"seed")), "{first}");
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert_eq!(err, "");
+}
+
+/// `check` whose reader went away still exits with the summary's code (2 for
+/// a violation) and prints no error: the scan finished, only the report did
+/// not.
+#[test]
+fn check_under_broken_pipe_exits_with_the_summary_code() {
+    let fx = Fx::new();
+    let f = fx.write("f", b"truth");
+    assert_eq!(fx.check().code, 0);
+    tamper(&fx, &f);
+    let pad = long_name_pad();
+    for i in 0..1500 {
+        fx.write(&format!("{pad}{i:05}"), b"new");
+    }
+    let mut child = spawn_piped(&fx, &["check", "--full"]);
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(!err.contains("error") && !err.contains("pipe"), "{err}");
+}
+
+/// `--d` names a store to open; `init` creates one, so it is a usage error
+/// that creates nothing.
+#[test]
+fn init_rejects_the_d_flag() {
+    let (_t, base) = tmp_dir();
+    let x = base.join("x");
+    let o = run(cmd().arg("--d").arg(&x).arg("init").current_dir(&base));
+    assert_eq!(o.code, 4, "{}", o.stderr);
+    assert!(!x.exists() && !base.join(".ext").exists());
+}
+
+/// A positional dir contradicts `--bare`.
+#[test]
+fn init_rejects_dir_with_bare() {
+    let (_t, base) = tmp_dir();
+    let (p, dir) = (base.join("p"), base.join("dir"));
+    fs::create_dir(&dir).unwrap();
+    let o = run(cmd().arg("init").arg(&dir).arg("--bare").arg(&p));
+    assert_eq!(o.code, 4, "{}", o.stderr);
+    assert!(!p.exists() && !dir.join(".ext").exists());
+}
+
+/// `register` takes a directory: a regular file is refused before anything
+/// is written.
+#[test]
+fn register_refuses_a_regular_file() {
+    let fx = Fx::new();
+    let file = fx.base.join("afile");
+    fs::write(&file, b"x").unwrap();
+    let before = fx.registry_text();
+    let o = run(fx.ext().arg("register").arg(&file));
+    assert_eq!(o.code, 4, "{}", o.stderr);
+    assert!(o.stderr.contains(file.to_str().unwrap()), "{}", o.stderr);
+    assert_eq!(fx.registry_text(), before);
+}
+
+/// ERROR and REFUSED lines say why: the cause follows the path as its own
+/// tab-separated field.
+fn assert_detail(o: &Out, status: &str) {
+    let lines = status_lines(o, status);
+    assert_eq!(lines.len(), 1, "{status}: {}", o.out());
+    assert!(
+        lines[0].len() >= 3 && !lines[0][2].is_empty(),
+        "{status} line has no detail: {}",
+        o.out()
+    );
+}
+
+#[test]
+fn refused_line_carries_the_detail() {
+    let fx = Fx::new();
+    let real = fx.base.join("real");
+    fs::create_dir_all(real.join("r")).unwrap();
+    let link = fx.base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let st = Store::open(&fx.store).unwrap();
+    let lock = st.lock().unwrap();
+    let via = RegPath::from_bytes(&p_bytes(&link.join("r"))).unwrap();
+    st.edit_registry(&lock, |v| v.push(via)).unwrap();
+    drop(lock);
+    let o = fx.check();
+    assert_eq!(o.code, 5, "{}", o.stderr);
+    assert_detail(&o, "REFUSED");
+}
+
+#[test]
+fn error_line_carries_the_detail() {
+    if is_root() {
+        return;
+    }
+    let fx = Fx::new();
+    let f = fx.write("locked", b"x");
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+    let o = fx.check();
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_detail(&o, "ERROR");
+}
