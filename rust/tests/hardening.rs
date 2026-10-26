@@ -183,9 +183,11 @@ fn swapped_path_has_a_different_id() {
 #[test]
 fn swap_under_writable_parent_is_refused_at_open() {
     let (_t, parent, dir) = store_under_parent();
-    chmod(&parent, 0o777);
+    // The decoy is built with init_bare, which now refuses a loose parent, so
+    // the parent is loosened only after the swap is staged.
     fs::rename(&dir, parent.join("old")).unwrap();
     decoy(&dir, 0o600);
+    chmod(&parent, 0o777);
     assert!(is_unsafe(&Store::open(&dir), &parent));
 }
 

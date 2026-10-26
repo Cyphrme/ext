@@ -438,6 +438,9 @@ fn publish_new(
     let tmp_name = format!(".{name}.init-{}-{nanos}", std::process::id());
     let tmp_path = parent.join(&tmp_name);
 
+    // Refuse a parent that `open` would refuse, before creating anything.
+    check_ancestors(parent)?;
+
     let mut published = false;
     let result = (|| {
         mkdirat(&pfd, tmp_name.as_str(), Mode::RWXU)
@@ -450,8 +453,7 @@ fn publish_new(
         }
         fsync(&dir).map_err(|e| errno(e, "sync temp store", &tmp_path))?;
         // Judged before publish so a bad store leaves nothing behind; the fd
-        // stays valid across the rename. Ancestors are not judged here: that
-        // is `open`'s job, and init in a loose parent is allowed.
+        // stays valid across the rename. Ancestors were judged above.
         let store = Store::adopt(dir, target.to_path_buf(), None)?;
         before_publish(&tmp_path)
             .map_err(|e| wrap(e, "init aborted before publish for", target))?;
