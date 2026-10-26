@@ -22,6 +22,7 @@ enum Ev {
     SubExtant(Vec<u8>),
     Refused(Vec<u8>),
     Error(Vec<u8>),
+    Unstable(Vec<u8>),
 }
 
 fn run_walk(root: &Path, store_id: (u64, u64)) -> Vec<Ev> {
@@ -40,6 +41,7 @@ fn run_walk(root: &Path, store_id: (u64, u64)) -> Vec<Ev> {
                 Event::SubExtant(p) => Ev::SubExtant(p),
                 Event::Refused(p, _) => Ev::Refused(p),
                 Event::Error(p, _) => Ev::Error(p),
+                Event::Unstable(p, _) => Ev::Unstable(p),
             })
         });
         v.sort();

@@ -43,6 +43,9 @@ pub struct Report {
     pub path: Vec<u8>,
     /// (stored, actual); `Some` for Edited, Violation and Accepted.
     pub digests: Option<(Digest, Digest)>,
+    /// The cause; `Some(non-empty)` for Error, Refused and Unstable
+    /// (amendment 26f). Scaffold: nothing sets it yet.
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -210,6 +213,7 @@ impl RootScan<'_> {
                 kind,
                 path: p.clone(),
                 digests: None,
+                detail: None,
             });
             gone.push(p);
         }
@@ -225,6 +229,7 @@ impl RootScan<'_> {
             kind,
             path,
             digests,
+            detail: None,
         });
     }
 
@@ -278,6 +283,7 @@ impl RootScan<'_> {
                     self.report(ReportKind::Refused, p, None);
                 }
             }
+            Event::Unstable(..) => todo!("Event::Unstable: amendment 26f #6"),
             Event::Error(p, e) => {
                 self.unverified.insert(p.clone());
                 if ChangedDuringWalk::is(&e) {

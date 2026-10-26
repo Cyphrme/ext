@@ -28,6 +28,10 @@ pub enum Event {
     SubExtant(Vec<u8>),
     Refused(Vec<u8>, io::Error),
     Error(Vec<u8>, io::Error),
+    /// The entry changed type or identity between the metadata read and the
+    /// open: known to be moving, so not merely unreadable. Replaces the
+    /// `ChangedDuringWalk` marker carried by `Error`.
+    Unstable(Vec<u8>, io::Error),
 }
 
 /// Carried by an `Event::Error` when the entry changed type or identity
@@ -103,6 +107,19 @@ fn child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     }
     p.extend_from_slice(name);
     p
+}
+
+/// Test seam (amendment 26f, #6): as [`walk`], but `before_open(path)` runs
+/// for each regular file and directory after its metadata is read and before
+/// it is opened, so a test can swap the entry in that window.
+// Scaffold for the red tests; the implementation walk replaces the body.
+pub fn walk_hooked(
+    _root: &RegPath,
+    _store_id: (u64, u64),
+    _before_open: &mut dyn FnMut(&[u8]),
+    _visit: &mut dyn FnMut(Event),
+) {
+    todo!("walk_hooked: amendment 26f #6")
 }
 
 /// Every descent is relative to a held descriptor, so no component can be
