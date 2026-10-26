@@ -202,12 +202,15 @@ Once the cache reaches capacity, the oldest items are removed.
 directory: `/var/lib/ext`. This may be set to a different directory using the
 environment variable `EXTANT_DIR`.
 
-The waterfall for directories. Use the first candidate that exists.
-1. Environment variable
-2. Default path, `/var/lib/ext`
-3. Flag value
+The waterfall for directories, highest precedence first:
+1. Flag value (`--d <path>`)
+2. Environment variable, `EXTANT_DIR`
+3. Default path, `/var/lib/ext`
 4. Current directory
 5. Fail if nothing exists.
+
+An explicitly given directory (flag or environment variable) that does not
+exist is an error; `ext` does not fall through to a lower candidate.
 
 ## Config Flags
 The config file is saved as <extant_path>/config.
