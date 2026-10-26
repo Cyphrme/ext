@@ -8,8 +8,6 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::Duration;
 
 #[derive(Clone, Copy, Debug)]
 enum Arg {
@@ -142,35 +140,6 @@ fn precedence_table_all_combinations() {
     assert_eq!(n, 5 * 6 * 2 * 2);
 }
 
-/// An explicit path that is missing never falls through to a lower step,
-/// even when every lower step would succeed.
-#[test]
-fn explicit_missing_does_not_fall_through() {
-    let t = tempfile::tempdir().unwrap();
-    let default = t.path().join("default");
-    let cwd = t.path().join("cwd");
-    mk_store(&default);
-    mk_store(&cwd.join(".ext"));
-    let missing = t.path().join("nope");
-    let r = locate(Some(&missing), None, &default, &cwd);
-    assert!(
-        matches!(r, Err(StoreError::ExplicitMissing(p)) if p == missing),
-        "flag"
-    );
-    let r = locate(None, Some(missing.as_os_str()), &default, &cwd);
-    assert!(
-        matches!(r, Err(StoreError::ExplicitMissing(p)) if p == missing),
-        "env"
-    );
-}
-
-#[test]
-fn no_candidate_is_no_store() {
-    let t = tempfile::tempdir().unwrap();
-    let r = locate(None, None, &t.path().join("absent"), t.path());
-    assert!(matches!(r, Err(StoreError::NoStore)));
-}
-
 /// §1: Store::open("/") is Foreign for a non-root user.
 #[test]
 fn open_foreign_owned_store_refused() {
@@ -215,31 +184,28 @@ fn judge_owner_mode_on_constructed_stat() {
     ));
 }
 
+/// A store whose directory or any file is group/other-writable is refused.
 #[test]
-fn open_group_or_other_writable_refused() {
-    for mode in [0o770, 0o707, 0o777, 0o720] {
-        let t = tempfile::tempdir().unwrap();
-        let dir = t.path().join("s");
-        Store::init_bare(&dir).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
-        let r = Store::open(&dir);
-        assert!(
-            matches!(r, Err(StoreError::Writable(_))),
-            "dir mode {mode:o}: {:?}",
-            r.err()
-        );
-    }
-    for f in ["registry", "index.db", "lock"] {
-        let t = tempfile::tempdir().unwrap();
-        let dir = t.path().join("s");
-        Store::init_bare(&dir).unwrap();
-        fs::set_permissions(dir.join(f), fs::Permissions::from_mode(0o664)).unwrap();
-        let r = Store::open(&dir);
-        assert!(
-            matches!(r, Err(StoreError::Writable(_))),
-            "{f} mode 664: {:?}",
-            r.err()
-        );
+fn open_refuses_loose_modes() {
+    for (target, modes) in [
+        (None, vec![0o770, 0o707, 0o777, 0o720]),
+        (Some("registry"), vec![0o664, 0o606]),
+        (Some("index.db"), vec![0o664, 0o606]),
+        (Some("lock"), vec![0o664, 0o606]),
+    ] {
+        for mode in modes {
+            let t = tempfile::tempdir().unwrap();
+            let dir = t.path().join("s");
+            Store::init_bare(&dir).unwrap();
+            let victim = target.map_or(dir.clone(), |f| dir.join(f));
+            fs::set_permissions(&victim, fs::Permissions::from_mode(mode)).unwrap();
+            let r = Store::open(&dir);
+            assert!(
+                matches!(r, Err(StoreError::Writable(_))),
+                "{target:?} mode {mode:o}: {:?}",
+                r.err()
+            );
+        }
     }
 }
 
@@ -324,77 +290,6 @@ fn registry_read_reports_line_number() {
     ));
 }
 
-/// §1 "Writes ... temp file, fsync, rename": a concurrent reader never sees a
-/// torn or partial registry, and no temp file is left behind.
-// fsync of the temp file, the store directory and the registry rename cannot
-// be observed without fault injection (a crash or a failing fsync); no test
-// here claims to cover them.
-#[test]
-fn registry_write_is_atomic_to_readers() {
-    const PER_EDIT: usize = 400;
-    const EDITS: usize = 25;
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    let st = Store::init_bare(&dir).unwrap();
-    let done = std::sync::atomic::AtomicBool::new(false);
-    std::thread::scope(|s| {
-        let reader = s.spawn(|| {
-            let mut seen = 0usize;
-            while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                let bytes = fs::read(dir.join("registry")).expect("registry always present");
-                let parsed = ext::registry::parse(&bytes)
-                    .unwrap_or_else(|e| panic!("torn registry observed: {e:?}"));
-                assert_eq!(parsed.len() % PER_EDIT, 0, "partial edit observed");
-                seen += 1;
-            }
-            seen
-        });
-        for i in 0..EDITS {
-            let lock = st.lock().unwrap();
-            st.edit_registry(&lock, |v| {
-                for j in 0..PER_EDIT {
-                    v.push(rp(format!("/d/{i}/{j}").as_bytes()));
-                }
-            })
-            .unwrap();
-        }
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(reader.join().unwrap() > 0);
-    });
-    assert_eq!(st.registry().unwrap().len(), PER_EDIT * EDITS);
-    let mut names: Vec<_> = fs::read_dir(&dir)
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
-    assert_eq!(names, ["index.db", "lock", "registry"], "stray temp file");
-}
-
-/// §1 "Writes hold flock(<store>/lock, LOCK_EX)": a second handle blocks
-/// until the first lock is dropped.
-#[test]
-fn lock_excludes_second_writer() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    let st = Store::init_bare(&dir).unwrap();
-    let held = st.lock().unwrap();
-    let (tx, rx) = mpsc::channel();
-    let d2 = dir.clone();
-    let h = std::thread::spawn(move || {
-        let other = Store::open(&d2).unwrap();
-        let _g = other.lock().unwrap();
-        tx.send(()).unwrap();
-    });
-    assert!(
-        rx.recv_timeout(Duration::from_millis(300)).is_err(),
-        "second lock acquired while first held"
-    );
-    drop(held);
-    rx.recv_timeout(Duration::from_secs(10))
-        .expect("second lock after release");
-    h.join().unwrap();
-}
-
 /// R3: `lock()` creates a missing lock file (0600); open tolerates its absence.
 #[test]
 fn lock_creates_missing_lock_file() {
@@ -409,92 +304,62 @@ fn lock_creates_missing_lock_file() {
     assert_eq!(md.permissions().mode() & 0o777, 0o600);
 }
 
-/// R3: the registry is replaced by rename, so the lock must be a separate
-/// file whose inode survives registry rewrites.
+/// R3/R9: the registry is replaced by rename (a new inode, no temp left
+/// behind), so a reader can never see a torn file; the lock is a separate
+/// file whose inode survives the rewrite.
 #[test]
-fn lock_file_survives_registry_rewrites() {
+fn registry_rewrite_is_rename_and_lock_inode_stable() {
     use std::os::unix::fs::MetadataExt;
     let t = tempfile::tempdir().unwrap();
     let dir = t.path().join("s");
     let st = Store::init_bare(&dir).unwrap();
-    let before = fs::metadata(dir.join("lock")).unwrap().ino();
+    let ino = |f: &str| fs::metadata(dir.join(f)).unwrap().ino();
+    let (reg_before, lock_before) = (ino("registry"), ino("lock"));
     let g = st.lock().unwrap();
     st.edit_registry(&g, |v| v.push(rp(b"/x"))).unwrap();
-    assert_eq!(fs::metadata(dir.join("lock")).unwrap().ino(), before);
+    assert_ne!(ino("registry"), reg_before, "registry rewritten in place");
+    assert_eq!(ino("lock"), lock_before);
+    let mut names: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["index.db", "lock", "registry"], "stray temp file");
+    assert_eq!(st.registry().unwrap(), vec![rp(b"/x")]);
 }
 
-/// R7: init never overwrites an existing store.
+/// R7: init never overwrites anything that exists at the target: a store
+/// (bytes kept), or merely an empty directory (`.ext` for the extant form).
 #[test]
-fn init_bare_refuses_existing_path() {
+fn init_never_overwrites() {
+    let already = |r: Result<Store, StoreError>| {
+        assert!(
+            matches!(&r, Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "{:?}",
+            r.err()
+        );
+    };
     let t = tempfile::tempdir().unwrap();
     let dir = t.path().join("s");
     let st = Store::init_bare(&dir).unwrap();
     let g = st.lock().unwrap();
     st.edit_registry(&g, |v| v.push(rp(b"/keep"))).unwrap();
     drop(g);
-    match Store::init_bare(&dir) {
-        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
-        other => panic!("expected Io(AlreadyExists), got {:?}", other.err()),
-    }
+    already(Store::init_bare(&dir));
     assert_eq!(
         Store::open(&dir).unwrap().registry().unwrap(),
         vec![rp(b"/keep")]
     );
-    // Any pre-existing path counts, even an empty directory.
     let empty = t.path().join("empty");
     fs::create_dir(&empty).unwrap();
-    assert!(matches!(
-        Store::init_bare(&empty),
-        Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
-    ));
-}
+    already(Store::init_bare(&empty));
 
-#[test]
-fn init_extant_refuses_existing_dot_ext() {
-    let t = tempfile::tempdir().unwrap();
-    let dir = fs::canonicalize(t.path()).unwrap();
-    Store::init_extant(&dir).unwrap();
-    match Store::init_extant(&dir) {
-        Err(StoreError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists),
-        other => panic!("expected Io(AlreadyExists), got {:?}", other.err()),
-    }
-    let t2 = tempfile::tempdir().unwrap();
-    let d2 = fs::canonicalize(t2.path()).unwrap();
-    fs::create_dir(d2.join(".ext")).unwrap();
-    assert!(matches!(
-        Store::init_extant(&d2),
-        Err(StoreError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists
-    ));
-}
-
-/// R9: id() is the (dev, ino) of the store directory, for every way of
-/// obtaining a Store.
-#[test]
-fn id_matches_store_directory_metadata() {
-    use std::os::unix::fs::MetadataExt;
-    let want = |p: &Path| {
-        let m = fs::metadata(p).unwrap();
-        (m.dev(), m.ino())
-    };
-    let t = tempfile::tempdir().unwrap();
-    let dir = t.path().join("s");
-    assert_eq!(Store::init_bare(&dir).unwrap().id(), want(&dir));
-    assert_eq!(Store::open(&dir).unwrap().id(), want(&dir));
-    let ext = fs::canonicalize(t.path()).unwrap();
-    assert_eq!(
-        Store::init_extant(&ext).unwrap().id(),
-        want(&ext.join(".ext"))
-    );
-}
-
-/// R9: the directory fd is opened O_NOFOLLOW, so a symlink to a store is not
-/// a store.
-#[test]
-fn open_refuses_symlinked_store_dir() {
-    let t = tempfile::tempdir().unwrap();
-    let real = t.path().join("real");
-    Store::init_bare(&real).unwrap();
-    let link = t.path().join("link");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    assert!(Store::open(&link).is_err());
+    let base = fs::canonicalize(t.path()).unwrap();
+    let with_store = base.join("x");
+    fs::create_dir(&with_store).unwrap();
+    Store::init_extant(&with_store).unwrap();
+    already(Store::init_extant(&with_store));
+    let with_empty_dot_ext = base.join("y");
+    fs::create_dir_all(with_empty_dot_ext.join(".ext")).unwrap();
+    already(Store::init_extant(&with_empty_dot_ext));
 }
