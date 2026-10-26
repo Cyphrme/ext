@@ -290,11 +290,19 @@ when a file's contents change, or when anything changes in a subdirectory.
 An unchanged directory record therefore permits skipping only the re-listing
 of that one directory. Every entry in it is still checked by rule 1.
 
-**Watcher** - `ext watch` monitors registered paths via the platform mechanism (Linux:
-inotify/fanotify). On create/modify/delete events it re-hash (or removes) and
-updates the timestamp index. The watcher is not required for correctness; any
-later `ext` invocation will observe the same timestamps and produce the same
-result.
+**Watcher** - `ext watch` monitors registered paths via the platform
+mechanism (Linux: inotify). inotify is not recursive, so the watcher adds one
+watch per directory, and newly created directories are scanned after their
+watch is added. Files are re-hashed on close-after-write (`IN_CLOSE_WRITE`)
+and on move-in, not on every modification; deleted or moved-out files are
+removed. The timestamp index is updated accordingly.
+
+Events can be lost: on queue overflow (`IN_Q_OVERFLOW`), on failure to add a
+watch (e.g. the per-user watch limit), and while the watcher is not running.
+In each case the watcher performs a full metadata scan of the affected tree
+using the rules above. With that rule the watcher is not required for
+correctness: any later `ext` invocation observes the same metadata and
+produces the same result.
 
 External services are never watched; they are consulted only on cache miss.
 
