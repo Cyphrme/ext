@@ -46,6 +46,8 @@ pub enum StoreError {
         line: usize,
         kind: RegistryErrorKind,
     },
+    #[error("not a registered root: {0}")]
+    NotRegistered(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("db: {0}")]

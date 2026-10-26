@@ -85,8 +85,18 @@ fn same_size_rewrite_mid_hash_is_unstable() {
         if !done {
             done = true;
             sleep(Duration::from_millis(50));
+            let before = fs::metadata(&p).unwrap();
             let mut w = OpenOptions::new().write(true).open(&p).unwrap();
             w.write_all(b"ZZZZ").unwrap();
+            // Premises: size unchanged, so only a timestamp can reveal this,
+            // and the clock actually moved (else the test is not testing).
+            let after = fs::metadata(&p).unwrap();
+            assert_eq!(before.len(), after.len());
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                (before.ctime(), before.ctime_nsec()),
+                (after.ctime(), after.ctime_nsec())
+            );
         }
     });
     assert!(matches!(r, Err(HashError::Unstable)), "{r:?}");

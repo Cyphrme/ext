@@ -7,7 +7,7 @@ mod support;
 use ext::digest::{Alg, Digest};
 use ext::index::{Entry, Index};
 use ext::scan::{run, run_hooked, Opts, Report, ReportKind as K, Summary};
-use ext::store::Store;
+use ext::store::{Store, StoreError};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -41,9 +41,10 @@ fn env() -> Env {
     }
 }
 
-fn scan(e: &mut Env, opts: &Opts) -> (Summary, Vec<Report>) {
+fn scan(e: &Env, opts: &Opts) -> (Summary, Vec<Report>) {
     let mut reps = Vec::new();
-    let s = run(&e.st, &mut e.ix, opts, &mut |r| reps.push(r)).unwrap();
+    let lock = e.st.lock().unwrap();
+    let s = run(&e.st, &lock, &e.ix, opts, &mut |r| reps.push(r)).unwrap();
     (s, reps)
 }
 
@@ -74,17 +75,21 @@ fn tamper(e: &Env, p: &Path) -> Entry {
     en
 }
 
+fn tampered_digest() -> Digest {
+    Digest::compute(Alg::Sha256, b"tampered")
+}
+
 fn digest_of(p: &Path) -> Digest {
     Digest::compute(Alg::Sha256, &fs::read(p).unwrap())
 }
 
 #[test]
 fn first_scan_reports_new_and_indexes_every_file() {
-    let mut e = env();
+    let e = env();
     fs::create_dir_all(e.root.join("d")).unwrap();
     fs::write(e.root.join("a"), b"alpha").unwrap();
     fs::write(e.root.join("d/b"), b"beta").unwrap();
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!(s.new, 2);
     assert_eq!(s.exit_code(), 0);
     let mut new = kinds(&reps, K::New);
@@ -98,13 +103,13 @@ fn first_scan_reports_new_and_indexes_every_file() {
 
 #[test]
 fn settled_unchanged_entry_is_skipped_not_rehashed() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     settle(&e);
     let t = tamper(&e, &f);
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!((s.skipped, s.new, s.edited, s.violation), (1, 0, 0, 0));
     assert!(reps.is_empty(), "{reps:?}");
     // The tampered digest survives only if the file was never re-read.
@@ -114,29 +119,30 @@ fn settled_unchanged_entry_is_skipped_not_rehashed() {
 // A2/T2: a racy entry is re-hashed even though every metadata field matches.
 #[test]
 fn racy_entry_is_rehashed_and_corrected() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     let mut en = tamper(&e, &f);
     en.last_checked_ns = en.meta.mtime_ns.max(en.meta.ctime_ns);
     e.ix.upsert(&en).unwrap();
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!((s.skipped, s.edited), (0, 1));
     assert_eq!(kinds(&reps, K::Edited), vec![b(&f)]);
+    assert_eq!(reps[0].digests, Some((tampered_digest(), digest_of(&f))));
     assert_eq!(entry(&e, &f).unwrap().digest, digest_of(&f));
 }
 
 // Unchanged after re-hash: nothing printed, but last_checked is refreshed.
 #[test]
 fn unchanged_rehash_is_silent_and_refreshes_last_checked() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     let before = entry(&e, &f).unwrap();
     sleep(Duration::from_millis(5));
-    let (s, reps) = scan(&mut e, &Opts::default()); // racy: just written
+    let (s, reps) = scan(&e, &Opts::default()); // racy: just written
     assert_eq!((s.unchanged, s.new, s.edited), (1, 0, 0));
     assert!(reps.is_empty(), "{reps:?}");
     assert!(entry(&e, &f).unwrap().last_checked_ns > before.last_checked_ns);
@@ -146,10 +152,10 @@ fn unchanged_rehash_is_silent_and_refreshes_last_checked() {
 // catch). Only the changed ctime can reveal the edit.
 #[test]
 fn same_size_edit_with_mtime_restored_is_caught_by_ctime() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"AAAAAAAA").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     settle(&e);
     let stored = entry(&e, &f).unwrap();
     sleep(Duration::from_millis(50)); // leave the creation tick of the coarse clock
@@ -173,22 +179,26 @@ fn same_size_edit_with_mtime_restored_is_caught_by_ctime() {
         stored.meta.ctime_ns,
         "test premise: ctime moved"
     );
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!(s.edited, 1);
     assert_eq!(kinds(&reps, K::Edited), vec![b(&f)]);
+    assert_eq!(
+        reps[0].digests,
+        Some((stored.digest.clone(), digest_of(&f)))
+    );
     assert_eq!(entry(&e, &f).unwrap().digest, digest_of(&f));
 }
 
 #[test]
 fn full_scan_violation_is_reported_and_not_written() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     settle(&e);
     let t = tamper(&e, &f);
     let (s, reps) = scan(
-        &mut e,
+        &e,
         &Opts {
             full: true,
             ..Opts::default()
@@ -197,6 +207,7 @@ fn full_scan_violation_is_reported_and_not_written() {
     assert_eq!(s.violation, 1);
     assert_eq!(s.exit_code(), 2);
     assert_eq!(kinds(&reps, K::Violation), vec![b(&f)]);
+    assert_eq!(reps[0].digests, Some((t.digest.clone(), digest_of(&f))));
     assert_eq!(
         entry(&e, &f).unwrap().digest,
         t.digest,
@@ -206,14 +217,14 @@ fn full_scan_violation_is_reported_and_not_written() {
 
 #[test]
 fn full_scan_with_accept_writes_the_entry() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     settle(&e);
     tamper(&e, &f);
     let (s, _) = scan(
-        &mut e,
+        &e,
         &Opts {
             full: true,
             accept: true,
@@ -226,13 +237,13 @@ fn full_scan_with_accept_writes_the_entry() {
 
 #[test]
 fn deleted_file_is_missing_and_its_entry_removed() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     fs::write(&f, b"content").unwrap();
     fs::write(e.root.join("keep"), b"k").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     fs::remove_file(&f).unwrap();
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!(s.missing, 1);
     assert_eq!(s.exit_code(), 0);
     assert_eq!(kinds(&reps, K::Missing), vec![b(&f)]);
@@ -243,14 +254,14 @@ fn deleted_file_is_missing_and_its_entry_removed() {
 // A1: content under a directory that gains `.ext/` is EXCLUDED, not MISSING.
 #[test]
 fn indexed_file_under_new_subextant_is_excluded_and_removed() {
-    let mut e = env();
+    let e = env();
     fs::create_dir_all(e.root.join("d")).unwrap();
     let f = e.root.join("d/f");
     fs::write(&f, b"content").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     assert!(entry(&e, &f).is_some());
     fs::create_dir_all(e.root.join("d/.ext")).unwrap();
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!((s.excluded, s.missing, s.subextant), (1, 0, 1));
     assert_eq!(kinds(&reps, K::Excluded), vec![b(&f)]);
     assert_eq!(kinds(&reps, K::SubExtant), vec![b(&e.root.join("d"))]);
@@ -264,11 +275,11 @@ fn indexed_file_under_new_subextant_is_excluded_and_removed() {
 
 #[test]
 fn subextant_content_never_enters_the_parent_index() {
-    let mut e = env();
+    let e = env();
     fs::create_dir_all(e.root.join("sub/.ext")).unwrap();
     fs::write(e.root.join("sub/content"), b"c").unwrap();
     fs::write(e.root.join("top"), b"t").unwrap();
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     let paths: Vec<_> = e.ix.iter().unwrap().into_iter().map(|x| x.path).collect();
     assert_eq!(paths, vec![b(&e.root.join("top"))]);
 }
@@ -285,20 +296,21 @@ fn store_inside_root_is_not_indexed() {
     let lock = st.lock().unwrap();
     st.edit_registry(&lock, |v| *v = vec![rp(&root)]).unwrap();
     drop(lock);
-    let mut ix = Index::open(&st).unwrap();
-    run(&st, &mut ix, &Opts::default(), &mut |_| {}).unwrap();
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
     let paths: Vec<_> = ix.iter().unwrap().into_iter().map(|x| x.path).collect();
     assert_eq!(paths, vec![b(&root.join("f"))]);
 }
 
 #[test]
 fn symlinks_are_counted_and_not_indexed() {
-    let mut e = env();
+    let e = env();
     let out = e.base.join("outside");
     fs::write(&out, b"secret").unwrap();
     symlink(&out, e.root.join("link")).unwrap();
     fs::write(e.root.join("f"), b"x").unwrap();
-    let (s, _) = scan(&mut e, &Opts::default());
+    let (s, _) = scan(&e, &Opts::default());
     assert_eq!((s.symlinks, s.new), (1, 1));
     assert!(entry(&e, &e.root.join("link")).is_none());
     assert!(entry(&e, &out).is_none());
@@ -315,9 +327,10 @@ fn refused_root_is_reported_exit_5_and_other_roots_still_scan() {
     fs::write(good.join("f"), b"x").unwrap();
     let bad = base.join("link/bad");
     let st = store_with_roots(&base, &[&bad, &good]);
-    let mut ix = Index::open(&st).unwrap();
+    let ix = Index::open(&st).unwrap();
     let mut reps = Vec::new();
-    let s = run(&st, &mut ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
+    let lock = st.lock().unwrap();
+    let s = run(&st, &lock, &ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
     assert_eq!(s.refused, 1);
     assert_eq!(s.exit_code(), 5);
     assert_eq!(kinds(&reps, K::Refused), vec![b(&bad)]);
@@ -330,12 +343,12 @@ fn unreadable_file_is_reported_scan_continues_run_incomplete() {
         eprintln!("skipped: root ignores mode 000");
         return;
     }
-    let mut e = env();
+    let e = env();
     let bad = e.root.join("locked");
     fs::write(&bad, b"x").unwrap();
     fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
     fs::write(e.root.join("ok"), b"y").unwrap();
-    let (s, reps) = scan(&mut e, &Opts::default());
+    let (s, reps) = scan(&e, &Opts::default());
     assert_eq!((s.error, s.new), (1, 1));
     assert_eq!(s.exit_code(), 5);
     assert_eq!(kinds(&reps, K::Error), vec![b(&bad)]);
@@ -351,17 +364,19 @@ fn big_file(p: &Path, fill: u8) {
 // stale entry is deleted, never left to be served.
 #[test]
 fn persistently_unstable_file_is_reported_and_entry_dropped() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     big_file(&f, b'a');
-    scan(&mut e, &Opts::default());
+    scan(&e, &Opts::default());
     assert!(entry(&e, &f).is_some());
     big_file(&f, b'b'); // stale entry now disagrees with the file
     let mut mutations = 0;
     let mut reps = Vec::new();
+    let lock = e.st.lock().unwrap();
     let s = run_hooked(
         &e.st,
-        &mut e.ix,
+        &lock,
+        &e.ix,
         &Opts::default(),
         &mut |path, _| {
             assert_eq!(path, b(&f).as_slice());
@@ -389,14 +404,16 @@ fn persistently_unstable_file_is_reported_and_entry_dropped() {
 // succeeds and records the final content.
 #[test]
 fn single_mid_hash_change_is_absorbed_by_one_retry() {
-    let mut e = env();
+    let e = env();
     let f = e.root.join("f");
     big_file(&f, b'a');
     let mut done = false;
     let mut reps = Vec::new();
+    let lock = e.st.lock().unwrap();
     let s = run_hooked(
         &e.st,
-        &mut e.ix,
+        &lock,
+        &e.ix,
         &Opts::default(),
         &mut |_, _| {
             if !done {
@@ -430,8 +447,10 @@ fn run_reconciles_index_to_registry() {
         fs::write(d.join("f"), b"x").unwrap();
     }
     let st = store_with_roots(&base, &[&a, &bdir]);
-    let mut ix = Index::open(&st).unwrap();
-    run(&st, &mut ix, &Opts::default(), &mut |_| {}).unwrap();
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
+    drop(lock);
     assert_eq!(ix.iter().unwrap().len(), 2);
 
     // Unregister `a` by hand-editing the registry, and plant an entry that
@@ -443,7 +462,8 @@ fn run_reconciles_index_to_registry() {
     stray.path = b"/nowhere/at/all".to_vec();
     ix.upsert(&stray).unwrap();
 
-    let s = run(&st, &mut ix, &Opts::default(), &mut |_| {}).unwrap();
+    let lock = st.lock().unwrap();
+    let s = run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
     assert_eq!(s.exit_code(), 0);
     let paths: Vec<_> = ix.iter().unwrap().into_iter().map(|x| x.path).collect();
     assert_eq!(paths, vec![b(&bdir.join("f"))]);
@@ -462,6 +482,7 @@ fn exit_code_precedence() {
         special: 9,
         subextant: 1,
         mount: 1,
+        accepted: 4,
         ..z
     };
     assert_eq!(
@@ -487,4 +508,214 @@ fn exit_code_precedence() {
         .exit_code(),
         2
     );
+}
+
+fn paths(e: &Env) -> Vec<Vec<u8>> {
+    e.ix.iter().unwrap().into_iter().map(|x| x.path).collect()
+}
+
+// C8(i): README L233, a deleted registered root is a deletion.
+#[test]
+fn deleted_registered_root_reports_each_entry_missing_and_exits_0() {
+    let e = env();
+    fs::create_dir_all(e.root.join("d")).unwrap();
+    fs::write(e.root.join("a"), b"1").unwrap();
+    fs::write(e.root.join("d/b"), b"2").unwrap();
+    scan(&e, &Opts::default());
+    assert_eq!(paths(&e).len(), 2);
+    fs::remove_dir_all(&e.root).unwrap();
+    let (s, reps) = scan(&e, &Opts::default());
+    assert_eq!((s.missing, s.refused, s.error), (2, 0, 0));
+    assert_eq!(s.exit_code(), 0);
+    let mut m = kinds(&reps, K::Missing);
+    m.sort();
+    assert_eq!(m, vec![b(&e.root.join("a")), b(&e.root.join("d/b"))]);
+    assert!(paths(&e).is_empty());
+}
+
+// C8(ii): a root refused for any reason other than ENOENT says nothing about
+// its files, so their entries survive.
+#[test]
+fn refused_root_keeps_its_entries_and_reports_no_missing() {
+    let (t, base) = canon_tmp();
+    let _keep = t;
+    fs::create_dir_all(base.join("real/root")).unwrap();
+    fs::write(base.join("real/root/f"), b"x").unwrap();
+    let via = base.join("link/root");
+    let st = store_with_roots(&base, &[&base.join("real/root")]);
+    let ix = Index::open(&st).unwrap();
+    {
+        let lock = st.lock().unwrap();
+        run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
+    }
+    let before = ix.iter().unwrap();
+    assert_eq!(before.len(), 1);
+    // Re-register the same tree through a symlinked parent; entries from the
+    // earlier scan sit under the refused path only if their paths match, so
+    // rewrite them to live under `via`.
+    symlink(base.join("real"), base.join("link")).unwrap();
+    for mut en in before {
+        ix.remove(&en.path).unwrap();
+        en.path = b(&via.join("f"));
+        ix.upsert(&en).unwrap();
+    }
+    {
+        let lock = st.lock().unwrap();
+        st.edit_registry(&lock, |v| *v = vec![rp(&via)]).unwrap();
+    }
+    let mut reps = Vec::new();
+    let lock = st.lock().unwrap();
+    let s = run(&st, &lock, &ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
+    assert_eq!((s.refused, s.missing), (1, 0));
+    assert_eq!(s.exit_code(), 5);
+    assert!(kinds(&reps, K::Missing).is_empty());
+    assert!(ix.get(&b(&via.join("f"))).unwrap().is_some(), "entry lost");
+}
+
+// C8(iii): an unreadable directory must not wipe its own index entries.
+#[test]
+fn unreadable_subdirectory_keeps_entries_and_reports_error_not_missing() {
+    if support::is_root() {
+        eprintln!("skipped: root ignores mode 000");
+        return;
+    }
+    let e = env();
+    fs::create_dir_all(e.root.join("d")).unwrap();
+    fs::write(e.root.join("d/f"), b"x").unwrap();
+    fs::write(e.root.join("ok"), b"y").unwrap();
+    scan(&e, &Opts::default());
+    assert_eq!(paths(&e).len(), 2);
+    let d = e.root.join("d");
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o000)).unwrap();
+    let (s, reps) = scan(&e, &Opts::default());
+    // Restore so the temp dir can be cleaned up even if an assert fails.
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!((s.error, s.missing), (1, 0));
+    assert_eq!(s.exit_code(), 5);
+    assert_eq!(kinds(&reps, K::Error), vec![b(&d)]);
+    assert!(kinds(&reps, K::Missing).is_empty());
+    assert_eq!(
+        paths(&e).len(),
+        2,
+        "entries under the unreadable dir must survive"
+    );
+}
+
+// C8 table, last row: an unreadable file's content is not known to have
+// changed, so its entry stays (contrast Unstable, which drops it).
+#[test]
+fn unreadable_file_keeps_its_existing_entry() {
+    if support::is_root() {
+        eprintln!("skipped: root ignores mode 000");
+        return;
+    }
+    let e = env();
+    let f = e.root.join("f");
+    fs::write(&f, b"x").unwrap();
+    scan(&e, &Opts::default());
+    let before = entry(&e, &f).unwrap();
+    settle(&e);
+    // chmod changes ctime, so the entry is not skippable and the file is opened.
+    sleep(Duration::from_millis(50));
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+    let (s, reps) = scan(&e, &Opts::default());
+    fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!((s.error, s.missing), (1, 0));
+    assert_eq!(kinds(&reps, K::Error), vec![b(&f)]);
+    assert_eq!(s.exit_code(), 5);
+    assert_eq!(entry(&e, &f).unwrap().digest, before.digest);
+}
+
+// C10: `only` narrows the walk and the Missing check, not reconcile.
+#[test]
+fn only_scans_just_that_registered_root() {
+    let (t, base) = canon_tmp();
+    let _keep = t;
+    let (a, bd) = (base.join("a"), base.join("b"));
+    for d in [&a, &bd] {
+        fs::create_dir_all(d).unwrap();
+        fs::write(d.join("old"), b"o").unwrap();
+    }
+    let st = store_with_roots(&base, &[&a, &bd]);
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
+    fs::write(a.join("new_a"), b"n").unwrap();
+    fs::write(bd.join("new_b"), b"n").unwrap();
+    fs::remove_file(bd.join("old")).unwrap();
+    let mut reps = Vec::new();
+    let s = run(
+        &st,
+        &lock,
+        &ix,
+        &Opts {
+            only: Some(rp(&a)),
+            ..Opts::default()
+        },
+        &mut |r| reps.push(r),
+    )
+    .unwrap();
+    assert_eq!(s.new, 1);
+    assert_eq!(kinds(&reps, K::New), vec![b(&a.join("new_a"))]);
+    assert!(kinds(&reps, K::Missing).is_empty(), "b is out of scope");
+    assert!(ix.get(&b(&a.join("new_a"))).unwrap().is_some());
+    assert!(ix.get(&b(&bd.join("new_b"))).unwrap().is_none());
+    assert!(
+        ix.get(&b(&bd.join("old"))).unwrap().is_some(),
+        "b untouched"
+    );
+}
+
+#[test]
+fn only_must_name_a_registered_root() {
+    let e = env();
+    fs::create_dir_all(e.root.join("sub")).unwrap();
+    for bad in [e.root.join("sub"), e.base.join("elsewhere")] {
+        let lock = e.st.lock().unwrap();
+        let r = run(
+            &e.st,
+            &lock,
+            &e.ix,
+            &Opts {
+                only: Some(rp(&bad)),
+                ..Opts::default()
+            },
+            &mut |_| {},
+        );
+        assert!(
+            matches!(r, Err(StoreError::NotRegistered(_))),
+            "{bad:?}: {r:?}"
+        );
+    }
+}
+
+// C8 reconcile still covers every root when `only` is set.
+#[test]
+fn only_still_reconciles_all_roots() {
+    let (t, base) = canon_tmp();
+    let _keep = t;
+    let (a, bd) = (base.join("a"), base.join("b"));
+    for d in [&a, &bd] {
+        fs::create_dir_all(d).unwrap();
+        fs::write(d.join("f"), b"x").unwrap();
+    }
+    let st = store_with_roots(&base, &[&a, &bd]);
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    run(&st, &lock, &ix, &Opts::default(), &mut |_| {}).unwrap();
+    st.edit_registry(&lock, |v| v.retain(|r| r != &rp(&bd)))
+        .unwrap();
+    run(
+        &st,
+        &lock,
+        &ix,
+        &Opts {
+            only: Some(rp(&a)),
+            ..Opts::default()
+        },
+        &mut |_| {},
+    )
+    .unwrap();
+    let left: Vec<_> = ix.iter().unwrap().into_iter().map(|x| x.path).collect();
+    assert_eq!(left, vec![b(&a.join("f"))]);
 }

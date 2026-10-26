@@ -1,8 +1,9 @@
 //! Reconcile, walk, hash, classify, and write the index.
 
+use crate::digest::Digest;
 use crate::index::Index;
 use crate::registry::RegPath;
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, WriteLock};
 
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
@@ -16,6 +17,8 @@ pub enum ReportKind {
     New,
     Edited,
     Violation,
+    /// A violation taken as the new baseline by `--accept`.
+    Accepted,
     Missing,
     Excluded,
     Unstable,
@@ -29,6 +32,8 @@ pub enum ReportKind {
 pub struct Report {
     pub kind: ReportKind,
     pub path: Vec<u8>,
+    /// (stored, actual); `Some` for Edited, Violation and Accepted.
+    pub digests: Option<(Digest, Digest)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +45,8 @@ pub struct Summary {
     /// Not hashed: metadata matched and the entry was not racy.
     pub skipped: u64,
     pub violation: u64,
+    /// Violations taken by `--accept`; never affects the exit code.
+    pub accepted: u64,
     pub missing: u64,
     pub excluded: u64,
     pub unstable: u64,
@@ -60,18 +67,20 @@ impl Summary {
 
 pub fn run(
     store: &Store,
-    idx: &mut Index,
+    lock: &WriteLock,
+    idx: &Index,
     opts: &Opts,
     out: &mut dyn FnMut(Report),
 ) -> Result<Summary, StoreError> {
-    run_hooked(store, idx, opts, &mut |_, _| {}, out)
+    run_hooked(store, lock, idx, opts, &mut |_, _| {}, out)
 }
 
 /// `after_chunk(path, bytes_so_far)` is forwarded to `hash_stable` so tests
 /// can mutate a file mid-hash.
 pub fn run_hooked(
     _store: &Store,
-    _idx: &mut Index,
+    _lock: &WriteLock,
+    _idx: &Index,
     _opts: &Opts,
     _after_chunk: &mut dyn FnMut(&[u8], u64),
     _out: &mut dyn FnMut(Report),
