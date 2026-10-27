@@ -5,7 +5,8 @@ answers "which paths hold this content?". This crate is a Linux-only
 implementation of the userspace part of the Extant design in the repository's
 root [README](../README.md). The places where it departs from that text, or
 decides something the text leaves open, are listed one by one in
-[DIVERGENCES.md](DIVERGENCES.md).
+[DIVERGENCES.md](DIVERGENCES.md), written against the spec as changed by
+PR #12 (branch `spec/consensus-fixes`, commit bb9a46f).
 
 Version 1 has no external services, no truncation, no `hash://` parsing, no
 human names or tags, no watcher, no config file, and no parent/sub-extant
@@ -64,12 +65,12 @@ characters (either case).
 
 | Code | Meaning |
 |---|---|
-| 0 | Success. Also: a reader closed the pipe, or the only changes were `MISSING`, `ACCEPTED`, `EXCLUDED`, `MOUNT` or `SUBEXTANT`. |
-| 1 | `resolve` found no path. |
-| 2 | `check` found an unaccepted `VIOLATION`. |
-| 3 | Never produced (reserved for AMBIGUOUS). |
-| 4 | Usage, configuration or store error, including a malformed registry, an untrusted store, and a failed write. Message on stderr. |
-| 5 | The scan was incomplete: at least one `ERROR`, `UNSTABLE` or `REFUSED`, and no violation. |
+| 0 | OK. Also: a reader closed the pipe, or the only changes were `MISSING`, `ACCEPTED`, `EXCLUDED`, `MOUNT` or `SUBEXTANT`. |
+| 1 | Not found: `resolve` found no path. |
+| 2 | Mismatch: `check` found an unaccepted `VIOLATION`. |
+| 3 | Ambiguous. Never emitted, because truncation is not supported. |
+| 4 | Usage or configuration error, including a malformed registry, an untrusted store, and a failed write. Message on stderr. |
+| 5 | Not in the spec: the scan was incomplete (at least one `ERROR`, `UNSTABLE` or `REFUSED`) and found no violation. Per-file errors do not abort a scan, so a script needs a code that says coverage was partial. |
 
 A store or database failure during a scan exits 4 even if earlier records were
 printed. When both a violation and an incomplete item occur, the exit code is 2.
