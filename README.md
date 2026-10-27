@@ -167,11 +167,11 @@ Truncation is supported but disabled by default. For example:
 Note that the strength of the integrity protection is lessened with truncation.
 
 **Collision**
-A collision is where two files resolve to a single digest. This may happen when
-using a non-cryptographic hash, truncation, or a broken cryptographic hash.
-Although `ext` is designed for cryptographic hashes, there are circumstances
-where non-cryptographic hashes are useful, such as speed and smaller lookup
-keys.
+A collision is where two distinct inputs resolve to a single digest. This may
+happen when using a non-cryptographic hash, truncation, or a broken
+cryptographic hash. Although `ext` is designed for cryptographic hashes, there
+are circumstances where non-cryptographic hashes are useful, such as speed and
+smaller lookup keys.
 
 On collision for truncation or non-cryptographic hashed, tooling provides top
 matches. For cryptographic hashes provided with full sized digests, tooling must
