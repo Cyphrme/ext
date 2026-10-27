@@ -142,6 +142,13 @@ Using a symbolic link, this file then can be used as a database:
 For example:
 ln -s /dev/ext /var/www/website_name/content
 
+**List of existing sources or sinks**
+- /dev/null
+- /dev/full
+- /dev/zero
+- /dev/random
+- /dev/urandom
+
 **Unix Tools**
 `/dev/ext` is a character special file.
  - `cat` lists all digests in the source index.
@@ -354,6 +361,14 @@ other Unix systems.
 
 Windows:There are no naming conflicts with Windows except
 `:`.  We suggest `_` be used instead.
+
+**/dev/random**
+`/dev/random` waits for the CSPRNG to fully initialize on boot. It never
+blocks after bootup after Linux 5.6.
+
+Before 5.6:
+- /dev/random  <- May block under low entropy
+- /dev/urandom <- non-blocking, including boot up
 
 ## FAQ
 - base85: We considered base85 support but it appears to be too problematic with
