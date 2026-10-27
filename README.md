@@ -204,6 +204,12 @@ The cache has two indexes which provide O(log(n)) lookups, the Cache Index
 comprised of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.
 Once the cache reaches capacity, the oldest items are removed.
 
+A fetched blob is hashed in full with the requested alg and compared with the
+requested digest before it is cached or returned. On mismatch it is discarded,
+nothing is cached, and the error names the service. Fetch size and timeout
+limits are configurable. By default, redirects to a different scheme are not
+followed. The cache records the origin service of each entry.
+
 ## Directories
 `ext` checks for stores, indexes, and registrations. Default system wide userland
 directory: `/var/lib/ext`. This may be set to a different directory using the
