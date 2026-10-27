@@ -93,14 +93,14 @@ https://cyphr.me/e/SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
 implementing systems (such as a browser):
 
 ```
-hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
+hash://SHA-256/oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
 ```
 
 **Hash Scheme Grammar**
 ```
-hash-uri = "hash://" alg ":" digest [tail]
+hash-uri = "hash://" alg "/" digest [tail]
 scheme   = "hash://"
-alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No ":".
+alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No "/".
 digest   = 1*b64ut; 
 b64ut    = ALPHA / DIGIT / "-" / "_" ; 
 hex      = DIGIT / %x41-46 / %x61-66; 0-9, A-F, a-f
@@ -112,11 +112,14 @@ The b64ut alphabet includes every hex character, so a hex digest is also a
 b64ut string. At full length the encoding is decided by length, not by which
 characters appear: for SHA-256, 43 characters is b64ut and 64 is hex.
 
-Scheme match is case-insensitive while `alg` and `digest` are case-sensitive.
+Scheme match and `alg` match are case-insensitive, while `digest` is
+case-sensitive. The `alg` acts as the URI authority, and generic URI parsers
+lowercase the authority, so in a `hash://` URI `alg` is matched
+case-insensitively against Coz alg names.
 Tail is optional and resolution is out of scope.
 
 **Hash Scheme Parsing**
-1. After `hash://`, split on first `:`.
+1. After `hash://`, split on first `/`.
 2. `digest` is the longest b64ut prefix of the remainder. First non-b64ut char
    starts `tail`.
 3. Prefer the decoding whose length equals `alg`'s digest size. Even-length
@@ -326,6 +329,8 @@ COLLISION - Two distinct payloads resolve to the same digest.
 **Extant Non-goals**
 - Not a transport.
 - Not a multi-hash registry. Not ni:. Not a filename standard.
+  In `hash:` the digest's algorithm is the authority, so ni's empty authority
+  (`///`) is not needed.
 
 **Recursion** - Recursion is not supported. If an ext path contains another ext,
 it is ignored. Subdirectories must be explicitly registered.
