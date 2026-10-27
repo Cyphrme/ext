@@ -101,12 +101,16 @@ hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
 hash-uri = "hash://" alg ":" digest [tail]
 scheme   = "hash://"
 alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No ":".
-digest   = 1*b64ut / 1*hex; 
+digest   = 1*b64ut; 
 b64ut    = ALPHA / DIGIT / "-" / "_" ; 
-hex      = ALPHA / alpha / DIGIT;
+hex      = DIGIT / %x41-46 / %x61-66; 0-9, A-F, a-f
 tail     = <Starting at first non-b64ut> 
            (which is of course inclusive of the Hex character set)
 ```
+
+The b64ut alphabet includes every hex character, so a hex digest is also a
+b64ut string. At full length the encoding is decided by length, not by which
+characters appear: for SHA-256, 43 characters is b64ut and 64 is hex.
 
 Scheme match is case-insensitive while `alg` and `digest` are case-sensitive.
 Tail is optional and resolution is out of scope.
