@@ -230,7 +230,7 @@ The waterfall for directories, highest precedence first:
 5. Fail if nothing exists.
 
 ## Config Flags
-The config file is saved as <extant_path>/config.
+The config file is saved as <extant_path>/config. Its format is JSON5.
 
 |Flag - Default Value - Description|
 - Aware      - True  - the system only supports digests specified by ext.
@@ -266,6 +266,16 @@ unchanged paths.
 `ext --d <path>` - Specifies the working directory for `ext`.
 
 `ext watch` - Starts the watcher that triggers on file change.
+
+`-r` and `-u` are aliases of `register` and `unregister`.
+
+**Exit codes**
+|Code - Meaning|
+- 0 - OK
+- 1 - Not found
+- 2 - Mismatch (`check`)
+- 3 - Ambiguous
+- 4 - Usage or configuration error
 
 ## Incrementality
 Incrementality uses a persistent timestamp index and an optional continuous
