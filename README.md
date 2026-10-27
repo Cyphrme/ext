@@ -16,7 +16,8 @@ blob services.
 ## Registration
 **Registry**
 A registry is simply a list of paths and URIs, newline delimited. For example,
-to register a whole system, the registry contains simply the root path, `/`.
+to register a whole system, the registry contains simply the root path, `/`. A subtree such as `/srv/www`
+may equally be registered.
 The system-wide registry is kept by default in `/var/lib/ext/registry`. Files
 may be registered by `ext -r <path>` or by editing the registry file.
 
@@ -36,6 +37,9 @@ For example:
 ## Extant Registry and Index paths
 Indexes are kept in `<extant_path>/<index_name>`. The registry and source index
 are required, others are optional.
+
+The store directory is never indexed by `ext`; it does not index itself. A
+per-file read error is reported and does not abort the scan.
 
 **File Formats**
 Registry:   <registered_file_path>
