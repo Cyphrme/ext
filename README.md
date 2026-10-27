@@ -283,9 +283,7 @@ filesystem's granularity. A racy entry is re-hashed on the next run regardless
 of matching metadata. This is the same problem and remedy as git's "racy git"
 handling.
 
-Skipping by metadata is a performance heuristic, not an integrity guarantee:
-an adversary able to write a file and control its metadata can evade it.
-Integrity audits use `ext check --full`.
+The rationale is in [docs/incrementality.md](docs/incrementality.md).
 
 **Directories** - Large directories may also be recorded in the timestamp
 index as a further optimization. A directory's mtime changes only when an
