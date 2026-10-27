@@ -209,9 +209,6 @@ The waterfall for directories, highest precedence first:
 4. Current directory
 5. Fail if nothing exists.
 
-An explicitly given directory (flag or environment variable) that does not
-exist is an error; `ext` does not fall through to a lower candidate.
-
 ## Config Flags
 The config file is saved as <extant_path>/config.
 
