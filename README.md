@@ -178,7 +178,8 @@ A collision is where two files resolve to a single digest. This may happen when
 using a non-cryptographic hash, truncation, or a broken cryptographic hash.
 Although `ext` is designed for cryptographic hashes, there are circumstances
 where non-cryptographic hashes are useful, such as speed and smaller lookup
-keys.
+keys. Non-cryptographic algorithms are "locate only": they are never used
+for verification, cache admission, or fetching.
 
 On collision for truncation or non-cryptographic hashed, tooling provides top
 matches. For cryptographic hashes provided with full sized digests, tooling must
