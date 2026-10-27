@@ -118,10 +118,9 @@ The b64ut alphabet includes every hex character, so a hex digest is also a
 b64ut string. At full length the encoding is decided by length, not by which
 characters appear: for SHA-256, 43 characters is b64ut and 64 is hex.
 
-Scheme match and `alg` match are case-insensitive, while `digest` is
-case-sensitive. The `alg` acts as the URI authority, and generic URI parsers
-lowercase the authority, so in a `hash://` URI `alg` is matched
-case-insensitively against Coz alg names.
+Scheme match is case-insensitive and `digest` is case-sensitive. The `alg`
+acts as the URI authority, and generic URI parsers lowercase the authority, so
+in a `hash://` URI `alg` is matched case-insensitively against Coz alg names.
 Tail is optional and resolution is out of scope.
 
 **Hash Scheme Parsing**
