@@ -9,7 +9,7 @@ blob services.
 # Extant Goals
  - Provide hash based addressing on a system wide and subdirectory basis.
   - Provide cryptographic integrity to files.
- - Incremental behavior. (New changes are added as the occur. No global
+ - Incremental behavior. (New changes are added as they occur. No global
    re-hashing)
  - Support external blob services.
 
@@ -194,8 +194,8 @@ The order of operations for the lookups is:
 3. Query external services
 
 The cache has two indexes which provide O(log(n)) lookups, the Cache Index
-comprised of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.
-Once the cache reaches capacity, the oldest items are removed.
+comprises <dig>:<path> pairs and the Cache Time Index comprises <dig>:<time>
+pairs. Once the cache reaches capacity, the oldest touched items are removed.
 
 ## Directories
 `ext` checks for stores, indexes, and registrations. Default system wide userland
@@ -224,7 +224,7 @@ The config file is saved as <extant_path>/config.
 - Hash     - SHA-256 - Default hash.
 
 ## Commands
-`ext init <path>` - Create a `ext` directory with a new registry. If no path is
+`ext init <path>` - Create an `ext` directory with a new registry. If no path is
 specified CWD is used.
 
 `ext register`,`ext -r`  - Registration. Supports both files and directories.
@@ -239,7 +239,7 @@ indexing. (Deleting a directory also unregisters.)
 `ext check`, `ext -check` - Re-hash all files and compare digests. Skip
 unchanged paths.
 
-`ext check --full` - Re-hash all files and does not skip unchanged paths.
+`ext check --full` - Re-hash all files and do not skip unchanged paths.
 
 `ext -rerun` - Rebuild all indexes and re-hash all files.
 
@@ -295,7 +295,7 @@ it is ignored. Subdirectories must be explicitly registered.
 
 **Digest Labeling** - Unlabeled digests are a security concern: the weakest hash
 becomes the security floor of the system overall. A system with unlabeled
-digests is only as strong as the weakest supported hash algorithm.
+digests are only as strong as the weakest supported hash algorithm.
 
 If the hashes are trusted, or for systems that only support one hash type or
 otherwise inferred, the label may be dropped, but the responsibility should be
