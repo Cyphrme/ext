@@ -50,6 +50,10 @@ Cache:      <digest>:<alg>\t<path>
 Cache Time: <digest>:<alg>\t<time>
 Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>
 
+Records are newline delimited and fields are tab delimited. A path containing
+a newline, tab, or backslash is written with that character escaped as `\n`,
+`\t`, or `\\`.
+
 External service URIs are not stored in the system indexes.
 
 The same digest may appear more than once when multiple paths contain
