@@ -350,7 +350,12 @@ External services are never watched; they are consulted only on cache miss.
 ## Coz
 Extant uses the algorithm hash naming convention and b64ut (RFC 4648 base64 url,
 padding truncated, canonical), and expected default digest sizes as specified by
-Coz. Hex may be used in place of b64ut.
+Coz. Hex may be used in place of b64ut. Algorithm names, digest sizes, and
+encoded lengths are listed by Coz.
+
+An `ext` client may support a subset of the Coz algorithms. A digest labeled
+with an algorithm the client does not support is rejected, not treated as
+unlabeled.
 
 ## Errors
 AMBIGUOUS - Multiple digests complete given string
