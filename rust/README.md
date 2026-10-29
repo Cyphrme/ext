@@ -10,9 +10,10 @@ PR #12 (branch `spec/consensus-fixes`, commit 4cdcefd, with `docs/traversal.md`)
 Each entry there is marked as following the spec, deferred, or differing from
 it as an implementation choice or an interface difference.
 
-Version 1 has no external services, no truncation, no tags, no watcher, and no
-parent/sub-extant linking. Of the config file's keys it honours only a few (see
-Config). It needs Linux 5.6 or later (`openat2`); mount boundaries use
+Version 1 has no external services, no truncation, no tags and no watcher. A
+parent never reads a sub-extant's index; registering the sub-extant makes the
+parent hash its files itself. Of the config file's keys it honours only a few
+(see Config). It needs Linux 5.6 or later (`openat2`); mount boundaries use
 `STATX_MNT_ID` (5.8) and fall back to `st_dev` with a warning.
 
 ## Build and test
@@ -42,7 +43,7 @@ ext [--d <path>] [--hex] [-0] <command>
 |---|---|
 | `init [<dir>]` | Create `<dir>/.ext/` (default: the current directory) and register `<dir>` in it. Fails if `.ext` exists. |
 | `init --bare <path>` | Create a flat store at `<path>` with an empty registry. This is how `/var/lib/ext` is made. |
-| `register <path>`, `-r <path>` | Add the directory (canonicalised) to the registry and scan it. Registering an already registered root re-records its filesystem identity and keeps its entries. |
+| `register <path>`, `-r <path>` | Add the directory or regular file (canonicalised) to the registry and scan it. Registering an already registered root re-records its filesystem identity and keeps its entries. |
 | `unregister <path>`, `-u <path>` | Remove an exact registry entry and every index entry under it. |
 | `resolve <arg>` | Print the paths whose last-scanned content has this digest, sorted by bytes. With a name, only paths whose filename equals it. |
 | `list` | Print every `<digest>:SHA-256<TAB><path>`, sorted by the printed digest text then path bytes. |
@@ -228,8 +229,8 @@ system, unless its filesystem (`statfs` type) is virtual: proc, sysfs, devtmpfs,
 devpts, tmpfs, ramfs, cgroup, cgroup2, debugfs, tracefs, securityfs, pstore, bpf,
 configfs, fusectl, mqueue, hugetlbfs, binfmt_misc, efivarfs or autofs. Such a
 mount is reported `MOUNT`; a registered root on one is still walked. A directory
-holding a real `.ext/` store (registry, index.db and lock present as regular
-files, owned by the root's owner or root, not group/other-writable) is a
+holding a `.ext/` store (a `registry` regular file inside, both owned by the
+root's owner or root, not group/other-writable) is a
 sub-extant and is not entered unless it is itself a registered root, in which
 case the files are hashed like any other root's; the `.ext` itself is never
 indexed, and any other `.ext` is ordinary content. The store being used is never
@@ -256,8 +257,8 @@ root, it is a missing mount: `REFUSED`, entries and registration kept, exit 5.
   files appear under every path it is mounted at.
 - Registered roots may be nested. A root's walk stops at another registered root,
   and each file is indexed once, by the inner root.
-- `register` takes directories only. A registry entry with a symlink in any
-  component is `REFUSED` at scan time.
+- A file root is one entry. A registry entry that is a symlink, has a symlink in
+  any component, or is a FIFO or device is `REFUSED` at scan time.
 - Hand-editing the registry while `ext register` runs can lose one of the two
   changes.
 - `resolve` answers from the last scan; it does not re-read the files. A

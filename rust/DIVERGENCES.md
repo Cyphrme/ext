@@ -241,33 +241,26 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## Sub-extants and traversal
 
-### Sub-extant marker (differs: implementation choice, #8, #13)
+### Sub-extant marker (follows, #8, #13)
 
 - Spec: README, Subdirectory Registration: a sub-extant keeps its store in
   `<dir>/.ext/`; it is a sub-extant "only if its `.ext/` is a directory
   containing a registry, both owned by the owner of the parent's registered root
   or by root"; any other `.ext` is ordinary content. Technical Considerations
   (Recursion): a parent's scan skips sub-extants.
-- Does: the same, with a stricter marker. A directory whose `.ext` is a real
-  store is not entered by a parent walk, unless it is itself a registered root
-  (see "Sub-extant linking"), and is reported `SUBEXTANT`; entries previously
-  indexed beneath it are reported `EXCLUDED` and removed. A `.ext` counts only
-  if `registry`, `index.db` and `lock` are all regular files, and the `.ext`
-  directory and those three files are owned by the registered root's owner or
-  root and not group/other-writable. The spec requires only the registry and
-  the ownership; a `.ext` missing `index.db` or `lock`, or with a
-  group-writable file, is indexed as ordinary content here and would be skipped
-  by the spec's rule. A sub-extant works standalone
-  (`ext init <dir>`, then `ext --d <dir> ...`). The store in use is never
-  indexed, and its own root is not a sub-extant of itself.
-- Why: a bare `registry` file is too generic a marker, and a store in the
-  content would index itself. Requiring all three files that `init` creates
-  stops a planted `.ext` from hiding a subtree. The spec's own marker is
-  weaker; adopting the stricter one is for its author.
-- Kind: a store created by another implementation with only a `registry` would
-  be indexed as content here, so this is arguably observable across
-  implementations; classed as a choice because stores made by `ext init` are
-  recognised by both rules.
+- Does: the same. A directory whose `.ext` is a directory holding a `registry`
+  regular file, both owned by the registered root's owner or root, is not
+  entered by a parent walk, unless it is itself a registered root (see
+  "Sub-extant linking"), and is reported `SUBEXTANT`; entries previously indexed
+  beneath it are reported `EXCLUDED` and removed. `index.db` and `lock` are not
+  required, since another implementation's store need not have them. Added
+  hardening: the `.ext` directory and its `registry` must not be
+  group/other-writable, so a `.ext` with a group-writable registry is indexed as
+  ordinary content here although the spec's rule would skip it. A sub-extant
+  works standalone (`ext init <dir>`, then `ext --d <dir> ...`). The store in
+  use is never indexed, and its own root is not a sub-extant of itself.
+- Why: a store in the content would index itself, and a planted `.ext` must not
+  hide a subtree; the ownership check is what stops that.
 
 ### Sub-extant linking (follows, #13)
 
@@ -334,15 +327,18 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## Commands
 
-### `register` and `unregister` arguments (differs: interface difference)
+### `register` and `unregister` arguments (follows)
 
 - Spec: README, Commands: `register` "Supports both files and directories";
   URIs are covered under External services.
-- Does: `register` accepts directories only (a file is exit 4, checked by a run), canonicalises the path, adds it and
-  scans that root. `unregister` needs a path that exactly matches a registry
+- Does: `register` accepts a directory or a regular file (anything else, a
+  FIFO or device, is exit 4), canonicalises the path, adds it and scans that
+  root. A file root is a single entry: hashed, checked, and judged deleted or a
+  missing mount like a directory root, with its parent as the nearest ancestor.
+  A registry entry that is a symlink or a special file is `REFUSED` at scan time
+  and never opened. `unregister` needs a path that exactly matches a registry
   entry (exit 4 otherwise) and removes the entry and all index entries under it.
-- Why: the walk is rooted at directories; exact matching avoids removing a
-  parent by accident.
+- Why: exact matching avoids removing a parent by accident.
 
 ### `check` and `rebuild` (follows, #10)
 
