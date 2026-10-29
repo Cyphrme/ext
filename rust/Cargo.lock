@@ -306,6 +306,8 @@ dependencies = [
  "assert_cmd",
  "clap",
  "data-encoding",
+ "libc",
+ "linux-raw-sys",
  "proptest",
  "rusqlite",
  "rustix",

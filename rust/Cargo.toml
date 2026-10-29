@@ -21,3 +21,6 @@ rustix = { version = "1.1.5", features = ["fs", "process"] }
 proptest = "1"
 tempfile = "3"
 assert_cmd = "2"
+# Cross-check the virtual-filesystem magic numbers against independent tables.
+libc = "0.2"
+linux-raw-sys = "0.12"

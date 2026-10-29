@@ -180,3 +180,141 @@ echo "CODE=$?"
     assert!(o.stdout.contains("NEW\t/work/root/sub/f"), "{}", o.stdout);
     assert!(lines(&o.stdout, "SUBEXTANT").is_empty(), "{}", o.stdout);
 }
+
+// ---- docs/traversal.md, Mounts: real mounts are entered, virtual are not.
+
+/// A directory on the build tree's filesystem, holding `files`, to bind into
+/// the jail as a real (non-virtual) mount. `None` when that filesystem is
+/// itself tmpfs, where no real source exists.
+fn real_source(files: &[&str]) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+    let t = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = fs::canonicalize(t.path()).unwrap();
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    if rustix::fs::statfs(&dir).unwrap().f_type as i64 == TMPFS_MAGIC {
+        eprintln!("skipped: the build tree is on tmpfs, so no real mount source exists");
+        return None;
+    }
+    for f in files {
+        fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+        fs::write(dir.join(f), f.as_bytes()).unwrap();
+    }
+    Some((t, dir))
+}
+
+fn with_sources(script: &str, srcs: &[&std::path::Path]) -> String {
+    let mut s = script.to_owned();
+    for (i, p) in srcs.iter().enumerate() {
+        s = s.replace(&format!("@SRC{i}@"), p.to_str().unwrap());
+    }
+    s
+}
+
+#[test]
+fn real_mount_inside_a_root_is_entered() {
+    let Some((_t, src)) = real_source(&["inside"]) else {
+        return;
+    };
+    let script = with_sources(
+        r#"
+mkdir -p "$J/work/root/mnt"
+echo x > "$J/work/root/f"
+mount --bind "@SRC0@" "$J/work/root/mnt" || exit 77
+x init --bare /work/store || exit 1
+x --d /work/store register /work/root
+echo "CODE=$?"
+"#,
+        &[&src],
+    );
+    let Some(o) = jail(&["-Urm"], &script) else {
+        return;
+    };
+    assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("NEW\t/work/root/f\n"), "{}", o.stdout);
+    assert!(o.stdout.contains("NEW\t/work/root/mnt/inside\n"), "{}", o.stdout);
+    assert!(lines(&o.stdout, "MOUNT").is_empty(), "{}", o.stdout);
+}
+
+// The boundary is judged against the directory's parent mount, not the
+// root's: a mount inside a mount is one more crossing, and its files are
+// reached, while a directory inside an entered mount is not a crossing.
+#[test]
+fn real_mounts_nest() {
+    let Some((_a, a)) = real_source(&["a-file", "sub/.keep"]) else {
+        return;
+    };
+    let Some((_b, b)) = real_source(&["b-file"]) else {
+        return;
+    };
+    let script = with_sources(
+        r#"
+mkdir -p "$J/work/root/a"
+mount --bind "@SRC0@" "$J/work/root/a" || exit 77
+mount --bind "@SRC1@" "$J/work/root/a/sub" || exit 77
+x init --bare /work/store || exit 1
+x --d /work/store register /work/root
+echo "CODE=$?"
+"#,
+        &[&a, &b],
+    );
+    let Some(o) = jail(&["-Urm"], &script) else {
+        return;
+    };
+    assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
+    for f in ["a/a-file", "a/sub/b-file"] {
+        assert!(o.stdout.contains(&format!("NEW\t/work/root/{f}\n")), "{f}: {}", o.stdout);
+    }
+    assert!(lines(&o.stdout, "MOUNT").is_empty(), "{}", o.stdout);
+}
+
+#[test]
+fn virtual_mount_inside_a_real_mount_is_reported_and_skipped() {
+    let Some((_t, src)) = real_source(&["real", "tmp/.keep"]) else {
+        return;
+    };
+    let script = with_sources(
+        r#"
+mkdir -p "$J/work/root/a"
+mount --bind "@SRC0@" "$J/work/root/a" || exit 77
+mount -t tmpfs tmpfs "$J/work/root/a/tmp" || exit 77
+echo hidden > "$J/work/root/a/tmp/hidden"
+x init --bare /work/store || exit 1
+x --d /work/store register /work/root
+echo "CODE=$?"
+"#,
+        &[&src],
+    );
+    let Some(o) = jail(&["-Urm"], &script) else {
+        return;
+    };
+    assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
+    assert!(o.stdout.contains("NEW\t/work/root/a/real\n"), "{}", o.stdout);
+    assert!(o.stdout.contains("MOUNT\t/work/root/a/tmp\n"), "{}", o.stdout);
+    assert!(!o.stdout.contains("hidden"), "entered tmpfs: {}", o.stdout);
+}
+
+// A root that is itself on a virtual filesystem is walked; only a virtual
+// filesystem mounted below it is skipped.
+#[test]
+fn a_root_on_a_virtual_filesystem_is_walked() {
+    let script = r#"
+mkdir -p "$J/work/root"
+mount -t tmpfs tmpfs "$J/work/root" || exit 77
+echo r > "$J/work/root/f"
+mkdir "$J/work/root/sub" "$J/work/root/mnt"
+echo s > "$J/work/root/sub/g"
+mount -t tmpfs tmpfs "$J/work/root/mnt" || exit 77
+echo hidden > "$J/work/root/mnt/hidden"
+x init --bare /work/store || exit 1
+x --d /work/store register /work/root
+echo "CODE=$?"
+"#;
+    let Some(o) = jail(&["-Urm"], script) else {
+        return;
+    };
+    assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
+    for f in ["f", "sub/g"] {
+        assert!(o.stdout.contains(&format!("NEW\t/work/root/{f}\n")), "{f}: {}", o.stdout);
+    }
+    assert!(o.stdout.contains("MOUNT\t/work/root/mnt\n"), "{}", o.stdout);
+    assert!(!o.stdout.contains("hidden"), "{}", o.stdout);
+}
