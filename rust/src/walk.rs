@@ -132,10 +132,6 @@ pub fn root_id(root: &RegPath) -> io::Result<RootId> {
     Ok(RootId(fstatvfs(&fd)?.f_fsid))
 }
 
-/// The filesystem of the nearest existing ancestor of `root`, which is itself
-/// gone: what a deleted root is compared against (a root on an unmounted disk
-/// leaves an ancestor on a different filesystem). A symlink or any other
-/// obstacle on the way is an error, never a guess.
 /// True if opening `root` still fails with ENOENT. Checked after the
 /// ancestor's filesystem is read, so a mount that landed in between is not
 /// mistaken for a deletion.
@@ -152,6 +148,10 @@ pub fn root_still_absent(root: &RegPath) -> bool {
     )
 }
 
+/// The filesystem of the nearest existing ancestor of `root`, which is itself
+/// gone: what a deleted root is compared against (a root on an unmounted disk
+/// leaves an ancestor on a different filesystem). A symlink or any other
+/// obstacle on the way is an error, never a guess.
 pub fn nearest_ancestor_id(root: &RegPath) -> io::Result<RootId> {
     let mut path = root.as_bytes();
     loop {

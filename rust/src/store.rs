@@ -105,10 +105,10 @@ fn explicit(p: &Path) -> Result<PathBuf, StoreError> {
     Err(StoreError::NotAStore(p.to_path_buf()))
 }
 
-/// Elevated: the kernel marked the exec secure (AT_SECURE), or running as root, or with an effective identity other than the
-/// real one (setuid, setgid), where a caller who controls the environment or
-/// the working directory could steer a privileged process to a store of its
-/// choosing.
+/// Elevated: the kernel marked the exec secure (AT_SECURE), or running as
+/// root, or with an effective identity other than the real one (setuid,
+/// setgid), where a caller who controls the environment or the working
+/// directory could steer a privileged process to a store of its choosing.
 pub fn privileged(ruid: u32, euid: u32, rgid: u32, egid: u32, secure: bool) -> bool {
     secure || euid == 0 || euid != ruid || egid != rgid
 }
