@@ -7,7 +7,7 @@ use std::io;
 
 #[test]
 fn deleted_only_when_both_probes_saw_it_absent_and_the_ancestor_is_the_recorded_filesystem() {
-    let (a, b) = (RootId(1), RootId(2));
+    let a = RootId(1);
     let recorded = [None, Some(a)];
     let ancestors: [fn() -> io::Result<RootId>; 3] = [
         || Ok(RootId(1)),
@@ -43,5 +43,4 @@ fn deleted_only_when_both_probes_saw_it_absent_and_the_ancestor_is_the_recorded_
     }
     // 2 * 2 * 3 * 2 combinations, exactly one of which is a deletion.
     assert_eq!((cases, deleted), (24, 1));
-    let _ = b;
 }

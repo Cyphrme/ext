@@ -252,25 +252,38 @@ fn confirmed_absent(rootfd: &OwnedFd, root: &RegPath, path: &[u8]) -> bool {
     }
 }
 
+/// What opening a root showed: it was absent (ENOENT), or anything else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Absent,
+    Present,
+}
+
 /// Why a registered root no longer opens.
 #[derive(Debug, PartialEq, Eq)]
-enum Gone {
+pub enum Gone {
     Deleted,
     /// Not a deletion, or not provably one; the string says why.
     MissingMount(String),
 }
 
-/// A root is deleted only if the filesystem it was recorded on is still
-/// there: its nearest existing ancestor is on it. Anything else, including
-/// not knowing, is treated as an unmounted disk, because forgetting a
-/// baseline cannot be undone.
-fn judge_gone(recorded: Option<RootId>, ancestor: io::Result<RootId>) -> Gone {
+/// The whole verdict, a pure function of what was observed: the walk's open
+/// of the root (`first`), the identity recorded for it, the identity of its
+/// nearest existing ancestor, and a second open (`again`) made after the
+/// ancestor was read. A root is deleted only if both opens saw it absent and
+/// the ancestor is on the recorded filesystem. Anything else, including not
+/// knowing, is treated as an unmounted disk, because forgetting a baseline
+/// cannot be undone.
+pub fn judge_gone(
+    first: Probe,
+    recorded: Option<RootId>,
+    ancestor: io::Result<RootId>,
+    again: Probe,
+) -> Gone {
+    if first != Probe::Absent {
+        return Gone::MissingMount("root was not seen to be missing".into());
+    }
     match (recorded, ancestor) {
-        (Some(was), Ok(now)) if was == now => Gone::Deleted,
-        (Some(was), Ok(now)) => Gone::MissingMount(format!(
-            "root is missing and its nearest existing ancestor is on another filesystem \
-             (recorded {was}, ancestor {now}); not mounted"
-        )),
         (None, _) => Gone::MissingMount(
             "root is missing and no filesystem identity was recorded for it, so a deletion \
              cannot be told from an unmounted disk"
@@ -279,6 +292,14 @@ fn judge_gone(recorded: Option<RootId>, ancestor: io::Result<RootId>) -> Gone {
         (Some(_), Err(e)) => Gone::MissingMount(format!(
             "root is missing and its nearest existing ancestor cannot be examined: {e}"
         )),
+        (Some(was), Ok(now)) if was != now => Gone::MissingMount(format!(
+            "root is missing and its nearest existing ancestor is on another filesystem \
+             (recorded {was}, ancestor {now}); not mounted"
+        )),
+        (Some(_), Ok(_)) if again != Probe::Absent => Gone::MissingMount(
+            "root was missing but reappeared while being examined; run again".into(),
+        ),
+        (Some(_), Ok(_)) => Gone::Deleted,
     }
 }
 
@@ -323,14 +344,14 @@ impl RootScan<'_> {
         }
         self.flush()?;
         if self.root_gone {
+            let recorded = self.idx.root_id(root)?;
             let ancestor = nearest_ancestor_id(root);
-            let mut verdict = judge_gone(self.idx.root_id(root)?, ancestor);
-            if verdict == Gone::Deleted && !root_still_absent(root) {
-                verdict = Gone::MissingMount(
-                    "root was missing but reappeared while being examined; run again".into(),
-                );
-            }
-            match verdict {
+            let again = if root_still_absent(root) {
+                Probe::Absent
+            } else {
+                Probe::Present
+            };
+            match judge_gone(Probe::Absent, recorded, ancestor, again) {
                 Gone::Deleted if !self.opts.unregister_deleted => {
                     self.summary.deleted += 1;
                     let note = "not unregistered: UnregisterDeleted is off".to_owned();
