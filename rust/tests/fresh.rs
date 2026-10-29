@@ -2,7 +2,7 @@
 //! clock. No filesystem, so ctime cannot leak in (A2, T2).
 
 use ext::digest::{Alg, Digest};
-use ext::fresh::{classify, is_racy, should_skip, Status, RACY_WINDOW_NS as W};
+use ext::fresh::{classify, is_racy, should_skip, MetaCmp, Status, RACY_WINDOW_NS as W};
 use ext::index::{Entry, Meta};
 use proptest::prelude::*;
 
@@ -65,10 +65,10 @@ proptest! {
             3 => cur.dev += delta as u64,
             _ => cur.ino += delta as u64,
         }
-        prop_assert!(!should_skip(Some(&e), &cur, false));
+        prop_assert!(!should_skip(Some(&e), &cur, false, MetaCmp::Full));
         // Control: the unmodified metadata of the same entry does skip, so
         // the assertion above cannot hold merely because skip is always false.
-        prop_assert!(should_skip(Some(&e), &base, false));
+        prop_assert!(should_skip(Some(&e), &base, false, MetaCmp::Full));
     }
 }
 
@@ -89,7 +89,11 @@ fn should_skip_table() {
     ];
     for (name, stored, current, full, want) in rows {
         let e = stored.map(|m| entry(m, T, b"x"));
-        assert_eq!(should_skip(e.as_ref(), &current, full), want, "{name}");
+        assert_eq!(
+            should_skip(e.as_ref(), &current, full, MetaCmp::Full),
+            want,
+            "{name}"
+        );
     }
 }
 
@@ -126,6 +130,49 @@ fn classify_table() {
     for (name, stored, is_moved, content, want) in rows {
         let cur = if is_moved { moved } else { old };
         let dg = Digest::compute(Alg::Sha256, content);
-        assert_eq!(classify(stored, &cur, &dg), want, "{name}");
+        assert_eq!(classify(stored, &cur, &dg, MetaCmp::Full), want, "{name}");
     }
+}
+
+// CompareCtimeInode = false: ctime, inode and device no longer count as a
+// change, size and mtime still do. The racy rule is unchanged: it reads the
+// stored ctime either way.
+#[test]
+fn size_mtime_comparison_ignores_ctime_inode_and_device() {
+    let settled = meta(7, T - 100 * W, T - 100 * W, 1, 2);
+    let e = entry(settled, T, b"x");
+    let rows = [
+        ("ctime", meta(7, T - 100 * W, T - 50 * W, 1, 2), true),
+        ("inode", meta(7, T - 100 * W, T - 100 * W, 1, 9), true),
+        ("device", meta(7, T - 100 * W, T - 100 * W, 9, 2), true),
+        ("size", meta(8, T - 100 * W, T - 100 * W, 1, 2), false),
+        ("mtime", meta(7, T - 99 * W, T - 100 * W, 1, 2), false),
+    ];
+    for (name, cur, lenient_skips) in rows {
+        assert_eq!(
+            should_skip(Some(&e), &cur, false, MetaCmp::SizeMtime),
+            lenient_skips,
+            "{name}"
+        );
+        assert!(!should_skip(Some(&e), &cur, false, MetaCmp::Full), "{name}");
+    }
+    let racy = entry(meta(7, T - W / 2, T - 100 * W, 1, 2), T, b"x");
+    assert!(!should_skip(
+        Some(&racy),
+        &racy.meta,
+        false,
+        MetaCmp::SizeMtime
+    ));
+    // A content change under metadata only ctime/inode disagree on is a
+    // violation under the lenient rule, an edit under the strict one.
+    let moved = meta(7, T - 100 * W, T - 50 * W, 1, 2);
+    let dg = Digest::compute(Alg::Sha256, b"y");
+    assert_eq!(
+        classify(Some(&e), &moved, &dg, MetaCmp::SizeMtime),
+        Status::Violation
+    );
+    assert_eq!(
+        classify(Some(&e), &moved, &dg, MetaCmp::Full),
+        Status::Edited
+    );
 }

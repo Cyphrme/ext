@@ -3,9 +3,10 @@
 use crate::hash::meta_of;
 use crate::index::{Meta, RootId};
 use crate::registry::RegPath;
+use crate::vfs;
 use rustix::fs::{
-    fstat, fstatvfs, makedev, openat, openat2, statx, AtFlags, Dir, FileType, Mode, OFlags,
-    ResolveFlags, Statx, StatxFlags, CWD,
+    fstat, fstatfs, fstatvfs, makedev, openat, openat2, statx, AtFlags, Dir, FileType, Mode,
+    OFlags, ResolveFlags, Statx, StatxFlags, CWD,
 };
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -55,6 +56,8 @@ static NO_MNT_ID: Once = Once::new();
 struct DirHandle {
     fd: OwnedFd,
     path: Vec<u8>,
+    /// The mount this directory is on; a child differing from it is a crossing.
+    mnt: u64,
 }
 
 /// A subdirectory found while listing its parent, opened only when popped.
@@ -64,11 +67,14 @@ struct Pending {
     parent: Rc<DirHandle>,
     name: CString,
     id: (u64, u64),
+    /// The child's mount, and whether it differs from the parent's: a
+    /// crossing is entered only if the filesystem there is not virtual.
+    mnt: u64,
+    crossed: bool,
 }
 
 struct Ctx<'a> {
     store_id: (u64, u64),
-    root_mnt: u64,
     root_uid: u32,
     /// Kernel without `STATX_MNT_ID`: mount identity degrades to `st_dev`.
     /// Wrong on btrfs subvolumes, hence only a fallback.
@@ -124,6 +130,47 @@ pub fn root_id(root: &RegPath) -> io::Result<RootId> {
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )?;
     Ok(RootId(fstatvfs(&fd)?.f_fsid))
+}
+
+/// True if opening `root` still fails with ENOENT. Checked after the
+/// ancestor's filesystem is read, so a mount that landed in between is not
+/// mistaken for a deletion.
+pub fn root_still_absent(root: &RegPath) -> bool {
+    matches!(
+        openat2(
+            CWD,
+            root.as_bytes(),
+            DIR_FLAGS,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ),
+        Err(rustix::io::Errno::NOENT)
+    )
+}
+
+/// The filesystem of the nearest existing ancestor of `root`, which is itself
+/// gone: what a deleted root is compared against (a root on an unmounted disk
+/// leaves an ancestor on a different filesystem). A symlink or any other
+/// obstacle on the way is an error, never a guess.
+pub fn nearest_ancestor_id(root: &RegPath) -> io::Result<RootId> {
+    let mut path = root.as_bytes();
+    loop {
+        path = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) | None => b"/",
+            Some(i) => &path[..i],
+        };
+        match openat2(
+            CWD,
+            path,
+            DIR_FLAGS,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(fd) => return Ok(RootId(fstatvfs(&fd)?.f_fsid)),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) if path != b"/" => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Every descent is relative to a held descriptor, so no component can be
@@ -197,7 +244,6 @@ pub(crate) fn walk_checked(
     }
     let mut ctx = Ctx {
         store_id,
-        root_mnt,
         root_uid: st.stx_uid,
         use_dev,
         stack: Vec::new(),
@@ -205,7 +251,15 @@ pub(crate) fn walk_checked(
         before_open,
         visit,
     };
-    list_dir(&mut ctx, Rc::new(DirHandle { fd, path }));
+    list_dir(
+        &mut ctx,
+        Rc::new(DirHandle {
+            fd,
+            path,
+            mnt: root_mnt,
+        }),
+        true,
+    );
     // Explicit stack: depth costs heap, never call-stack or one fd per level.
     while let Some(p) = ctx.stack.pop() {
         let path = child_path(&p.parent.path, p.name.to_bytes());
@@ -225,10 +279,25 @@ pub(crate) fn walk_checked(
         };
         match fstat(&fd) {
             Ok(f) if (f.st_dev, f.st_ino) == p.id => {
+                if p.crossed {
+                    match fstatfs(&fd) {
+                        // Truncating: every magic number fits in 32 bits.
+                        Ok(s) if vfs::is_virtual(s.f_type as u32) => {
+                            (ctx.visit)(Event::Mount(path));
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            (ctx.visit)(Event::Error(path, e.into()));
+                            continue;
+                        }
+                    }
+                }
+                let mnt = p.mnt;
                 // Release the parent before descending; if this was its last
                 // pending child, its descriptor closes here.
                 drop(p);
-                list_dir(&mut ctx, Rc::new(DirHandle { fd, path }));
+                list_dir(&mut ctx, Rc::new(DirHandle { fd, path, mnt }), false);
             }
             Ok(_) => (ctx.visit)(Event::Unstable(path, changed("directory"))),
             Err(e) => (ctx.visit)(Event::Error(path, e.into())),
@@ -260,7 +329,9 @@ fn is_real_store(ctx: &Ctx<'_>, parent: &OwnedFd, ext: &Statx) -> bool {
     })
 }
 
-fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>) {
+/// A registered root is walked even if it holds a store of its own: the
+/// registration is what lets a parent hash a sub-extant's files itself.
+fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>, is_root: bool) {
     match statx(
         &dir.fd,
         ".ext",
@@ -268,7 +339,8 @@ fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>) {
         StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::INO,
     ) {
         Ok(st)
-            if is_type(&st, FileType::Directory)
+            if !is_root
+                && is_type(&st, FileType::Directory)
                 && (dev_of(&st), st.stx_ino) != ctx.store_id
                 && is_real_store(ctx, &dir.fd, &st) =>
         {
@@ -313,17 +385,21 @@ fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
     match FileType::from_raw_mode(st.stx_mode.into()) {
         FileType::Symlink => (ctx.visit)(Event::Symlink(path)),
         FileType::Directory => {
-            if id == ctx.store_id || (ctx.skip)(&path) {
+            // A store is never content, whether it is the one in use or a
+            // sub-extant's that a registered root hashes around.
+            if id == ctx.store_id
+                || (name.to_bytes() == b".ext" && is_real_store(ctx, &dir.fd, &st))
+                || (ctx.skip)(&path)
+            {
                 return;
             }
-            let child_mnt = if ctx.use_dev { id.0 } else { st.stx_mnt_id };
-            if crosses_mount(ctx.root_mnt, child_mnt) {
-                return (ctx.visit)(Event::Mount(path));
-            }
+            let mnt = if ctx.use_dev { id.0 } else { st.stx_mnt_id };
             ctx.stack.push(Pending {
                 parent: Rc::clone(dir),
                 name: name.to_owned(),
                 id,
+                mnt,
+                crossed: crosses_mount(dir.mnt, mnt),
             });
         }
         FileType::RegularFile => {
@@ -364,6 +440,6 @@ fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
 }
 
 /// Pure so the mount rule is testable without privilege.
-pub fn crosses_mount(root_mnt: u64, child_mnt: u64) -> bool {
-    root_mnt != child_mnt
+pub fn crosses_mount(parent_mnt: u64, child_mnt: u64) -> bool {
+    parent_mnt != child_mnt
 }

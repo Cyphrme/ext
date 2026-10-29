@@ -208,11 +208,11 @@ fn store_inside_root_is_excluded_by_identity() {
     assert!(files(&ev).len() > 1, "{ev:?}");
 }
 
-/// T5: the mount rule on a real mount. A tmpfs inside the root is reported
-/// and never entered (verified on a mutant that returns a constant mount
-/// key: the tmpfs content then leaks into the listing).
+/// T5: a virtual mount (tmpfs) inside the root is reported and never entered
+/// (verified on a mutant that treats every crossing as real: the tmpfs
+/// content then leaks into the listing). Real mounts are in tests/mounts.rs.
 #[test]
-fn real_mount_boundary_is_not_entered() {
+fn virtual_mount_boundary_is_not_entered() {
     let script = r#"
 mkdir -p "$J/work/root/mnt"
 echo x > "$J/work/root/f"

@@ -93,7 +93,10 @@ impl RawRow {
 
     fn into_entry(self) -> Result<Entry, StoreError> {
         let corrupt = |why: String| {
-            StoreError::Corrupt(format!("path {}: {why}", crate::escape::escape(&self.path)))
+            StoreError::Corrupt(format!(
+                "path {}: {why}",
+                crate::escape::display(&self.path)
+            ))
         };
         let alg = Alg::from_name(&self.alg)
             .ok_or_else(|| corrupt(format!("unknown algorithm {:?}", self.alg)))?;
@@ -262,6 +265,14 @@ impl Index {
         Ok(())
     }
 
+    /// Forgets the recorded filesystem identity of `root`, leaving entries.
+    pub fn forget_root_id(&self, root: &RegPath) -> Result<(), StoreError> {
+        self.conn
+            .prepare_cached("DELETE FROM roots WHERE path = ?1")?
+            .execute([root.as_bytes()])?;
+        Ok(())
+    }
+
     pub fn paths_under(&self, root: &RegPath) -> Result<Vec<Vec<u8>>, StoreError> {
         let (lo, hi) = below_bounds(root);
         let mut stmt = self.conn.prepare_cached(&format!(
@@ -269,6 +280,13 @@ impl Index {
         ))?;
         let rows = stmt.query_map(params![root.as_bytes(), lo, hi], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        let any: bool = self
+            .conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM files)", [], |r| r.get(0))?;
+        Ok(!any)
     }
 
     pub fn iter(&self) -> Result<Vec<Entry>, StoreError> {

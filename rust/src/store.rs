@@ -1,12 +1,13 @@
 //! Store location, ownership checks, locking and registry access.
 
+use crate::config::{self, Config, ConfigError};
 use crate::registry::{self, RegPath, RegistryErrorKind};
 use rustix::fs::{
     flock, fstat, fsync, mkdirat, openat, renameat, renameat_with, statat, unlinkat, AtFlags,
     FileType, FlockOperation, Mode, OFlags, RenameFlags, CWD,
 };
 use rustix::io::Errno;
-use rustix::process::geteuid;
+use rustix::process::{getegid, geteuid, getgid, getuid};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 const REGISTRY: &str = "registry";
 const INDEX_DB: &str = "index.db";
 const LOCK: &str = "lock";
+const CONFIG: &str = "config";
 const REGISTRY_TMP: &str = "registry.tmp";
 const FILES: [&str; 3] = [REGISTRY, INDEX_DB, LOCK];
 const S_ISVTX: u32 = 0o1000;
@@ -51,6 +53,8 @@ pub enum StoreError {
         line: usize,
         kind: RegistryErrorKind,
     },
+    #[error("config {}: {source}", path.display())]
+    Config { path: PathBuf, source: ConfigError },
     #[error("store directory {0} is no longer the directory that was opened")]
     Moved(PathBuf),
     #[error("not a registered root: {0}")]
@@ -101,25 +105,52 @@ fn explicit(p: &Path) -> Result<PathBuf, StoreError> {
     Err(StoreError::NotAStore(p.to_path_buf()))
 }
 
+/// Elevated: the kernel marked the exec secure (AT_SECURE), or running as
+/// root, or with an effective identity other than the real one (setuid,
+/// setgid), where a caller who controls the environment or the working
+/// directory could steer a privileged process to a store of its choosing.
+pub fn privileged(ruid: u32, euid: u32, rgid: u32, egid: u32, secure: bool) -> bool {
+    secure || euid == 0 || euid != ruid || egid != rgid
+}
+
+fn at_secure() -> bool {
+    // SAFETY: getauxval only reads the process's auxiliary vector.
+    unsafe { libc::getauxval(libc::AT_SECURE) != 0 }
+}
+
+pub fn is_elevated() -> bool {
+    privileged(
+        getuid().as_raw(),
+        geteuid().as_raw(),
+        getgid().as_raw(),
+        getegid().as_raw(),
+        // AT_SECURE also covers binaries run with file capabilities.
+        at_secure(),
+    )
+}
+
 /// Order (spec, PR #12): flag, `EXTANT_DIR` (empty counts as unset), system
-/// default, `./.ext`.
+/// default, `./.ext`. When `elevated`, the environment and the working
+/// directory are not consulted; the flag is the caller's explicit word and
+/// still applies.
 pub fn locate(
     flag: Option<&Path>,
     env: Option<&OsStr>,
     default: &Path,
     cwd: &Path,
+    elevated: bool,
 ) -> Result<(PathBuf, Source), StoreError> {
     if let Some(p) = flag {
         return Ok((explicit(p)?, Source::Flag));
     }
-    if let Some(p) = env.filter(|v| !v.is_empty()) {
+    if let Some(p) = env.filter(|v| !elevated && !v.is_empty()) {
         return Ok((explicit(Path::new(p))?, Source::Env));
     }
     if is_store(default) {
         return Ok((default.to_path_buf(), Source::Default));
     }
     let sub = cwd.join(".ext");
-    if is_store(&sub) {
+    if !elevated && is_store(&sub) {
         return Ok((sub, Source::Cwd));
     }
     Err(StoreError::NoStore)
@@ -355,6 +386,34 @@ impl Store {
             line,
             kind,
         })
+    }
+
+    /// The store's `config`, or the defaults if there is none. It is part of
+    /// the store, so it gets the registry's checks: not a symlink, owned by
+    /// the effective user, not group/other-writable.
+    pub fn config(&self) -> Result<Config, StoreError> {
+        let p = self.path.join(CONFIG);
+        let fd = match openat(
+            &self.dir,
+            CONFIG,
+            // NONBLOCK: a planted FIFO must fail the type check, not hang.
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(Config::default()),
+            Err(e) => return Err(errno(e, "open", &p)),
+        };
+        let st = fstat(&fd).map_err(|e| errno(e, "stat", &p))?;
+        if !FileType::from_raw_mode(st.st_mode).is_file() {
+            return Err(StoreError::NotAStore(self.path.clone()));
+        }
+        judge_owner_mode(st.st_uid, st.st_mode, geteuid().as_raw(), &p)?;
+        let mut bytes = Vec::new();
+        fs::File::from(fd)
+            .read_to_end(&mut bytes)
+            .map_err(|e| wrap(e, "read", &p))?;
+        config::parse(&bytes).map_err(|source| StoreError::Config { path: p, source })
     }
 
     /// Reads, applies `f`, then replaces the registry atomically. A registry

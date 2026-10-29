@@ -19,6 +19,14 @@ impl Alg {
         Alg::ALL.iter().copied().find(|a| a.name() == s)
     }
 
+    /// For the `hash://` authority only, which URI parsers lowercase.
+    pub fn from_name_ignore_case(s: &str) -> Option<Alg> {
+        Alg::ALL
+            .iter()
+            .copied()
+            .find(|a| a.name().eq_ignore_ascii_case(s))
+    }
+
     // Digest size in bytes; an algorithm has no "empty" state.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(self) -> usize {
@@ -95,33 +103,162 @@ impl Digest {
     /// The encoding is chosen by length alone, never by character set, so
     /// a value cannot be read two ways.
     pub fn decode_value(alg: Alg, s: &str) -> Result<Digest, DigestError> {
+        Digest::decode_value_enc(alg, s).map(|(d, _)| d)
+    }
+
+    /// As [`Digest::decode_value`], also saying which encoding the length chose.
+    pub fn decode_value_enc(alg: Alg, s: &str) -> Result<(Digest, Enc), DigestError> {
         let got = s.chars().count();
-        let bytes = if got == alg.b64ut_len() {
-            decode_b64ut(alg, s)?
+        let (bytes, enc) = if got == alg.b64ut_len() {
+            (decode_b64ut(alg, s)?, Enc::B64ut)
         } else if got == alg.hex_len() {
-            decode_hex(s)?
+            (decode_hex(s)?, Enc::Hex)
         } else {
             return Err(DigestError::WrongLength { alg, got });
         };
-        Digest::from_bytes(alg, &bytes)
+        Ok((Digest::from_bytes(alg, &bytes)?, enc))
     }
 
     /// Accepts `<value>:<alg>` and `<alg>:<value>`. An algorithm name is
     /// never a valid value, so the two orders cannot be confused.
     pub fn parse_labelled(s: &str) -> Result<Digest, DigestError> {
+        Digest::parse_labelled_enc(s).map(|(d, _)| d)
+    }
+
+    fn parse_labelled_enc(s: &str) -> Result<(Digest, Enc), DigestError> {
         let (left, right) = s.split_once(':').ok_or(DigestError::Unlabelled)?;
         if right.contains(':') {
             return Err(DigestError::TooManyColons);
         }
         if let Some(alg) = Alg::from_name(right) {
-            Digest::decode_value(alg, left)
+            Digest::decode_value_enc(alg, left)
         } else if let Some(alg) = Alg::from_name(left) {
-            Digest::decode_value(alg, right)
+            Digest::decode_value_enc(alg, right)
         } else {
             // Reverse form is canonical, so blame the right-hand side.
             Err(DigestError::UnknownAlg(right.to_owned()))
         }
     }
+}
+
+/// What `resolve` looks up: a digest and, optionally, the filename that at
+/// least one returned path must have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Query {
+    pub digest: Digest,
+    /// A filename, extension included; never empty, never contains `/`.
+    pub name: Option<Vec<u8>>,
+    /// The encoding the digest was written in, for the config's input policy.
+    pub enc: Enc,
+}
+
+impl Query {
+    /// Accepts, in order of recognition:
+    /// - `hash://<alg>/<digest>[tail]`, scheme and `alg` case-insensitive;
+    /// - `<value>:<alg>` and `<alg>:<value>` (no name);
+    /// - `<alg>:<value>:<name>`, `<value>:<alg>:<name>`,
+    ///   `<name>:<alg>:<value>` and `<name>:<alg>:<value>.<ext>`.
+    ///
+    /// Names may contain `:`. The algorithm label and the fixed-length value
+    /// beside it are located first and the rest is the name; in the
+    /// name-first forms the last label wins, since the digest ends the
+    /// argument. Outside `hash://` algorithm names are exact.
+    pub fn parse(s: &str) -> Result<Query, DigestError> {
+        if s.get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("hash://"))
+        {
+            return hash_uri(&s[7..]);
+        }
+        match s.matches(':').count() {
+            0 => Err(DigestError::Unlabelled),
+            1 => Digest::parse_labelled_enc(s).map(|(digest, enc)| Query {
+                digest,
+                name: None,
+                enc,
+            }),
+            _ => name_form(s),
+        }
+    }
+}
+
+fn hash_uri(rest: &str) -> Result<Query, DigestError> {
+    let (alg, rest) = rest.split_once('/').ok_or(DigestError::BadHashUri)?;
+    let alg =
+        Alg::from_name_ignore_case(alg).ok_or_else(|| DigestError::UnknownAlg(alg.to_owned()))?;
+    // The tail starts at the first non-b64ut character; every b64ut
+    // character is ASCII, so the prefix length is a char boundary.
+    let end = rest
+        .find(|c: char| b64ut_val(c).is_none())
+        .unwrap_or(rest.len());
+    let (digest, enc) = Digest::decode_value_enc(alg, &rest[..end])?;
+    Ok(Query {
+        digest,
+        name: None,
+        enc,
+    })
+}
+
+/// Every value that decodes at the start of `b`, with its length. A hex
+/// value's first 43 characters can also be a canonical b64ut value, so the
+/// caller picks the candidate whose delimiter follows.
+fn values_at(alg: Alg, b: &[u8]) -> impl Iterator<Item = (Digest, usize, Enc)> + '_ {
+    [alg.b64ut_len(), alg.hex_len()]
+        .into_iter()
+        .filter_map(move |n| {
+            let v = std::str::from_utf8(b.get(..n)?).ok()?;
+            let (d, e) = Digest::decode_value_enc(alg, v).ok()?;
+            Some((d, n, e))
+        })
+}
+
+fn name_form(s: &str) -> Result<Query, DigestError> {
+    let b = s.as_bytes();
+    let found = Alg::ALL.iter().find_map(|&alg| {
+        let label = alg.name().as_bytes();
+        // <alg>:<value>:<name>
+        if let Some(rest) = b.strip_prefix(label).and_then(|r| r.strip_prefix(b":")) {
+            if let Some(hit) = values_at(alg, rest)
+                .find_map(|(d, n, e)| Some((d, rest[n..].strip_prefix(b":")?.to_vec(), e)))
+            {
+                return Some(hit);
+            }
+        }
+        // <value>:<alg>:<name>
+        if let Some(hit) = values_at(alg, b).find_map(|(d, n, e)| {
+            let tail = b[n..].strip_prefix(b":")?;
+            let name = tail.strip_prefix(label)?.strip_prefix(b":")?;
+            Some((d, name.to_vec(), e))
+        }) {
+            return Some(hit);
+        }
+        // <name>:<alg>:<value>[.<ext>], the rightmost label first
+        let mut pat = vec![b':'];
+        pat.extend_from_slice(label);
+        pat.push(b':');
+        let starts: Vec<usize> = (0..b.len()).filter(|&i| b[i..].starts_with(&pat)).collect();
+        starts.into_iter().rev().find_map(|i| {
+            let after = &b[i + pat.len()..];
+            values_at(alg, after).find_map(|(d, n, e)| {
+                let ext = &after[n..];
+                let mut name = b[..i].to_vec();
+                match ext {
+                    [] => {}
+                    [b'.', _, ..] => name.extend_from_slice(ext),
+                    _ => return None,
+                }
+                Some((d, name, e))
+            })
+        })
+    });
+    let (digest, name, enc) = found.ok_or(DigestError::NoNameForm)?;
+    if name.is_empty() || name.contains(&b'/') {
+        return Err(DigestError::InvalidName);
+    }
+    Ok(Query {
+        digest,
+        name: Some(name),
+        enc,
+    })
 }
 
 impl std::fmt::Display for Digest {
@@ -183,6 +320,12 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, DigestError> {
 pub enum DigestError {
     #[error("digest has no ':' label")]
     Unlabelled,
+    #[error("malformed hash:// URI: expected hash://<alg>/<digest>")]
+    BadHashUri,
+    #[error("no <alg>:<value> pair of a digest and a name found in the argument")]
+    NoNameForm,
+    #[error("a name is a filename: non-empty, without '/'")]
+    InvalidName,
     #[error("digest has more than one ':'")]
     TooManyColons,
     #[error("unknown algorithm {0:?}")]

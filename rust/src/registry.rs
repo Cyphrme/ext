@@ -1,4 +1,4 @@
-//! Registry file: one escaped absolute path per line.
+//! Registry file: one TSV-escaped absolute path per line.
 
 use crate::escape::{escape, unescape, EscapeError};
 use std::collections::HashSet;
@@ -13,7 +13,6 @@ pub enum RegistryErrorKind {
     Relative,
     NotNormalised,
     Nul,
-    NotUtf8,
     Escape(EscapeError),
 }
 
@@ -58,8 +57,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<RegPath>, (usize, RegistryErrorKind)> {
         if line.is_empty() || line[0] == b'#' {
             continue;
         }
-        let text = std::str::from_utf8(line).map_err(|_| (lineno, RegistryErrorKind::NotUtf8))?;
-        let raw = unescape(text).map_err(|e| (lineno, RegistryErrorKind::Escape(e)))?;
+        let raw = unescape(line).map_err(|e| (lineno, RegistryErrorKind::Escape(e)))?;
         let p = RegPath::from_bytes(&raw).map_err(|k| (lineno, k))?;
         if seen.insert(p.clone()) {
             out.push(p);
@@ -71,7 +69,7 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<RegPath>, (usize, RegistryErrorKind)> {
 pub fn render(paths: &[RegPath]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in paths {
-        out.extend_from_slice(escape(p.as_bytes()).as_bytes());
+        out.extend_from_slice(&escape(p.as_bytes()));
         out.push(b'\n');
     }
     out

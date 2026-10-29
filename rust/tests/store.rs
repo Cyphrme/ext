@@ -3,7 +3,7 @@
 
 mod common;
 use common::{euid, mk_store, rp};
-use ext::store::{locate, Source, Store, StoreError};
+use ext::store::{locate, privileged, Source, Store, StoreError};
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -124,7 +124,7 @@ fn precedence_table_all_combinations() {
                         Arg::Empty => Some(OsStr::new("")),
                         _ => Some(paths.env.as_os_str()),
                     };
-                    let got = locate(flag_arg, env_os, &paths.default, &paths.cwd);
+                    let got = locate(flag_arg, env_os, &paths.default, &paths.cwd, false);
                     let want = expected(flag, env, default_present, cwd_present, &paths);
                     assert_eq!(
                         classify(&got),
@@ -237,7 +237,14 @@ fn init_extant_creates_dot_ext_and_registers_dir() {
     let reg = st.registry().unwrap();
     assert_eq!(reg, vec![rp(dir.as_os_str().as_encoded_bytes())]);
     // `<dir>` and `<dir>/.ext` both resolve to the same store.
-    let a = locate(Some(&dir), None, &dir.join("nodefault"), &dir.join("nocwd")).unwrap();
+    let a = locate(
+        Some(&dir),
+        None,
+        &dir.join("nodefault"),
+        &dir.join("nocwd"),
+        false,
+    )
+    .unwrap();
     assert_eq!(a, (dir.join(".ext"), Source::Flag));
 }
 
@@ -359,4 +366,75 @@ fn init_never_overwrites() {
     let with_empty_dot_ext = base.join("y");
     fs::create_dir_all(with_empty_dot_ext.join(".ext")).unwrap();
     already(Store::init_extant(&with_empty_dot_ext));
+}
+
+// ---- README, Trust: with elevated privilege `EXTANT_DIR` and the current
+// directory are not consulted.
+
+/// Store at each of flag/env/default/cwd, so the one used names the step.
+fn all_four() -> (tempfile::TempDir, [PathBuf; 4]) {
+    let t = tempfile::tempdir().unwrap();
+    let p = [
+        t.path().join("flag"),
+        t.path().join("env"),
+        t.path().join("default"),
+        t.path().join("cwd"),
+    ];
+    for d in &p[..3] {
+        mk_store(d);
+    }
+    mk_store(&p[3].join(".ext"));
+    (t, p)
+}
+
+#[test]
+fn elevated_ignores_env_and_cwd_but_not_flag_or_default() {
+    let (_t, [flag, env, default, cwd]) = all_four();
+    let env = env.as_os_str();
+    let at = |flag: Option<&Path>, env: Option<&OsStr>, default: &Path, elevated| {
+        locate(flag, env, default, &cwd, elevated)
+    };
+    // The control: unprivileged, env wins over default and cwd.
+    let (p, s) = at(None, Some(env), &default, false).unwrap();
+    assert_eq!((p, s), (PathBuf::from(env), Source::Env));
+    // Elevated: env is skipped, the default is next.
+    let (p, s) = at(None, Some(env), &default, true).unwrap();
+    assert_eq!((p, s), (default.clone(), Source::Default));
+    // Elevated, and no default: the cwd store is not consulted either.
+    let missing = default.join("absent");
+    assert!(matches!(
+        at(None, Some(env), &missing, true),
+        Err(StoreError::NoStore)
+    ));
+    assert!(
+        at(None, None, &missing, false).is_ok(),
+        "cwd works unprivileged"
+    );
+    // An explicit flag is the operator's own word and still counts.
+    let (p, s) = at(Some(&flag), Some(env), &default, true).unwrap();
+    assert_eq!((p, s), (flag, Source::Flag));
+}
+
+#[test]
+fn privilege_is_root_or_a_changed_identity() {
+    // (ruid, euid, rgid, egid)
+    for (ids, want, why) in [
+        ((1000, 1000, 1000, 1000), false, "ordinary user"),
+        ((0, 0, 0, 0), true, "root"),
+        ((1000, 0, 1000, 1000), true, "setuid root"),
+        ((1000, 1001, 1000, 1000), true, "setuid to another user"),
+        ((1000, 1000, 1000, 1001), true, "setgid"),
+        ((0, 1000, 0, 0), true, "real root, effective user"),
+        ((1000, 1000, 0, 0), false, "uid and gid each unchanged"),
+    ] {
+        assert_eq!(privileged(ids.0, ids.1, ids.2, ids.3, false), want, "{why}");
+    }
+}
+
+#[test]
+fn a_secure_exec_is_elevated_whatever_the_ids() {
+    assert!(
+        privileged(1000, 1000, 1000, 1000, true),
+        "file capabilities"
+    );
 }

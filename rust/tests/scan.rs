@@ -228,6 +228,36 @@ fn violation_then_accept() {
     assert_eq!(s.exit_code(), 0, "an accepted violation is not an error");
 }
 
+// README, Incrementality: the option disables the ctime and inode
+// comparisons. A chmod moves only the ctime, so it is re-hashed by default
+// and skipped when the comparison is off.
+#[test]
+fn ctime_only_change_is_skipped_only_without_the_ctime_comparison() {
+    let d = Opts::default();
+    assert!(
+        d.compare_ctime_inode && d.unregister_deleted,
+        "defaults are on"
+    );
+    for (compare, want_skipped) in [(true, 0), (false, 1)] {
+        let e = env();
+        let f = e.root.join("f");
+        fs::write(&f, b"content").unwrap();
+        scan(&e, &Opts::default());
+        settle(&e);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o640)).unwrap();
+        let opts = Opts {
+            compare_ctime_inode: compare,
+            ..Opts::default()
+        };
+        let (s, _) = scan(&e, &opts);
+        assert_eq!(
+            (s.skipped, s.unchanged),
+            (want_skipped, 1 - want_skipped),
+            "{compare}"
+        );
+    }
+}
+
 #[test]
 fn deleted_file_is_missing_and_its_entry_removed() {
     let e = env();
