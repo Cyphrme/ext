@@ -204,3 +204,38 @@ cat "$J/work/store/registry"
     );
     assert!(!o.stdout.contains("DELETED"), "{}", o.stdout);
 }
+
+// A deleted outer root takes only its own entries: a registered root nested
+// in it that is a missing mount keeps its entries and its registration.
+#[test]
+fn deleted_outer_root_leaves_a_nested_missing_mount_alone() {
+    let script = r#"
+mkdir -p "$J/work/outer/mnt"
+mount -t tmpfs tmpfs "$J/work/outer/mnt" || exit 77
+echo data > "$J/work/outer/mnt/f"
+echo o > "$J/work/outer/g"
+x init --bare /work/store || exit 1
+x --d /work/store register /work/outer > /dev/null 2>&1 || exit 1
+x --d /work/store register /work/outer/mnt > /dev/null 2>&1 || exit 1
+umount "$J/work/outer/mnt" && rm -rf "$J/work/outer" || exit 77
+x --d /work/store check
+echo "CODE=$?"
+echo "--list"
+x --d /work/store list
+echo "--registry"
+cat "$J/work/store/registry"
+"#;
+    let Some(o) = support::in_jail(script) else {
+        eprintln!("skipped: no unprivileged user+mount namespace");
+        return;
+    };
+    let out = &o.stdout;
+    assert!(out.contains("DELETED\t/work/outer\n"), "{out}{}", o.stderr);
+    assert!(out.contains("REFUSED\t/work/outer/mnt\t"), "{out}");
+    assert!(out.contains("CODE=5"), "{out}");
+    let (_, rest) = out.split_once("--list\n").unwrap();
+    let (list, registry) = rest.split_once("--registry\n").unwrap();
+    assert!(list.contains("\t/work/outer/mnt/f\n"), "entry lost: {list}");
+    assert!(!list.contains("/work/outer/g"), "{list}");
+    assert_eq!(registry, "/work/outer/mnt\n", "{registry}");
+}
