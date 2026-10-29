@@ -95,7 +95,7 @@ fn export_format_order_and_files() {
     );
 
     let d = |e: &Entry| e.digest.to_reverse(Enc::B64ut);
-    let mut src = vec![
+    let mut src = [
         (d(&a), "/r/b.txt".to_string()),
         (d(&b), "/r/a\\tb\\nc\\\\d".to_string()),
         (d(&c), "/r/z".to_string()),
@@ -271,7 +271,7 @@ fn import_refuses_a_store_with_an_index() {
     let t = tempfile::tempdir().unwrap();
     let out = good_export(t.path());
     let keep = entry(b"/k/f", b"k", 9);
-    let dst = mk_store(t.path(), "dst", &[b"/k"], &[keep.clone()]);
+    let dst = mk_store(t.path(), "dst", &[b"/k"], std::slice::from_ref(&keep));
     let o = ext(&dst).arg("import").arg(&out).output().unwrap();
     assert_eq!(o.status.code(), Some(4));
     let st = Store::open(&dst).unwrap();

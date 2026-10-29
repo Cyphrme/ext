@@ -7,4 +7,5 @@ pub mod index;
 pub mod registry;
 pub mod scan;
 pub mod store;
+pub mod transfer;
 pub mod walk;

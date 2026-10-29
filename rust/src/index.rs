@@ -274,6 +274,13 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    pub fn is_empty(&self) -> Result<bool, StoreError> {
+        let any: bool = self
+            .conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM files)", [], |r| r.get(0))?;
+        Ok(!any)
+    }
+
     pub fn iter(&self) -> Result<Vec<Entry>, StoreError> {
         let mut stmt = self
             .conn

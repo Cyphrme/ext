@@ -61,6 +61,14 @@ pub enum Cmd {
         accept: bool,
     },
     Rebuild,
+    /// Write the registry, source and timestamp records as TSV into a directory.
+    Export {
+        dir: PathBuf,
+    },
+    /// Load an export into a store whose index is empty.
+    Import {
+        dir: PathBuf,
+    },
 }
 
 /// Everything that ends a command early. All of these exit 4 (Display says
@@ -77,6 +85,8 @@ enum CliError {
     },
     #[error("cannot write output: {0}")]
     Out(#[from] io::Error),
+    #[error("{0}")]
+    Transfer(#[from] crate::transfer::TransferError),
     #[error("{0}")]
     Digest(#[from] crate::digest::DigestError),
     #[error("not a valid registry root {}: {kind:?}", path.display())]
@@ -210,6 +220,14 @@ fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
                 only: None,
             };
             scan_locked(&open_store(cli)?, &opts, false, fmt, w)?
+        }
+        Cmd::Export { dir } => {
+            crate::transfer::export(&open_store(cli)?, dir)?;
+            0
+        }
+        Cmd::Import { dir } => {
+            crate::transfer::import(&open_store(cli)?, dir)?;
+            0
         }
         Cmd::Rebuild => {
             let opts = Opts {
