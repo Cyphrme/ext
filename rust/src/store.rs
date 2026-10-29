@@ -105,12 +105,17 @@ fn explicit(p: &Path) -> Result<PathBuf, StoreError> {
     Err(StoreError::NotAStore(p.to_path_buf()))
 }
 
-/// Elevated: running as root, or with an effective identity other than the
+/// Elevated: the kernel marked the exec secure (AT_SECURE), or running as root, or with an effective identity other than the
 /// real one (setuid, setgid), where a caller who controls the environment or
 /// the working directory could steer a privileged process to a store of its
 /// choosing.
-pub fn privileged(ruid: u32, euid: u32, rgid: u32, egid: u32) -> bool {
-    euid == 0 || euid != ruid || egid != rgid
+pub fn privileged(ruid: u32, euid: u32, rgid: u32, egid: u32, secure: bool) -> bool {
+    secure || euid == 0 || euid != ruid || egid != rgid
+}
+
+fn at_secure() -> bool {
+    // SAFETY: getauxval only reads the process's auxiliary vector.
+    unsafe { libc::getauxval(libc::AT_SECURE) != 0 }
 }
 
 pub fn is_elevated() -> bool {
@@ -119,6 +124,8 @@ pub fn is_elevated() -> bool {
         geteuid().as_raw(),
         getgid().as_raw(),
         getegid().as_raw(),
+        // AT_SECURE also covers binaries run with file capabilities.
+        at_secure(),
     )
 }
 
@@ -389,7 +396,8 @@ impl Store {
         let fd = match openat(
             &self.dir,
             CONFIG,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            // NONBLOCK: a planted FIFO must fail the type check, not hang.
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
             Mode::empty(),
         ) {
             Ok(fd) => fd,

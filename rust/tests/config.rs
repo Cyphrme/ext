@@ -292,3 +292,20 @@ fn export_import_then_check_records_identity_and_is_clean() {
     assert_eq!(code, 0, "{stdout}");
     assert!(stdout.contains("DELETED\t"), "{stdout}");
 }
+
+// A FIFO planted as the config must fail the type check; opening it for
+// reading would otherwise block until a writer appears.
+#[test]
+fn a_fifo_config_is_refused_without_blocking() {
+    let fx = Fx::new();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        fx.store.join("config"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let (code, _, err) = fx.ext(&["list"]);
+    assert_eq!(code, 4, "{err}");
+}

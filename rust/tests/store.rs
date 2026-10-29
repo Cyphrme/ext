@@ -427,6 +427,14 @@ fn privilege_is_root_or_a_changed_identity() {
         ((0, 1000, 0, 0), true, "real root, effective user"),
         ((1000, 1000, 0, 0), false, "uid and gid each unchanged"),
     ] {
-        assert_eq!(privileged(ids.0, ids.1, ids.2, ids.3), want, "{why}");
+        assert_eq!(privileged(ids.0, ids.1, ids.2, ids.3, false), want, "{why}");
     }
+}
+
+#[test]
+fn a_secure_exec_is_elevated_whatever_the_ids() {
+    assert!(
+        privileged(1000, 1000, 1000, 1000, true),
+        "file capabilities"
+    );
 }
