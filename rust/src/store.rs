@@ -6,7 +6,7 @@ use rustix::fs::{
     FileType, FlockOperation, Mode, OFlags, RenameFlags, CWD,
 };
 use rustix::io::Errno;
-use rustix::process::geteuid;
+use rustix::process::{getegid, geteuid, getgid, getuid};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -101,25 +101,45 @@ fn explicit(p: &Path) -> Result<PathBuf, StoreError> {
     Err(StoreError::NotAStore(p.to_path_buf()))
 }
 
+/// Elevated: running as root, or with an effective identity other than the
+/// real one (setuid, setgid), where a caller who controls the environment or
+/// the working directory could steer a privileged process to a store of its
+/// choosing.
+pub fn privileged(ruid: u32, euid: u32, rgid: u32, egid: u32) -> bool {
+    euid == 0 || euid != ruid || egid != rgid
+}
+
+pub fn is_elevated() -> bool {
+    privileged(
+        getuid().as_raw(),
+        geteuid().as_raw(),
+        getgid().as_raw(),
+        getegid().as_raw(),
+    )
+}
+
 /// Order (spec, PR #12): flag, `EXTANT_DIR` (empty counts as unset), system
-/// default, `./.ext`.
+/// default, `./.ext`. When `elevated`, the environment and the working
+/// directory are not consulted; the flag is the caller's explicit word and
+/// still applies.
 pub fn locate(
     flag: Option<&Path>,
     env: Option<&OsStr>,
     default: &Path,
     cwd: &Path,
+    elevated: bool,
 ) -> Result<(PathBuf, Source), StoreError> {
     if let Some(p) = flag {
         return Ok((explicit(p)?, Source::Flag));
     }
-    if let Some(p) = env.filter(|v| !v.is_empty()) {
+    if let Some(p) = env.filter(|v| !elevated && !v.is_empty()) {
         return Ok((explicit(Path::new(p))?, Source::Env));
     }
     if is_store(default) {
         return Ok((default.to_path_buf(), Source::Default));
     }
     let sub = cwd.join(".ext");
-    if is_store(&sub) {
+    if !elevated && is_store(&sub) {
         return Ok((sub, Source::Cwd));
     }
     Err(StoreError::NoStore)

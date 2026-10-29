@@ -137,6 +137,7 @@ fn open_store(cli: &Cli) -> Result<Store, CliError> {
         env.as_deref(),
         Path::new(SYSTEM_STORE),
         &cwd,
+        store::is_elevated(),
     )?;
     let store = Store::open(&dir)?;
     // A malformed registry is a config error for every command, readers
