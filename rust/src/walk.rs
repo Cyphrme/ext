@@ -246,6 +246,17 @@ pub(crate) fn walk_checked(
         Ok(v) => RootId(v.f_fsid),
         Err(e) => return visit(Event::Error(path, e.into())),
     };
+    // Before the identity is recorded or anything is read.
+    match inside_store(root, store_id, st.stx_uid) {
+        Ok(None) => {}
+        Ok(Some(why)) => {
+            return visit(Event::Refused(
+                path,
+                io::Error::other(format!("not indexed: {why}")),
+            ))
+        }
+        Err(e) => return visit(Event::Refused(path, e)),
+    }
     if let Err(e) = check(id) {
         return visit(Event::Refused(path, e));
     }
@@ -329,6 +340,57 @@ pub(crate) fn walk_checked(
     }
 }
 
+/// Why `root` may not be a root: it is the active store, or lies inside it, or
+/// lies inside a sub-extant's store. The store is never indexed, and the
+/// directory walk already leaves these alone below a root; a root placed
+/// there directly would bypass that. Identity is by device and inode of each
+/// directory on the path (the path has no symlinks), not by path text, and a
+/// `.ext` counts under the same rule as in the walk, with `root_uid` the
+/// owner of the root.
+pub fn inside_store(
+    root: &RegPath,
+    store_id: (u64, u64),
+    root_uid: u32,
+) -> io::Result<Option<&'static str>> {
+    let path = root.as_bytes();
+    let ends = path
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b == b'/' && i > 0)
+        .map(|(i, _)| i)
+        .chain(std::iter::once(path.len()));
+    for end in ends {
+        let prefix = &path[..end];
+        let st = statx(
+            CWD,
+            prefix,
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::INO,
+        )?;
+        if !is_type(&st, FileType::Directory) {
+            continue;
+        }
+        if (dev_of(&st), st.stx_ino) == store_id {
+            return Ok(Some("it is the store in use, or lies inside it"));
+        }
+        let slash = prefix.iter().rposition(|&b| b == b'/').unwrap_or(0);
+        if &prefix[slash + 1..] == b".ext" {
+            let parent = &prefix[..slash.max(1)];
+            let parent = openat2(
+                CWD,
+                parent,
+                DIR_FLAGS,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )?;
+            if is_real_store(root_uid, &parent, &st) {
+                return Ok(Some("it lies inside a sub-extant's store"));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// A root that is one regular file: hashed like any other file, by a read-only
 /// open that cannot block, checked against the identity just seen.
 fn file_root(path: Vec<u8>, id: (u64, u64), last_checked_ns: i64, visit: &mut dyn FnMut(Event)) {
@@ -365,9 +427,9 @@ fn file_root(path: Vec<u8>, id: (u64, u64), last_checked_ns: i64, visit: &mut dy
 /// index and lock files this one keeps, so they are not required. Not being
 /// group/other-writable is added hardening. Any other `.ext` is ordinary
 /// content, so planting one cannot hide a subtree.
-fn is_real_store(ctx: &Ctx<'_>, parent: &OwnedFd, ext: &Statx) -> bool {
+fn is_real_store(root_uid: u32, parent: &OwnedFd, ext: &Statx) -> bool {
     let trusted =
-        |st: &Statx| (st.stx_uid == 0 || st.stx_uid == ctx.root_uid) && st.stx_mode & 0o022 == 0;
+        |st: &Statx| (st.stx_uid == 0 || st.stx_uid == root_uid) && st.stx_mode & 0o022 == 0;
     if !trusted(ext) {
         return false;
     }
@@ -394,7 +456,7 @@ fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>, is_root: bool) {
             if !is_root
                 && is_type(&st, FileType::Directory)
                 && (dev_of(&st), st.stx_ino) != ctx.store_id
-                && is_real_store(ctx, &dir.fd, &st) =>
+                && is_real_store(ctx.root_uid, &dir.fd, &st) =>
         {
             return (ctx.visit)(Event::SubExtant(dir.path.clone()));
         }
@@ -440,7 +502,7 @@ fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
             // A store is never content, whether it is the one in use or a
             // sub-extant's that a registered root hashes around.
             if id == ctx.store_id
-                || (name.to_bytes() == b".ext" && is_real_store(ctx, &dir.fd, &st))
+                || (name.to_bytes() == b".ext" && is_real_store(ctx.root_uid, &dir.fd, &st))
                 || (ctx.skip)(&path)
             {
                 return;

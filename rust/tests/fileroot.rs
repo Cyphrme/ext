@@ -264,8 +264,6 @@ fn the_store_directory_or_a_directory_inside_it_is_refused_as_a_root() {
     let (_t, base) = canon_tmp();
     let store = base.join("store");
     for root in [store.clone(), store.join("sub")] {
-        // The store is created by store_with_roots; add the subdirectory first.
-        let _ = fs::create_dir_all(&root.parent().unwrap());
         let (_s, reps, paths) = scan_roots_in(&base, &root);
         assert_eq!(kinds(&reps, K::Refused), vec![b(&root)], "{reps:?}");
         assert!(paths.is_empty(), "indexed {paths:?}");

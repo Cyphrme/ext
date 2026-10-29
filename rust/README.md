@@ -258,7 +258,8 @@ root, it is a missing mount: `REFUSED`, entries and registration kept, exit 5.
 - Registered roots may be nested. A root's walk stops at another registered root,
   and each file is indexed once, by the inner root.
 - A file root is one entry. A registry entry that is a symlink, has a symlink in
-  any component, or is a FIFO or device is `REFUSED` at scan time.
+  any component, or is a FIFO or device is `REFUSED` at scan time, as is a root that is a store
+  or inside one (`register` rejects it with exit 4).
 - Hand-editing the registry while `ext register` runs can lose one of the two
   changes.
 - `resolve` answers from the last scan; it does not re-read the files. A

@@ -99,6 +99,8 @@ enum CliError {
     },
     #[error("--d names a store to open, but init creates one; give the location as an argument")]
     InitWithStoreFlag,
+    #[error("cannot register {}: {why}", path.display())]
+    InsideStore { path: PathBuf, why: &'static str },
     #[error("not a directory or regular file: {}", .0.display())]
     NotADirectoryOrFile(PathBuf),
     #[error("not a registry entry (unregister needs an exact match): {0}")]
@@ -303,11 +305,27 @@ fn register(
         path: path.to_path_buf(),
         source,
     })?;
-    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir() || m.is_file()) {
+    let Some(md) = std::fs::metadata(&canon)
+        .ok()
+        .filter(|m| m.is_dir() || m.is_file())
+    else {
         return Err(CliError::NotADirectoryOrFile(path.to_path_buf()));
-    }
+    };
     let root = RegPath::from_bytes(canon.as_os_str().as_bytes())
         .map_err(|kind| CliError::BadRoot { path: canon, kind })?;
+    let uid = std::os::unix::fs::MetadataExt::uid(&md);
+    if let Some(why) =
+        crate::walk::inside_store(&root, store.id(), uid).map_err(|source| CliError::Io {
+            what: "cannot examine",
+            path: path.to_path_buf(),
+            source,
+        })?
+    {
+        return Err(CliError::InsideStore {
+            path: path.to_path_buf(),
+            why,
+        });
+    }
     let already = store.registry()?.contains(&root);
     store.edit_registry(&lock, |v| {
         if !v.contains(&root) {

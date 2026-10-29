@@ -336,7 +336,10 @@ into unless registered (README, Technical Considerations: Recursion).
   root. A file root is a single entry: hashed, checked, and judged deleted or a
   missing mount like a directory root, with its parent as the nearest ancestor.
   A registry entry that is a symlink or a special file is `REFUSED` at scan time
-  and never opened. `unregister` needs a path that exactly matches a registry
+  and never opened. So is a root that is the store in use or lies inside it, or
+  lies inside a sub-extant's store (decided by device and inode of each
+  directory on the path); `register` rejects these with exit 4. A refused root
+  keeps whatever entries it already had, and none are created for it. `unregister` needs a path that exactly matches a registry
   entry (exit 4 otherwise) and removes the entry and all index entries under it.
 - Why: exact matching avoids removing a parent by accident.
 
