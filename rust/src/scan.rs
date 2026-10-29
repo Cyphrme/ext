@@ -7,7 +7,7 @@ use crate::hash::{hash_stable, HashError};
 use crate::index::{Entry, Index, Meta, RootId};
 use crate::registry::RegPath;
 use crate::store::{Store, StoreError, WriteLock};
-use crate::walk::{nearest_ancestor_id, walk_checked, Event};
+use crate::walk::{nearest_ancestor_id, root_still_absent, walk_checked, Event};
 use rustix::fs::{openat2, statx, AtFlags, FileType, Mode, OFlags, ResolveFlags, StatxFlags, CWD};
 use std::collections::HashSet;
 use std::fs::File;
@@ -323,7 +323,13 @@ impl RootScan<'_> {
         }
         self.flush()?;
         if self.root_gone {
-            let verdict = judge_gone(self.idx.root_id(root)?, nearest_ancestor_id(root));
+            let ancestor = nearest_ancestor_id(root);
+            let mut verdict = judge_gone(self.idx.root_id(root)?, ancestor);
+            if verdict == Gone::Deleted && !root_still_absent(root) {
+                verdict = Gone::MissingMount(
+                    "root was missing but reappeared while being examined; run again".into(),
+                );
+            }
             match verdict {
                 Gone::Deleted if !self.opts.unregister_deleted => {
                     self.summary.deleted += 1;
@@ -396,7 +402,10 @@ impl RootScan<'_> {
             // the next run's reconcile drops what is left.
             self.store
                 .edit_registry(self.lock, |v| v.retain(|r| r != root))?;
-            self.idx.remove_under(root)?;
+            // Not `remove_under`: the loop above already removed this root's
+            // own entries, and anything left lies under a nested root that is
+            // judged on its own (it may be a missing mount).
+            self.idx.forget_root_id(root)?;
             self.summary.deleted += 1;
             self.report(ReportKind::Deleted, root.as_bytes().to_vec(), None, None);
         }

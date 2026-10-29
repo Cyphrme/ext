@@ -265,6 +265,14 @@ impl Index {
         Ok(())
     }
 
+    /// Forgets the recorded filesystem identity of `root`, leaving entries.
+    pub fn forget_root_id(&self, root: &RegPath) -> Result<(), StoreError> {
+        self.conn
+            .prepare_cached("DELETE FROM roots WHERE path = ?1")?
+            .execute([root.as_bytes()])?;
+        Ok(())
+    }
+
     pub fn paths_under(&self, root: &RegPath) -> Result<Vec<Vec<u8>>, StoreError> {
         let (lo, hi) = below_bounds(root);
         let mut stmt = self.conn.prepare_cached(&format!(
