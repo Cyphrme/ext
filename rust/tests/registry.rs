@@ -49,9 +49,7 @@ fn parse_rejects() {
         (b"/ok\nfile:///x\n", 2, K::Relative),
         // Whitespace-only is not blank-or-comment: it is a relative path.
         (b"# header\n\n/a\n/a\n  \n/b\n", 5, K::Relative),
-        (b"/ok\n/a\\x00b\n", 2, K::Nul),
         (b"/ok\n/a\0b\n", 2, K::Nul),
-        (b"/ok\n/\xff\n", 2, K::NotUtf8),
         // Dot segments are rejected, never resolved lexically.
         (b"/ok\n/srv/../etc\n", 2, K::NotNormalised),
         (b"/ok\n/a/./b\n", 2, K::NotNormalised),
@@ -68,7 +66,7 @@ fn parse_rejects() {
             String::from_utf8_lossy(input)
         );
     }
-    for bad in ["/a\\q", "/a\\", "/a\\x4", "/a\\x4g", "/a\\x4a"] {
+    for bad in ["/a\\q", "/a\\", "/a\\x41", "/a\\r", "/a\\T"] {
         let r = parse(format!("/ok\n{bad}\n").as_bytes());
         assert!(
             matches!(r, Err((2, RegistryErrorKind::Escape(_)))),
@@ -90,6 +88,9 @@ fn parse_accepts() {
         (b"//\n", &[b"/"]),
         (b"/a///b//c\n", &[b"/a/b/c"]),
         (b"/\n", &[b"/"]),
+        // TSV escapes only backslash, tab and newline; other bytes are verbatim.
+        (b"/a\\tb\\nc\\\\d\n", &[b"/a\tb\nc\\d"]),
+        (b"/\xff\xfe\x1b\n", &[b"/\xff\xfe\x1b"]),
         // Dots inside a name are ordinary.
         (b"/a/.hidden/..x/y.\n", &[b"/a/.hidden/..x/y."]),
     ];
