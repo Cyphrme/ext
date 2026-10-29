@@ -415,3 +415,46 @@ fn import_rejects_unpaired_records_and_missing_files() {
     assert_eq!((code, empty), (Some(4), true), "{err}");
     assert!(err.contains("registry"), "{err}");
 }
+
+/// Whether `pid` is a blocked flock waiter, from /proc/locks (a waiter's
+/// line is marked `->`). Polling this instead of sleeping makes the test
+/// independent of scheduling.
+fn is_waiting_on_lock(pid: u32) -> bool {
+    fs::read_to_string("/proc/locks").is_ok_and(|s| {
+        s.lines()
+            .any(|l| l.contains("->") && l.split_whitespace().any(|w| w == pid.to_string()))
+    })
+}
+
+/// export reads under the writers' lock: with the lock held it blocks, writes
+/// nothing, and completes once the lock is released.
+#[test]
+fn export_waits_for_the_write_lock() {
+    let t = tempfile::tempdir().unwrap();
+    let store = mk_store(t.path(), "s", &[b"/r"], &[entry(b"/r/f", b"x", 1)]);
+    let out = t.path().join("out");
+    fs::create_dir(&out).unwrap();
+    let held = Store::open(&store).unwrap().lock().unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_ext"))
+        .env("EXTANT_DIR", &store)
+        .arg("export")
+        .arg(&out)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !is_waiting_on_lock(child.id()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "export never queued on the lock (or /proc/locks is unreadable)"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "export finished while the lock was held"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+    drop(held);
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
+}

@@ -341,20 +341,19 @@ fn seeded_many(fx: &Fx) -> Vec<(Digest, Vec<u8>)> {
     v
 }
 
-/// §5 list: `<value>:<alg>\t<escaped path>`, sorted by (digest, path) bytes.
+/// §5 list: `<value>:<alg>\t<escaped path>`, sorted by (encoded digest text, path) bytes,
+/// the order `export` gives `source`.
 #[test]
 fn list_format_and_order() {
     let fx = Fx::new();
     let mut want = seeded_many(&fx);
-    want.sort_by(|a, b| (a.0.bytes(), &a.1).cmp(&(b.0.bytes(), &b.1)));
-    let by_text = {
-        let mut t: Vec<String> = want.iter().map(|(d, _)| d.to_reverse(Enc::B64ut)).collect();
-        t.sort();
-        t
-    };
-    let in_byte_order: Vec<String> = want.iter().map(|(d, _)| d.to_reverse(Enc::B64ut)).collect();
+    let text = |d: &Digest| d.to_reverse(Enc::B64ut);
+    let mut by_bytes = want.clone();
+    by_bytes.sort_by(|a, b| (a.0.bytes(), &a.1).cmp(&(b.0.bytes(), &b.1)));
+    want.sort_by(|a, b| (text(&a.0).as_bytes(), &a.1).cmp(&(text(&b.0).as_bytes(), &b.1)));
     assert_ne!(
-        by_text, in_byte_order,
+        want.iter().map(|w| text(&w.0)).collect::<Vec<_>>(),
+        by_bytes.iter().map(|w| text(&w.0)).collect::<Vec<_>>(),
         "fixture premise: text order must differ from digest-byte order"
     );
     let o = run(fx.ext().arg("list"));
@@ -364,7 +363,11 @@ fn list_format_and_order() {
         .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::B64ut), display(p)))
         .collect();
     assert_eq!(o.out(), expect);
-    // --hex: uppercase hex, same `<value>:<alg>` shape.
+    // --hex: uppercase hex, same shape, sorted by the hex text.
+    want.sort_by(|a, b| {
+        let h = |d: &Digest| d.to_reverse(Enc::Hex);
+        (h(&a.0).as_bytes(), &a.1).cmp(&(h(&b.0).as_bytes(), &b.1))
+    });
     let o = run(fx.ext().arg("--hex").arg("list"));
     let expect: String = want
         .iter()
