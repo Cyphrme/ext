@@ -3,6 +3,7 @@
 //! Exit codes (plan §1): 0 ok, 1 `resolve` found nothing, 2 unaccepted
 //! violation, 4 usage/config/store error, 5 incomplete scan. 3 is never used.
 
+use crate::config::{Config, ConfigError};
 use crate::digest::{Digest, Enc};
 use crate::escape::escape;
 use crate::index::Index;
@@ -78,6 +79,8 @@ enum CliError {
     #[error("cannot write output: {0}")]
     Out(#[from] io::Error),
     #[error("{0}")]
+    Config(#[from] ConfigError),
+    #[error("{0}")]
     Digest(#[from] crate::digest::DigestError),
     #[error("not a valid registry root {}: {kind:?}", path.display())]
     BadRoot {
@@ -129,7 +132,10 @@ impl Fmt {
     }
 }
 
-fn open_store(cli: &Cli) -> Result<Store, CliError> {
+/// The open store and its config, which every command that touches a store
+/// applies: a bad config is an error for all of them, not just the ones that
+/// happen to read the key.
+fn open_store(cli: &Cli) -> Result<(Store, Config), CliError> {
     let cwd = std::env::current_dir().map_err(CliError::Cwd)?;
     let env = std::env::var_os("EXTANT_DIR");
     let (dir, _) = store::locate(
@@ -143,7 +149,24 @@ fn open_store(cli: &Cli) -> Result<Store, CliError> {
     // A malformed registry is a config error for every command, readers
     // included, not just for the ones that happen to scan.
     store.registry()?;
-    Ok(store)
+    let cfg = store.config()?;
+    Ok((store, cfg))
+}
+
+/// `--hex` beats the config's `DefaultEnc`.
+fn fmt_for(cli: &Cli, cfg: &Config) -> Fmt {
+    Fmt {
+        enc: if cli.hex { Enc::Hex } else { cfg.default_enc },
+        nul: cli.nul,
+    }
+}
+
+fn scan_opts(cfg: &Config) -> Opts {
+    Opts {
+        compare_ctime_inode: cfg.compare_ctime_inode,
+        unregister_deleted: cfg.unregister_deleted,
+        ..Opts::default()
+    }
 }
 
 fn reg_path(p: &Path) -> Result<RegPath, CliError> {
@@ -167,13 +190,9 @@ pub fn run(cli: &Cli) -> u8 {
 }
 
 fn dispatch(cli: &Cli) -> Result<u8, CliError> {
-    let fmt = Fmt {
-        enc: if cli.hex { Enc::Hex } else { Enc::B64ut },
-        nul: cli.nul,
-    };
     let stdout = io::stdout();
     let mut w = BufWriter::new(stdout.lock());
-    let result = command(cli, fmt, &mut w);
+    let result = command(cli, &mut w);
     // A reader that went away is a quiet stop, not a failure.
     let flushed = w.flush();
     match result {
@@ -186,7 +205,7 @@ fn dispatch(cli: &Cli) -> Result<u8, CliError> {
     }
 }
 
-fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
+fn command(cli: &Cli, w: &mut impl Write) -> Result<u8, CliError> {
     let code = match &cli.cmd {
         Cmd::Init { dir, bare } => {
             if cli.d.is_some() {
@@ -195,32 +214,37 @@ fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
             init(dir.as_deref(), bare.as_deref())?
         }
         Cmd::Register { path } => {
-            let store = open_store(cli)?;
-            register(&store, path, fmt, w)?
+            let (store, cfg) = open_store(cli)?;
+            register(&store, path, &cfg, fmt_for(cli, &cfg), w)?
         }
-        Cmd::Unregister { path } => unregister(&open_store(cli)?, path)?,
+        Cmd::Unregister { path } => unregister(&open_store(cli)?.0, path)?,
         Cmd::Resolve { digest } => {
             let d = Digest::parse_labelled(digest)?;
-            resolve(&open_store(cli)?, &d, fmt, w)?
+            let (store, cfg) = open_store(cli)?;
+            cfg.check_input(digest)?;
+            resolve(&store, &d, fmt_for(cli, &cfg), w)?
         }
-        Cmd::List => list(&open_store(cli)?, fmt, w)?,
+        Cmd::List => {
+            let (store, cfg) = open_store(cli)?;
+            list(&store, fmt_for(cli, &cfg), w)?
+        }
         Cmd::Check { full, accept } => {
+            let (store, cfg) = open_store(cli)?;
             let opts = Opts {
                 full: *full,
                 accept: *accept,
-                only: None,
-                ..Opts::default()
+                ..scan_opts(&cfg)
             };
-            scan_locked(&open_store(cli)?, &opts, false, fmt, w)?
+            scan_locked(&store, &opts, false, fmt_for(cli, &cfg), w)?
         }
         Cmd::Rebuild => {
+            let (store, cfg) = open_store(cli)?;
             let opts = Opts {
                 full: true,
                 accept: true,
-                only: None,
-                ..Opts::default()
+                ..scan_opts(&cfg)
             };
-            scan_locked(&open_store(cli)?, &opts, true, fmt, w)?
+            scan_locked(&store, &opts, true, fmt_for(cli, &cfg), w)?
         }
     };
     Ok(code)
@@ -244,7 +268,13 @@ fn init(dir: Option<&Path>, bare: Option<&Path>) -> Result<u8, CliError> {
     Ok(0)
 }
 
-fn register(store: &Store, path: &Path, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
+fn register(
+    store: &Store,
+    path: &Path,
+    cfg: &Config,
+    fmt: Fmt,
+    w: &mut impl Write,
+) -> Result<u8, CliError> {
     let lock = store.lock()?;
     let canon = std::fs::canonicalize(path).map_err(|source| CliError::Io {
         what: "cannot register",
@@ -272,7 +302,7 @@ fn register(store: &Store, path: &Path, fmt: Fmt, w: &mut impl Write) -> Result<
     }
     let opts = Opts {
         only: Some(root),
-        ..Opts::default()
+        ..scan_opts(cfg)
     };
     report_scan(store, &lock, &idx, &opts, fmt, w)
 }

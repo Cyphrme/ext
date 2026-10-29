@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod config;
 pub mod digest;
 pub mod escape;
 pub mod fresh;

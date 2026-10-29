@@ -1,5 +1,6 @@
 //! Store location, ownership checks, locking and registry access.
 
+use crate::config::{self, Config, ConfigError};
 use crate::registry::{self, RegPath, RegistryErrorKind};
 use rustix::fs::{
     flock, fstat, fsync, mkdirat, openat, renameat, renameat_with, statat, unlinkat, AtFlags,
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 const REGISTRY: &str = "registry";
 const INDEX_DB: &str = "index.db";
 const LOCK: &str = "lock";
+const CONFIG: &str = "config";
 const REGISTRY_TMP: &str = "registry.tmp";
 const FILES: [&str; 3] = [REGISTRY, INDEX_DB, LOCK];
 const S_ISVTX: u32 = 0o1000;
@@ -51,6 +53,8 @@ pub enum StoreError {
         line: usize,
         kind: RegistryErrorKind,
     },
+    #[error("config {}: {source}", path.display())]
+    Config { path: PathBuf, source: ConfigError },
     #[error("store directory {0} is no longer the directory that was opened")]
     Moved(PathBuf),
     #[error("not a registered root: {0}")]
@@ -375,6 +379,33 @@ impl Store {
             line,
             kind,
         })
+    }
+
+    /// The store's `config`, or the defaults if there is none. It is part of
+    /// the store, so it gets the registry's checks: not a symlink, owned by
+    /// the effective user, not group/other-writable.
+    pub fn config(&self) -> Result<Config, StoreError> {
+        let p = self.path.join(CONFIG);
+        let fd = match openat(
+            &self.dir,
+            CONFIG,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(Config::default()),
+            Err(e) => return Err(errno(e, "open", &p)),
+        };
+        let st = fstat(&fd).map_err(|e| errno(e, "stat", &p))?;
+        if !FileType::from_raw_mode(st.st_mode).is_file() {
+            return Err(StoreError::NotAStore(self.path.clone()));
+        }
+        judge_owner_mode(st.st_uid, st.st_mode, geteuid().as_raw(), &p)?;
+        let mut bytes = Vec::new();
+        fs::File::from(fd)
+            .read_to_end(&mut bytes)
+            .map_err(|e| wrap(e, "read", &p))?;
+        config::parse(&bytes).map_err(|source| StoreError::Config { path: p, source })
     }
 
     /// Reads, applies `f`, then replaces the registry atomically. A registry
