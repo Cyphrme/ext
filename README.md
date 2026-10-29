@@ -45,6 +45,8 @@ are required, others are optional.
 
 The store directory is never indexed by `ext`; it does not index itself. A
 per-file read error is reported and does not abort the scan.
+Which files are hashed, and how mounts, symlinks, special files and deleted
+roots are handled, is in [docs/traversal.md](docs/traversal.md).
 
 **File Formats**
 Registry:   <registered_file_path>
@@ -287,7 +289,8 @@ specified CWD is used.
 `ext register`,`ext -r`  - Registration. Supports both files and directories.
 
 `ext unregister`, `ext -u`         - Unregister, removing all references in
-indexing. (Deleting a directory also unregisters.)
+indexing. A deleted root is also unregistered; see
+[docs/traversal.md](docs/traversal.md).
 
 `ext resolve <dig>` - Print path(s)
 
