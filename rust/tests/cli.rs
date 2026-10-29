@@ -887,3 +887,90 @@ fn error_line_carries_the_detail() {
     fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
     assert_detail(&o, "ERROR");
 }
+
+// -------------------------------------------- resolve: URIs and human names
+
+fn resolved(fx: &Fx, arg: &str) -> (i32, String) {
+    let o = run(fx.ext().arg("resolve").arg(arg));
+    (o.code, o.out())
+}
+
+/// Three paths hold the content; the name filters by last component.
+#[test]
+fn resolve_hash_uri_and_names() {
+    let fx = Fx::new();
+    for p in [
+        &b"/x/a/notes.txt"[..],
+        b"/x/b/notes.txt",
+        b"/x/c/xnotes.txt",
+        b"/x/d/other",
+        b"/x/notes.txt/inner",
+    ] {
+        fx.seed(p, b"hello");
+    }
+    let v = rev(b"hello");
+    let v = v.strip_suffix(":SHA-256").unwrap();
+    let all = "/x/a/notes.txt\n/x/b/notes.txt\n/x/c/xnotes.txt\n/x/d/other\n/x/notes.txt/inner\n";
+    let notes = "/x/a/notes.txt\n/x/b/notes.txt\n";
+
+    for arg in [
+        format!("hash://SHA-256/{v}"),
+        format!("hash://sha-256/{v}.png"),
+        format!("HASH://SHA-256/{v}/tail"),
+    ] {
+        assert_eq!(resolved(&fx, &arg), (0, all.into()), "{arg}");
+    }
+    for arg in [
+        format!("notes.txt:SHA-256:{v}"),
+        format!("SHA-256:{v}:notes.txt"),
+        format!("{v}:SHA-256:notes.txt"),
+        format!("notes:SHA-256:{v}.txt"),
+    ] {
+        assert_eq!(resolved(&fx, &arg), (0, notes.into()), "{arg}");
+    }
+    // One match among several paths suffices; the others are not returned.
+    assert_eq!(
+        resolved(&fx, &format!("other:SHA-256:{v}")),
+        (0, "/x/d/other\n".into())
+    );
+    // Hex input in any case, uppercase hex output under --hex is unchanged.
+    let h = dg(b"hello").encode(Enc::Hex).to_lowercase();
+    assert_eq!(
+        resolved(&fx, &format!("notes.txt:SHA-256:{h}")),
+        (0, notes.into())
+    );
+    // The digest exists but no path has that filename: not found.
+    for arg in [
+        format!("notes:SHA-256:{v}"),
+        format!("nothing:SHA-256:{v}.txt"),
+        format!("SHA-256:{v}:a"),
+    ] {
+        assert_eq!(resolved(&fx, &arg), (1, String::new()), "{arg}");
+    }
+    // A name never makes an absent digest present.
+    let absent = rev(b"absent");
+    let absent = absent.strip_suffix(":SHA-256").unwrap();
+    assert_eq!(resolved(&fx, &format!("notes.txt:SHA-256:{absent}")).0, 1);
+    // Malformed arguments are usage errors.
+    for arg in [
+        format!("hash://SHA-256/{}", &v[..40]),
+        format!("a/b:SHA-256:{v}"),
+        format!("x:sha-256:{v}"),
+    ] {
+        assert_eq!(resolved(&fx, &arg).0, 4, "{arg}");
+    }
+}
+
+/// Filenames compare as raw bytes, so a name with a tab matches and the
+/// path prints escaped.
+#[test]
+fn resolve_name_matches_raw_bytes() {
+    let fx = Fx::new();
+    fx.seed(b"/x/t\tb", b"hello");
+    let v = rev(b"hello");
+    let v = v.strip_suffix(":SHA-256").unwrap();
+    assert_eq!(
+        resolved(&fx, &format!("t\tb:SHA-256:{v}")),
+        (0, "/x/t\\tb\n".into())
+    );
+}
