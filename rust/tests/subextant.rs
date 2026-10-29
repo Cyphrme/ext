@@ -1,0 +1,100 @@
+//! Sub-extants against registration (README: a parent's scan skips a
+//! sub-extant unless its directory is itself registered to the parent, in
+//! which case the parent hashes its files itself and never reads its index).
+
+mod support;
+use ext::index::Index;
+use ext::scan::{run, Opts, Report, ReportKind as K};
+use ext::store::Store;
+use std::fs;
+use std::path::{Path, PathBuf};
+use support::{b, canon_tmp, store_with_roots};
+
+struct Tree {
+    _t: tempfile::TempDir,
+    root: PathBuf,
+    sub: PathBuf,
+    base: PathBuf,
+}
+
+/// `<base>/root/{top, s/{inner}}` where `s` holds a real store of its own.
+fn tree() -> Tree {
+    let (t, base) = canon_tmp();
+    let (root, sub) = (base.join("root"), base.join("root/s"));
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(root.join("top"), b"top").unwrap();
+    fs::write(sub.join("inner"), b"inner").unwrap();
+    Store::init_extant(&sub).unwrap();
+    Tree {
+        _t: t,
+        root,
+        sub,
+        base,
+    }
+}
+
+fn scan(t: &Tree, roots: &[&Path]) -> (Vec<Report>, Vec<Vec<u8>>) {
+    let st = store_with_roots(&t.base, roots);
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    let mut reps = Vec::new();
+    run(&st, &lock, &ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
+    let paths = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+    (reps, paths)
+}
+
+fn has(paths: &[Vec<u8>], p: &Path) -> bool {
+    paths.contains(&b(p))
+}
+
+fn nothing_from_a_store(paths: &[Vec<u8>], sub: &Path) {
+    let ext = b(&sub.join(".ext"));
+    assert!(
+        !paths.iter().any(|p| p.starts_with(&ext)),
+        "the sub-extant's own store was indexed: {paths:?}"
+    );
+}
+
+#[test]
+fn unregistered_sub_extant_is_skipped() {
+    let t = tree();
+    let (reps, paths) = scan(&t, &[&t.root]);
+    assert!(reps.iter().any(|r| r.kind == K::SubExtant && r.path == b(&t.sub)));
+    assert!(has(&paths, &t.root.join("top")));
+    assert!(!has(&paths, &t.sub.join("inner")));
+    nothing_from_a_store(&paths, &t.sub);
+}
+
+#[test]
+fn registered_sub_extant_is_hashed_by_the_parent() {
+    let t = tree();
+    for roots in [vec![&t.root, &t.sub], vec![&t.sub]] {
+        let roots: Vec<&Path> = roots.into_iter().map(PathBuf::as_path).collect();
+        let (reps, paths) = scan(&t, &roots);
+        let n = roots.len();
+        assert!(
+            reps.iter().all(|r| r.kind != K::SubExtant),
+            "{n} roots: {reps:?}"
+        );
+        assert!(
+            reps.iter().any(|r| r.kind == K::New && r.path == b(&t.sub.join("inner"))),
+            "{n} roots: {reps:?}"
+        );
+        assert!(has(&paths, &t.sub.join("inner")), "{n} roots");
+        nothing_from_a_store(&paths, &t.sub);
+    }
+}
+
+// The outer walk stops at the inner root, so the file is indexed once and
+// the sub-extant is not reported as excluded from the outer scan either.
+#[test]
+fn registered_sub_extant_under_a_registered_root_is_indexed_once() {
+    let t = tree();
+    let (reps, _) = scan(&t, &[&t.root, &t.sub]);
+    let news = reps
+        .iter()
+        .filter(|r| r.kind == K::New && r.path == b(&t.sub.join("inner")))
+        .count();
+    assert_eq!(news, 1, "{reps:?}");
+    assert!(reps.iter().all(|r| r.kind != K::Excluded), "{reps:?}");
+}
