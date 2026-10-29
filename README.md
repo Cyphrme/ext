@@ -280,10 +280,14 @@ indexing. (Deleting a directory also unregisters.)
 
 `ext list` - prints the source index.
 
-`ext check`, `ext -check` - Re-hash all files and compare digests. Skip
-unchanged paths.
+`ext check`, `ext -check` - Re-hash files whose metadata changed (see
+Incrementality) and record their new digests as edits. Skip unchanged paths.
 
-`ext check --full` - Re-hash all files and does not skip unchanged paths.
+`ext check --full` - Re-hash all files and do not skip unchanged paths. A
+digest that changed while the file's metadata did not is a violation: it is
+reported, the index is not updated, and `check` exits 2.
+
+`ext check --accept` - Record reported violations as the new digests.
 
 `ext -rerun` - Rebuild all indexes and re-hash all files.
 
