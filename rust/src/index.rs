@@ -93,7 +93,10 @@ impl RawRow {
 
     fn into_entry(self) -> Result<Entry, StoreError> {
         let corrupt = |why: String| {
-            StoreError::Corrupt(format!("path {}: {why}", crate::escape::escape(&self.path)))
+            StoreError::Corrupt(format!(
+                "path {}: {why}",
+                crate::escape::display(&self.path)
+            ))
         };
         let alg = Alg::from_name(&self.alg)
             .ok_or_else(|| corrupt(format!("unknown algorithm {:?}", self.alg)))?;

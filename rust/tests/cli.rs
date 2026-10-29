@@ -15,7 +15,7 @@ mod common;
 
 use assert_cmd::Command;
 use ext::digest::{Alg, Digest, Enc};
-use ext::escape::escape;
+use ext::escape::{display, escape};
 use ext::index::{Entry, Index, Meta};
 use ext::registry::RegPath;
 use ext::store::Store;
@@ -239,8 +239,7 @@ fn init_then_check_indexes_the_directory() {
     let f = base.join("f");
     let new = status_lines(&o, "NEW");
     assert!(
-        new.iter()
-            .any(|l| l[1] == escape(&p_bytes(&f)).into_bytes()),
+        new.iter().any(|l| l[1] == escape(&p_bytes(&f))),
         "no NEW for {f:?} in {}",
         o.out()
     );
@@ -362,14 +361,14 @@ fn list_format_and_order() {
     assert_eq!(o.code, 0, "{}", o.stderr);
     let expect: String = want
         .iter()
-        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::B64ut), escape(p)))
+        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::B64ut), display(p)))
         .collect();
     assert_eq!(o.out(), expect);
     // --hex: uppercase hex, same `<value>:<alg>` shape.
     let o = run(fx.ext().arg("--hex").arg("list"));
     let expect: String = want
         .iter()
-        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::Hex), escape(p)))
+        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::Hex), display(p)))
         .collect();
     assert_eq!(o.out(), expect);
 }
@@ -650,8 +649,9 @@ fn resolve_and_check_wiring() {
     assert!(fx.index().get(&p_bytes(&f)).unwrap().is_none());
 }
 
-/// S4: control, bidi, tab, newline and invalid-UTF-8 bytes in file names
-/// never reach a terminal raw, in text mode, and survive exactly under `-0`.
+/// TSV escaping: tab and newline in names cannot split or forge a record;
+/// every other byte (control, bidi, invalid UTF-8) is verbatim. `-0` gives
+/// raw paths with NUL-terminated records.
 #[test]
 fn hostile_names() {
     let fx = Fx::new();
@@ -669,41 +669,35 @@ fn hostile_names() {
         fs::write(&p, &content).unwrap();
         files.push((p_bytes(&p), content));
     }
-    let sorted = |mut v: Vec<String>| {
+    let sorted = |mut v: Vec<Vec<u8>>| {
         v.sort();
         v
     };
+    let rec = |head: &str, p: &[u8]| [head.as_bytes(), b"\t", &escape(p)].concat();
 
     let o = fx.check();
     assert_eq!(o.code, 0, "{}", o.stderr);
-    for raw in [0x1bu8, 0xff] {
-        assert!(
-            !o.stdout.contains(&raw),
-            "raw byte {raw:#x} in check output"
-        );
-    }
-    assert!(!o.out().contains('\u{202e}'));
-    let text: Vec<String> = o.out().lines().map(str::to_owned).collect();
-    assert!(text.iter().all(|l| l.split('\t').count() == 2), "{text:?}");
-    let want = files
-        .iter()
-        .map(|(p, _)| format!("NEW\t{}", escape(p)))
-        .collect();
-    assert_eq!(sorted(text), sorted(want));
+    let lines = o.lines();
+    assert!(
+        lines.iter().all(|l| l.split(|&b| b == b'\t').count() == 2),
+        "{lines:?}"
+    );
+    let want = files.iter().map(|(p, _)| rec("NEW", p)).collect();
+    assert_eq!(sorted(lines), sorted(want));
 
     for (p, c) in &files {
         let o = run(fx.ext().arg("resolve").arg(rev(c.as_bytes())));
-        assert_eq!((o.code, o.out()), (0, format!("{}\n", escape(p))));
+        assert_eq!(
+            (o.code, o.stdout),
+            (0, [escape(p), b"\n".to_vec()].concat())
+        );
     }
     let o = run(fx.ext().arg("list"));
     let want = files
         .iter()
-        .map(|(p, c)| format!("{}\t{}", rev(c.as_bytes()), escape(p)))
+        .map(|(p, c)| rec(&rev(c.as_bytes()), p))
         .collect();
-    assert_eq!(
-        sorted(o.out().lines().map(str::to_owned).collect()),
-        sorted(want)
-    );
+    assert_eq!(sorted(o.lines()), sorted(want));
 
     // -0: raw paths, NUL-terminated records.
     let nul_sorted = |o: &Out| {

@@ -4,7 +4,7 @@
 //! violation, 4 usage/config/store error, 5 incomplete scan. 3 is never used.
 
 use crate::digest::{Digest, Enc};
-use crate::escape::escape;
+use crate::escape::{display, escape};
 use crate::index::Index;
 use crate::registry::RegPath;
 use crate::scan::{self, Opts, Report, ReportKind, Summary};
@@ -119,7 +119,7 @@ impl Fmt {
         if self.nul {
             w.write_all(path)?;
         } else {
-            w.write_all(escape(path).as_bytes())?;
+            w.write_all(&escape(path))?;
         }
         for t in tail {
             w.write_all(b"\t")?;
@@ -278,7 +278,7 @@ fn unregister(store: &Store, path: &Path) -> Result<u8, CliError> {
     let lock = store.lock()?;
     let root = reg_path(path)?;
     if !store.registry()?.contains(&root) {
-        return Err(CliError::NotAnEntry(escape(root.as_bytes())));
+        return Err(CliError::NotAnEntry(display(root.as_bytes())));
     }
     let idx = Index::open(store)?;
     // Registry first: if we die between the two, the next run's reconcile
@@ -365,7 +365,7 @@ fn report_scan(
             .collect();
         // The cause is text from the OS; escape it like a path so it cannot
         // carry control bytes, and keep it a single tab-separated field.
-        tail.extend(r.detail.iter().map(|d| escape(d.as_bytes())));
+        tail.extend(r.detail.iter().map(|d| display(d.as_bytes())));
         if let Err(e) = fmt.record(w, &[label(r.kind)], &r.path, &tail) {
             write_err = Some(e);
         }
