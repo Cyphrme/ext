@@ -85,9 +85,10 @@ digest exists. Why? The digest value can always be sent. If the human readable
 value is sent, ext forces interpretation. If you don't need the human name,
 don't use it.
 
-The human name is the file's name. It is optional; when given, it must equal
-the last component of a path that has the digest. When several paths share
-the digest, one match is enough. Tags, other human-readable data describing
+The human name is the file's name, including its extension when present:
+`<human_name>:<alg>:<value>.<ext>` names the file `<human_name>.<ext>`. It is
+optional; when given, it must equal the last component of a path that has the
+digest. When several paths share the digest, one match is enough. Tags, other human-readable data describing
 a digest, are TODO.
 
 Digest with Human Name
