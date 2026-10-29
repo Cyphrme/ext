@@ -150,25 +150,13 @@ pub fn parse(bytes: &[u8]) -> Result<Config, ConfigError> {
 }
 
 impl Config {
-    /// Refuses a labelled digest whose value uses an encoding the config
-    /// disables. The encoding is told by the value's length, as the digest
-    /// parser does; a length that is neither is left to that parser's error.
-    pub fn check_input(&self, labelled: &str) -> Result<(), ConfigError> {
-        let Some((left, right)) = labelled.split_once(':') else {
-            return Ok(());
-        };
-        let (alg, value) = match (Alg::from_name(right), Alg::from_name(left)) {
-            (Some(a), _) => (a, left),
-            (None, Some(a)) => (a, right),
-            (None, None) => return Ok(()),
-        };
-        let n = value.chars().count();
-        if n == alg.hex_len() && !self.hex {
-            Err(ConfigError::InputDisabled("Hex"))
-        } else if n == alg.b64ut_len() && !self.base64 {
-            Err(ConfigError::InputDisabled("Base64"))
-        } else {
-            Ok(())
+    /// Refuses a query written in an encoding the config disables; `enc` is
+    /// what `Query::parse` found, so every query form is covered.
+    pub fn check_input(&self, enc: Enc) -> Result<(), ConfigError> {
+        match enc {
+            Enc::Hex if !self.hex => Err(ConfigError::InputDisabled("Hex")),
+            Enc::B64ut if !self.base64 => Err(ConfigError::InputDisabled("Base64")),
+            _ => Ok(()),
         }
     }
 }

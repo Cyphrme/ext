@@ -199,3 +199,96 @@ fn unregister_deleted_false_reaches_the_scan() {
         .unwrap()
         .contains("tree"));
 }
+
+// Every query form is judged by the encoding it was written in, not just the
+// labelled digest: hash:// and the name forms too.
+#[test]
+fn a_disabled_encoding_is_refused_in_every_query_form() {
+    let fx = Fx::new();
+    let (b64, hex) = (
+        Digest::compute(Alg::Sha256, CONTENT).encode(Enc::B64ut),
+        Digest::compute(Alg::Sha256, CONTENT).encode(Enc::Hex),
+    );
+    let forms = |v: &str| {
+        vec![
+            format!("hash://sha-256/{v}"),
+            format!("hash://SHA-256/{v}/tail"),
+            format!("{v}:SHA-256"),
+            format!("SHA-256:{v}"),
+            format!("SHA-256:{v}:file"),
+            format!("file:SHA-256:{v}"),
+        ]
+    };
+    fx.config("{ Hex: false }");
+    for q in forms(&hex) {
+        let (code, _, err) = fx.ext(&["resolve", &q]);
+        assert_eq!(code, 4, "{q}: {err}");
+        assert!(err.contains("Hex"), "{q}: {err}");
+    }
+    for q in forms(&b64) {
+        assert_ne!(fx.ext(&["resolve", &q]).0, 4, "{q} still allowed");
+    }
+    fx.config("{ Base64: false }");
+    for q in forms(&b64) {
+        let (code, _, err) = fx.ext(&["resolve", &q]);
+        assert_eq!(code, 4, "{q}: {err}");
+        assert!(err.contains("Base64"), "{q}: {err}");
+    }
+    for q in forms(&hex) {
+        assert_ne!(fx.ext(&["resolve", &q]).0, 4, "{q} still allowed");
+    }
+}
+
+// export and import open the store like every command, so a bad config stops
+// them too.
+#[test]
+fn export_and_import_apply_the_config() {
+    let fx = Fx::new();
+    fx.config("{ Truncation: true }");
+    let out = fx.store.parent().unwrap().join("out");
+    fs::create_dir(&out).unwrap();
+    for cmd in ["export", "import"] {
+        let (code, _, err) = fx.ext(&[cmd, out.to_str().unwrap()]);
+        assert_eq!(code, 4, "{cmd}: {err}");
+        assert!(err.contains("Truncation"), "{cmd}: {err}");
+    }
+}
+
+// Imported roots carry no recorded filesystem identity. The first scan must
+// record it, not refuse the root.
+#[test]
+fn export_import_then_check_records_identity_and_is_clean() {
+    let fx = Fx::new();
+    let tree = fx.store.parent().unwrap().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("f"), "x").unwrap();
+    assert_eq!(fx.ext(&["register", tree.to_str().unwrap()]).0, 0);
+    let out = fx.store.parent().unwrap().join("out");
+    fs::create_dir(&out).unwrap();
+    assert_eq!(fx.ext(&["export", out.to_str().unwrap()]).0, 0);
+
+    let other = fx.store.parent().unwrap().join("store2");
+    let st = Store::init_bare(&other).unwrap();
+    drop(st);
+    let run = |args: &[&str]| {
+        let o = Command::new(env!("CARGO_BIN_EXE_ext"))
+            .env("EXTANT_DIR", &other)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            o.status.code().unwrap(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+        )
+    };
+    assert_eq!(run(&["import", out.to_str().unwrap()]).0, 0);
+    let (code, stdout) = run(&["check"]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(!stdout.contains("REFUSED"), "{stdout}");
+    // The identity is now recorded: deleting the root is a deletion, not a
+    // missing mount.
+    fs::remove_dir_all(&tree).unwrap();
+    let (code, stdout) = run(&["check"]);
+    assert_eq!(code, 0, "{stdout}");
+    assert!(stdout.contains("DELETED\t"), "{stdout}");
+}

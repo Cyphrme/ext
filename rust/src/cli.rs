@@ -4,8 +4,8 @@
 //! violation, 4 usage/config/store error, 5 incomplete scan. 3 is never used.
 
 use crate::config::{Config, ConfigError};
-use crate::digest::{Digest, Enc};
-use crate::escape::escape;
+use crate::digest::{Enc, Query};
+use crate::escape::{display, escape};
 use crate::index::Index;
 use crate::registry::RegPath;
 use crate::scan::{self, Opts, Report, ReportKind, Summary};
@@ -62,6 +62,14 @@ pub enum Cmd {
         accept: bool,
     },
     Rebuild,
+    /// Write the registry, source and timestamp records as TSV into a directory.
+    Export {
+        dir: PathBuf,
+    },
+    /// Load an export into a store whose index is empty.
+    Import {
+        dir: PathBuf,
+    },
 }
 
 /// Everything that ends a command early. All of these exit 4 (Display says
@@ -78,6 +86,8 @@ enum CliError {
     },
     #[error("cannot write output: {0}")]
     Out(#[from] io::Error),
+    #[error("{0}")]
+    Transfer(#[from] crate::transfer::TransferError),
     #[error("{0}")]
     Config(#[from] ConfigError),
     #[error("{0}")]
@@ -122,7 +132,7 @@ impl Fmt {
         if self.nul {
             w.write_all(path)?;
         } else {
-            w.write_all(escape(path).as_bytes())?;
+            w.write_all(&escape(path))?;
         }
         for t in tail {
             w.write_all(b"\t")?;
@@ -219,10 +229,10 @@ fn command(cli: &Cli, w: &mut impl Write) -> Result<u8, CliError> {
         }
         Cmd::Unregister { path } => unregister(&open_store(cli)?.0, path)?,
         Cmd::Resolve { digest } => {
-            let d = Digest::parse_labelled(digest)?;
+            let q = Query::parse(digest)?;
             let (store, cfg) = open_store(cli)?;
-            cfg.check_input(digest)?;
-            resolve(&store, &d, fmt_for(cli, &cfg), w)?
+            cfg.check_input(q.enc)?;
+            resolve(&store, &q, fmt_for(cli, &cfg), w)?
         }
         Cmd::List => {
             let (store, cfg) = open_store(cli)?;
@@ -236,6 +246,18 @@ fn command(cli: &Cli, w: &mut impl Write) -> Result<u8, CliError> {
                 ..scan_opts(&cfg)
             };
             scan_locked(&store, &opts, false, fmt_for(cli, &cfg), w)?
+        }
+        Cmd::Export { dir } => {
+            let (store, _cfg) = open_store(cli)?;
+            // Writers hold this lock, so the registry and the index are read
+            // with none between them.
+            let _lock = store.lock()?;
+            crate::transfer::export(&store, dir)?;
+            0
+        }
+        Cmd::Import { dir } => {
+            crate::transfer::import(&open_store(cli)?.0, dir)?;
+            0
         }
         Cmd::Rebuild => {
             let (store, cfg) = open_store(cli)?;
@@ -311,7 +333,7 @@ fn unregister(store: &Store, path: &Path) -> Result<u8, CliError> {
     let lock = store.lock()?;
     let root = reg_path(path)?;
     if !store.registry()?.contains(&root) {
-        return Err(CliError::NotAnEntry(escape(root.as_bytes())));
+        return Err(CliError::NotAnEntry(display(root.as_bytes())));
     }
     let idx = Index::open(store)?;
     // Registry first: if we die between the two, the next run's reconcile
@@ -321,8 +343,12 @@ fn unregister(store: &Store, path: &Path) -> Result<u8, CliError> {
     Ok(0)
 }
 
-fn resolve(store: &Store, d: &Digest, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
-    let mut paths = Index::open(store)?.by_digest(d)?;
+fn resolve(store: &Store, q: &Query, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
+    let mut paths = Index::open(store)?.by_digest(&q.digest)?;
+    // A name is the filename: only paths ending in it are returned.
+    if let Some(name) = &q.name {
+        paths.retain(|p| p.rsplit(|&b| b == b'/').next() == Some(name.as_slice()));
+    }
     if paths.is_empty() {
         return Ok(EXIT_NOT_FOUND);
     }
@@ -334,10 +360,16 @@ fn resolve(store: &Store, d: &Digest, fmt: Fmt, w: &mut impl Write) -> Result<u8
 }
 
 fn list(store: &Store, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
-    let mut entries = Index::open(store)?.iter()?;
-    entries.sort_by(|a, b| (a.digest.bytes(), &a.path).cmp(&(b.digest.bytes(), &b.path)));
-    for e in &entries {
-        fmt.record(w, &[&e.digest.to_reverse(fmt.enc)], &e.path, &[])?;
+    let entries = Index::open(store)?.iter()?;
+    // The record's first field is the encoded text, so that is the sort key
+    // (the same order `export` gives `source`).
+    let mut rows: Vec<(String, &[u8])> = entries
+        .iter()
+        .map(|e| (e.digest.to_reverse(fmt.enc), e.path.as_slice()))
+        .collect();
+    rows.sort();
+    for (d, p) in &rows {
+        fmt.record(w, &[d], p, &[])?;
     }
     Ok(0)
 }
@@ -399,7 +431,7 @@ fn report_scan(
             .collect();
         // The cause is text from the OS; escape it like a path so it cannot
         // carry control bytes, and keep it a single tab-separated field.
-        tail.extend(r.detail.iter().map(|d| escape(d.as_bytes())));
+        tail.extend(r.detail.iter().map(|d| display(d.as_bytes())));
         if let Err(e) = fmt.record(w, &[label(r.kind)], &r.path, &tail) {
             write_err = Some(e);
         }

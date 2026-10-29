@@ -8,11 +8,10 @@ decides something the text leaves open, are listed one by one in
 [DIVERGENCES.md](DIVERGENCES.md), written against the spec as changed by
 PR #12 (branch `spec/consensus-fixes`, commit 5451659).
 
-Version 1 has no external services, no truncation, no `hash://` parsing, no
-human names or tags, no watcher, and no parent/sub-extant linking. Of the
-config file's keys it honours only a few (see Config). It needs Linux 5.6 or
-later (`openat2`); mount boundaries use `STATX_MNT_ID` (5.8) and fall back to
-`st_dev` with a warning.
+Version 1 has no external services, no truncation, no tags, no watcher, and no
+parent/sub-extant linking. Of the config file's keys it honours only a few (see
+Config). It needs Linux 5.6 or later (`openat2`); mount boundaries use
+`STATX_MNT_ID` (5.8) and fall back to `st_dev` with a warning.
 
 ## Build and test
 
@@ -43,12 +42,14 @@ ext [--d <path>] [--hex] [-0] <command>
 | `init --bare <path>` | Create a flat store at `<path>` with an empty registry. This is how `/var/lib/ext` is made. |
 | `register <path>`, `-r <path>` | Add the directory (canonicalised) to the registry and scan it. Registering an already registered root re-records its filesystem identity and keeps its entries. |
 | `unregister <path>`, `-u <path>` | Remove an exact registry entry and every index entry under it. |
-| `resolve <digest>` | Print the paths whose last-scanned content has this digest, sorted by bytes. |
-| `list` | Print every `<digest>:SHA-256<TAB><path>`, sorted by digest bytes then path bytes. |
+| `resolve <arg>` | Print the paths whose last-scanned content has this digest, sorted by bytes. With a name, only paths whose filename equals it. |
+| `list` | Print every `<digest>:SHA-256<TAB><path>`, sorted by the printed digest text then path bytes. |
 | `check` | Scan the registered roots, hash files whose metadata changed, report differences. Accepts ordinary edits into the index. |
 | `check --full` | Hash every file regardless of metadata. A digest change under unchanged metadata is a `VIOLATION`, not written. |
 | `check --accept` | As `check`, but write violations into the index as the new baseline (reported `ACCEPTED`). |
 | `rebuild` | Clear the index, then hash everything and accept it. |
+| `export <dir>` | Write `registry`, `source` and `timestamp` (TSV, see Export and import) into the existing directory `<dir>`. |
+| `import <dir>` | Load an export into a store whose index is empty and replace its registry. Exit 4 otherwise. |
 
 Global options:
 
@@ -58,9 +59,20 @@ Global options:
 | `--hex` | Print digests as uppercase hex instead of b64ut. |
 | `-0` | End records with NUL instead of newline and print paths raw (unescaped). |
 
-Digest arguments to `resolve` must be labelled and full length: `<value>:SHA-256`
-or `SHA-256:<value>`, where `<value>` is 43 b64ut characters or 64 hex
-characters (either case).
+Arguments to `resolve`, full length only: `<value>` is 43 b64ut characters or
+64 hex characters (either case), and the encoding is decided by length.
+
+| Form | Meaning |
+|---|---|
+| `<value>:SHA-256`, `SHA-256:<value>` | Digest only. |
+| `hash://<alg>/<digest>[tail]` | Scheme and `alg` match in any case; the digest is case-sensitive; the tail (from the first character outside `A-Za-z0-9-_`) is ignored. |
+| `SHA-256:<value>:<name>`, `<value>:SHA-256:<name>` | Digest and filename. |
+| `<name>:SHA-256:<value>`, `<name>:SHA-256:<value>.<ext>` | Digest and filename; with `.<ext>` the filename is `<name>.<ext>`. |
+
+A name is a filename, extension included: only paths whose last component
+equals it are printed, and none is exit 1. Names may contain `:`; the label
+and the digest beside it are found first. Outside `hash://` the algorithm name
+is exact (`SHA-256`). A name is not empty and has no `/`.
 
 ## Exit codes
 
@@ -103,13 +115,12 @@ Files that are hashed with an equal digest are not printed. A counts line
 (`new=… edited=… unchanged=… skipped=… symlinks=… special=…`) goes to stderr
 after every scan.
 
-Paths are escaped on output: `\` becomes `\\`, and every byte of a control
-character (C0, DEL, C1), of an invalid UTF-8 sequence, and of a Unicode bidi
-control becomes `\xNN` (uppercase). Other valid UTF-8 is printed as is. The
-escaping is injective, so an escaped name never collides with another path. With
-`-0` paths are written raw and records end in NUL; a raw path may then contain
-tabs or newlines, so split on NUL first. Causes (OS error text) are always
-escaped.
+Paths are TSV-escaped on output: `\` becomes `\\`, tab `\t` and newline `\n`.
+Every other byte, including control characters, escape sequences and invalid
+UTF-8, is printed as is, so output sent to a terminal can carry control
+sequences. The escaping is injective and a record never spans lines or gains
+a field. With `-0` paths are written raw and records end in NUL; a raw path
+may then contain tabs or newlines, so split on NUL first.
 
 ## Store
 
@@ -151,7 +162,7 @@ one is exit 4 for every command that opens the store. Keys:
 
 An unknown key is an error.
 
-**Registry.** One absolute path per line, escaped as above. Blank lines and
+**Registry.** One absolute path per line, TSV-escaped as above (it need not be UTF-8). Blank lines and
 lines starting with `#` are ignored. `//` and a trailing `/` are collapsed; `.`
 and `..` segments are rejected. Duplicates are dropped. The file is replaced
 atomically (temp file, fsync, rename). The registry is authoritative: every
@@ -164,8 +175,30 @@ files, so an interrupted run loses at most uncommitted work and the next run
 converges.
 
 **Locking.** `register`, `unregister`, `check` and `rebuild` hold an
-exclusive `flock` on `lock` for the whole run and wait for it. `resolve` and
-`list` do not lock.
+exclusive `flock` on `lock` for the whole run and wait for it. `import` and `export` take the same lock.
+`resolve` and `list` do not lock. `export` takes the lock so that the
+registry and index it writes agree.
+
+## Export and import
+
+`ext export <dir>` writes three TSV files (format: <https://github.com/Cyphrme/TSV>)
+into an existing directory, each through a temp file renamed into place:
+
+| File | Record |
+|---|---|
+| `registry` | `<path>` |
+| `source` | `<digest>:SHA-256<TAB><path>`, digest in b64ut |
+| `timestamp` | `<path><TAB><last_checked><TAB><mtime><TAB><ctime><TAB><size><TAB><inode><TAB><dev>` |
+
+Times are nanoseconds. Records are sorted by the raw (unescaped) bytes of the
+first field, with the path breaking ties in `source`. `ext import <dir>` needs
+an empty index, validates every record (digest syntax, absolute normalised
+path under a registered root, canonical decimal numbers, a `source` and a
+`timestamp` record for each path, files ending in a newline), then writes the
+rows in one transaction and replaces the registry, all under the store lock. An
+invalid record aborts the import with nothing written and the message
+`<file>:<line>: <why>`. Root filesystem identities are not exported; the first
+scan after an import records them.
 
 ## Change detection
 

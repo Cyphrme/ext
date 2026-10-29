@@ -1,7 +1,7 @@
 //! Reconcile, walk, hash, classify, and write the index.
 
 use crate::digest::{Alg, Digest};
-use crate::escape::escape;
+use crate::escape::display;
 use crate::fresh::{classify, should_skip, MetaCmp, Status};
 use crate::hash::{hash_stable, HashError};
 use crate::index::{Entry, Index, Meta, RootId};
@@ -142,7 +142,7 @@ pub fn run_hooked(
     let roots = store.registry()?;
     if let Some(only) = &opts.only {
         if !roots.contains(only) {
-            return Err(StoreError::NotRegistered(escape(only.as_bytes())));
+            return Err(StoreError::NotRegistered(display(only.as_bytes())));
         }
     }
     // The registry is authoritative: entries outside it go before anything

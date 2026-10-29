@@ -15,7 +15,7 @@ mod common;
 
 use assert_cmd::Command;
 use ext::digest::{Alg, Digest, Enc};
-use ext::escape::escape;
+use ext::escape::{display, escape};
 use ext::index::{Entry, Index, Meta};
 use ext::registry::RegPath;
 use ext::store::Store;
@@ -239,8 +239,7 @@ fn init_then_check_indexes_the_directory() {
     let f = base.join("f");
     let new = status_lines(&o, "NEW");
     assert!(
-        new.iter()
-            .any(|l| l[1] == escape(&p_bytes(&f)).into_bytes()),
+        new.iter().any(|l| l[1] == escape(&p_bytes(&f))),
         "no NEW for {f:?} in {}",
         o.out()
     );
@@ -342,34 +341,37 @@ fn seeded_many(fx: &Fx) -> Vec<(Digest, Vec<u8>)> {
     v
 }
 
-/// §5 list: `<value>:<alg>\t<escaped path>`, sorted by (digest, path) bytes.
+/// §5 list: `<value>:<alg>\t<escaped path>`, sorted by (encoded digest text, path) bytes,
+/// the order `export` gives `source`.
 #[test]
 fn list_format_and_order() {
     let fx = Fx::new();
     let mut want = seeded_many(&fx);
-    want.sort_by(|a, b| (a.0.bytes(), &a.1).cmp(&(b.0.bytes(), &b.1)));
-    let by_text = {
-        let mut t: Vec<String> = want.iter().map(|(d, _)| d.to_reverse(Enc::B64ut)).collect();
-        t.sort();
-        t
-    };
-    let in_byte_order: Vec<String> = want.iter().map(|(d, _)| d.to_reverse(Enc::B64ut)).collect();
+    let text = |d: &Digest| d.to_reverse(Enc::B64ut);
+    let mut by_bytes = want.clone();
+    by_bytes.sort_by(|a, b| (a.0.bytes(), &a.1).cmp(&(b.0.bytes(), &b.1)));
+    want.sort_by(|a, b| (text(&a.0).as_bytes(), &a.1).cmp(&(text(&b.0).as_bytes(), &b.1)));
     assert_ne!(
-        by_text, in_byte_order,
+        want.iter().map(|w| text(&w.0)).collect::<Vec<_>>(),
+        by_bytes.iter().map(|w| text(&w.0)).collect::<Vec<_>>(),
         "fixture premise: text order must differ from digest-byte order"
     );
     let o = run(fx.ext().arg("list"));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let expect: String = want
         .iter()
-        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::B64ut), escape(p)))
+        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::B64ut), display(p)))
         .collect();
     assert_eq!(o.out(), expect);
-    // --hex: uppercase hex, same `<value>:<alg>` shape.
+    // --hex: uppercase hex, same shape, sorted by the hex text.
+    want.sort_by(|a, b| {
+        let h = |d: &Digest| d.to_reverse(Enc::Hex);
+        (h(&a.0).as_bytes(), &a.1).cmp(&(h(&b.0).as_bytes(), &b.1))
+    });
     let o = run(fx.ext().arg("--hex").arg("list"));
     let expect: String = want
         .iter()
-        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::Hex), escape(p)))
+        .map(|(d, p)| format!("{}\t{}\n", d.to_reverse(Enc::Hex), display(p)))
         .collect();
     assert_eq!(o.out(), expect);
 }
@@ -650,8 +652,9 @@ fn resolve_and_check_wiring() {
     assert!(fx.index().get(&p_bytes(&f)).unwrap().is_none());
 }
 
-/// S4: control, bidi, tab, newline and invalid-UTF-8 bytes in file names
-/// never reach a terminal raw, in text mode, and survive exactly under `-0`.
+/// TSV escaping: tab and newline in names cannot split or forge a record;
+/// every other byte (control, bidi, invalid UTF-8) is verbatim. `-0` gives
+/// raw paths with NUL-terminated records.
 #[test]
 fn hostile_names() {
     let fx = Fx::new();
@@ -669,41 +672,35 @@ fn hostile_names() {
         fs::write(&p, &content).unwrap();
         files.push((p_bytes(&p), content));
     }
-    let sorted = |mut v: Vec<String>| {
+    let sorted = |mut v: Vec<Vec<u8>>| {
         v.sort();
         v
     };
+    let rec = |head: &str, p: &[u8]| [head.as_bytes(), b"\t", &escape(p)].concat();
 
     let o = fx.check();
     assert_eq!(o.code, 0, "{}", o.stderr);
-    for raw in [0x1bu8, 0xff] {
-        assert!(
-            !o.stdout.contains(&raw),
-            "raw byte {raw:#x} in check output"
-        );
-    }
-    assert!(!o.out().contains('\u{202e}'));
-    let text: Vec<String> = o.out().lines().map(str::to_owned).collect();
-    assert!(text.iter().all(|l| l.split('\t').count() == 2), "{text:?}");
-    let want = files
-        .iter()
-        .map(|(p, _)| format!("NEW\t{}", escape(p)))
-        .collect();
-    assert_eq!(sorted(text), sorted(want));
+    let lines = o.lines();
+    assert!(
+        lines.iter().all(|l| l.split(|&b| b == b'\t').count() == 2),
+        "{lines:?}"
+    );
+    let want = files.iter().map(|(p, _)| rec("NEW", p)).collect();
+    assert_eq!(sorted(lines), sorted(want));
 
     for (p, c) in &files {
         let o = run(fx.ext().arg("resolve").arg(rev(c.as_bytes())));
-        assert_eq!((o.code, o.out()), (0, format!("{}\n", escape(p))));
+        assert_eq!(
+            (o.code, o.stdout),
+            (0, [escape(p), b"\n".to_vec()].concat())
+        );
     }
     let o = run(fx.ext().arg("list"));
     let want = files
         .iter()
-        .map(|(p, c)| format!("{}\t{}", rev(c.as_bytes()), escape(p)))
+        .map(|(p, c)| rec(&rev(c.as_bytes()), p))
         .collect();
-    assert_eq!(
-        sorted(o.out().lines().map(str::to_owned).collect()),
-        sorted(want)
-    );
+    assert_eq!(sorted(o.lines()), sorted(want));
 
     // -0: raw paths, NUL-terminated records.
     let nul_sorted = |o: &Out| {
@@ -892,4 +889,91 @@ fn error_line_carries_the_detail() {
     let o = fx.check();
     fs::set_permissions(&f, fs::Permissions::from_mode(0o600)).unwrap();
     assert_detail(&o, "ERROR");
+}
+
+// -------------------------------------------- resolve: URIs and human names
+
+fn resolved(fx: &Fx, arg: &str) -> (i32, String) {
+    let o = run(fx.ext().arg("resolve").arg(arg));
+    (o.code, o.out())
+}
+
+/// Three paths hold the content; the name filters by last component.
+#[test]
+fn resolve_hash_uri_and_names() {
+    let fx = Fx::new();
+    for p in [
+        &b"/x/a/notes.txt"[..],
+        b"/x/b/notes.txt",
+        b"/x/c/xnotes.txt",
+        b"/x/d/other",
+        b"/x/notes.txt/inner",
+    ] {
+        fx.seed(p, b"hello");
+    }
+    let v = rev(b"hello");
+    let v = v.strip_suffix(":SHA-256").unwrap();
+    let all = "/x/a/notes.txt\n/x/b/notes.txt\n/x/c/xnotes.txt\n/x/d/other\n/x/notes.txt/inner\n";
+    let notes = "/x/a/notes.txt\n/x/b/notes.txt\n";
+
+    for arg in [
+        format!("hash://SHA-256/{v}"),
+        format!("hash://sha-256/{v}.png"),
+        format!("HASH://SHA-256/{v}/tail"),
+    ] {
+        assert_eq!(resolved(&fx, &arg), (0, all.into()), "{arg}");
+    }
+    for arg in [
+        format!("notes.txt:SHA-256:{v}"),
+        format!("SHA-256:{v}:notes.txt"),
+        format!("{v}:SHA-256:notes.txt"),
+        format!("notes:SHA-256:{v}.txt"),
+    ] {
+        assert_eq!(resolved(&fx, &arg), (0, notes.into()), "{arg}");
+    }
+    // One match among several paths suffices; the others are not returned.
+    assert_eq!(
+        resolved(&fx, &format!("other:SHA-256:{v}")),
+        (0, "/x/d/other\n".into())
+    );
+    // Hex input in any case, uppercase hex output under --hex is unchanged.
+    let h = dg(b"hello").encode(Enc::Hex).to_lowercase();
+    assert_eq!(
+        resolved(&fx, &format!("notes.txt:SHA-256:{h}")),
+        (0, notes.into())
+    );
+    // The digest exists but no path has that filename: not found.
+    for arg in [
+        format!("notes:SHA-256:{v}"),
+        format!("nothing:SHA-256:{v}.txt"),
+        format!("SHA-256:{v}:a"),
+    ] {
+        assert_eq!(resolved(&fx, &arg), (1, String::new()), "{arg}");
+    }
+    // A name never makes an absent digest present.
+    let absent = rev(b"absent");
+    let absent = absent.strip_suffix(":SHA-256").unwrap();
+    assert_eq!(resolved(&fx, &format!("notes.txt:SHA-256:{absent}")).0, 1);
+    // Malformed arguments are usage errors.
+    for arg in [
+        format!("hash://SHA-256/{}", &v[..40]),
+        format!("a/b:SHA-256:{v}"),
+        format!("x:sha-256:{v}"),
+    ] {
+        assert_eq!(resolved(&fx, &arg).0, 4, "{arg}");
+    }
+}
+
+/// Filenames compare as raw bytes, so a name with a tab matches and the
+/// path prints escaped.
+#[test]
+fn resolve_name_matches_raw_bytes() {
+    let fx = Fx::new();
+    fx.seed(b"/x/t\tb", b"hello");
+    let v = rev(b"hello");
+    let v = v.strip_suffix(":SHA-256").unwrap();
+    assert_eq!(
+        resolved(&fx, &format!("t\tb:SHA-256:{v}")),
+        (0, "/x/t\\tb\n".into())
+    );
 }
