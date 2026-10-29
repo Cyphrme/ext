@@ -323,6 +323,8 @@ reported, the index is not updated, and `check` exits 2.
 - 2 - Mismatch (`check`)
 - 3 - Ambiguous
 - 4 - Usage or configuration error
+- 5 - Incomplete: some paths could not be read or were refused, and no
+  mismatch was found. A mismatch (2) takes precedence.
 
 ## Incrementality
 Incrementality uses a persistent timestamp index and an optional continuous
