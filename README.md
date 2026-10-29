@@ -22,7 +22,12 @@ The system-wide registry is kept by default in `/var/lib/ext/registry`. Files
 may be registered by `ext -r <path>` or by editing the registry file.
 
 **Subdirectory Registration**
-Sub-extants keep their own registries in `<sub-extant_path>/registry`.
+A sub-extant keeps its store in `<sub-extant_path>/.ext/`, which holds its
+registry. A directory is a sub-extant only if its `.ext/` is a directory
+containing a registry, both owned by the owner of the parent's registered
+root or by root. Any other `.ext` is ordinary content, so creating one cannot
+hide a subtree from the parent. A sub-extant works standalone: `ext init
+<dir>`, then `ext --d <dir> ...`.
 
 Sub-extants may be registered to a parent extant.
 
@@ -379,8 +384,9 @@ COLLISION - Two distinct payloads resolve to the same digest.
   In `hash:` the digest's algorithm is the authority, so ni's empty authority
   (`///`) is not needed.
 
-**Recursion** - Recursion is not supported. If an ext path contains another ext,
-it is ignored. Subdirectories must be explicitly registered.
+**Recursion** - A parent's scan skips sub-extants; they are not included by
+default. Registering a sub-extant to the parent includes it: the parent hashes
+the sub-extant's files itself and does not read the sub-extant's index.
 
 **Digest Labeling** - Unlabeled digests are a security concern: the weakest hash
 becomes the security floor of the system overall. A system with unlabeled
