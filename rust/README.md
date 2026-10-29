@@ -6,7 +6,9 @@ implementation of the userspace part of the Extant design in the repository's
 root [README](../README.md). The places where it departs from that text, or
 decides something the text leaves open, are listed one by one in
 [DIVERGENCES.md](DIVERGENCES.md), written against the spec as changed by
-PR #12 (branch `spec/consensus-fixes`, commit 5451659).
+PR #12 (branch `spec/consensus-fixes`, commit 5451659, with `docs/traversal.md`).
+Each entry there is marked as following the spec, differing from it, or
+deferred.
 
 Version 1 has no external services, no truncation, no tags, no watcher, and no
 parent/sub-extant linking. Of the config file's keys it honours only a few (see
@@ -47,7 +49,7 @@ ext [--d <path>] [--hex] [-0] <command>
 | `check` | Scan the registered roots, hash files whose metadata changed, report differences. Accepts ordinary edits into the index. |
 | `check --full` | Hash every file regardless of metadata. A digest change under unchanged metadata is a `VIOLATION`, not written. |
 | `check --accept` | As `check`, but write violations into the index as the new baseline (reported `ACCEPTED`). |
-| `rebuild` | Clear the index, then hash everything and accept it. |
+| `rebuild` | Clear the index, then hash everything and accept it. The spec's `-rerun` and `-check` spellings are not accepted (exit 4). |
 | `export <dir>` | Write `registry`, `source` and `timestamp` (TSV, see Export and import) into the existing directory `<dir>`. |
 | `import <dir>` | Load an export into a store whose index is empty and replace its registry. Exit 4 otherwise. |
 
@@ -124,14 +126,17 @@ may then contain tabs or newlines, so split on NUL first.
 
 ## Store
 
-A store is a directory containing `registry`, `index.db` and `lock`, and optionally `config`.
+A store is a directory containing `registry`, `index.db` and `lock` as regular files, and optionally `config`.
 
 **Location**, first match wins:
 
 1. `--d <path>`
 2. `EXTANT_DIR` (empty counts as unset)
-3. `/var/lib/ext`
-4. `./.ext`
+3. `/var/lib/ext`, if it is a store
+4. `./.ext`, if it is a store (the spec says "current directory"; see DIVERGENCES)
+
+Steps 3 and 4 are skipped when nothing is there; if no step yields a store the
+command fails with exit 4.
 
 When `ext` runs with elevated privilege (secure exec, effective uid 0, or an effective uid or
 gid that differs from the real one), steps 2 and 4 are skipped.
