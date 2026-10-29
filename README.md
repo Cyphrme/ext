@@ -80,6 +80,11 @@ digest exists. Why? The digest value can always be sent. If the human readable
 value is sent, ext forces interpretation. If you don't need the human name,
 don't use it.
 
+The human name is the file's name. It is optional; when given, it must equal
+the last component of a path that has the digest. When several paths share
+the digest, one match is enough. Tags, other human-readable data describing
+a digest, are TODO.
+
 Digest with Human Name
 <alg>:<value>:<human_name>
 
@@ -189,7 +194,7 @@ Truncation is supported but disabled by default. For example:
 Note that the strength of the integrity protection is lessened with truncation.
 
 **Collision**
-A collision is where two files resolve to a single digest. This may happen when
+A collision is where two distinct inputs resolve to a single digest. This may happen when
 using a non-cryptographic hash, truncation, or a broken cryptographic hash.
 Although `ext` is designed for cryptographic hashes, there are circumstances
 where non-cryptographic hashes are useful, such as speed and smaller lookup
