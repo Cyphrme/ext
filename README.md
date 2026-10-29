@@ -50,9 +50,10 @@ Cache:      <digest>:<alg>\t<path>
 Cache Time: <digest>:<alg>\t<time>
 Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>
 
-Records are newline delimited and fields are tab delimited. A path containing
-a newline, tab, or backslash is written with that character escaped as `\n`,
-`\t`, or `\\`.
+Index files are TSV as defined in https://github.com/Cyphrme/TSV: fields are
+tab delimited, records are newline delimited, and a backslash, tab, or newline
+in a field is escaped as `\\`, `\t`, or `\n`. Records are sorted by the raw
+bytes of their first field.
 
 External service URIs are not stored in the system indexes.
 
