@@ -2,7 +2,7 @@
 
 This lists where the implementation departs from the spec, or decides
 something the spec leaves open. It is written against `README.md` as changed by
-PR #12 (branch `spec/consensus-fixes`, commit 5451659, with `docs/traversal.md`),
+PR #12 (branch `spec/consensus-fixes`, commit 4cdcefd, with `docs/traversal.md`),
 which records a decision on every issue #1-#10 and #13. The spec is cited by
 section name, since line numbers move. "Issue" is an issue in Cyphrme/ext;
 "new" means no issue covers the point. Each entry carries one status:
@@ -10,10 +10,16 @@ section name, since line numbers move. "Issue" is an issue in Cyphrme/ext;
 - **follows**: the code does what the spec text says. The entry only records
   details the spec leaves to the implementation.
 - **differs**: the spec decides the point and the code does something else.
-  The entry says how, and why.
+  The entry says how, and why, and is one of two kinds:
+  - *implementation choice*: non-normative; the spec leaves the point to the
+    implementer, or the code is stricter or richer than the spec, and no other
+    implementation, exported file or script written to the spec would observe
+    the difference.
+  - *interface difference*: another implementation, an exported file or a
+    script would observe it. These should be raised with the spec author.
 - **deferred**: the spec describes it and v1 does not implement it.
 - **open**: the spec leaves the point undecided; the entry names the question.
-  No entry is open at 5451659.
+  No entry is open at 4cdcefd.
 
 Behaviour the spec now states and this implementation follows: the store is
 never indexed (README, Extant Registry and Index paths); a per-file read error is reported and does not abort the
@@ -26,7 +32,7 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## Index and registry
 
-### SQLite index with TSV export and import (differs, #1)
+### SQLite index with TSV export and import (differs: implementation choice, #1)
 
 - Spec: README, Extant Registry and Index paths, "Indexes are kept in `<extant_path>/<index_name>`", with the text
   record formats under File Formats and the TSV rule there (records sorted by the raw bytes
@@ -52,6 +58,11 @@ into unless registered (README, Technical Considerations: Recursion).
   imported one and the index is empty. Rerunning the import is safe.
 - Why: lookup by digest and by path, atomic updates and safe concurrent writers
   come from one file, and the export gives the portable form.
+- Kind: the export files use the spec's record formats, so the portable form
+  conforms. A second implementation reading this store directory in place would
+  find `index.db` rather than TSV index files; it must go through `export`.
+  The file names `source` and `timestamp` and the `export`/`import` commands
+  are this code's.
 
 ### Escaped paths (follows, #1)
 
@@ -69,17 +80,16 @@ into unless registered (README, Technical Considerations: Recursion).
 - Consequence: text output can carry terminal control sequences from file
   names. The earlier `\xNN` scheme prevented that; it was dropped to follow TSV.
 
-### Timestamp record (differs; directory records deferred)
+### Timestamp record (follows; directory records deferred)
 
-- Spec: README, File Formats: `<path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>`; Incrementality:
-  skip rule; Incrementality: "A configuration option may disable the ctime and inode
-  comparisons".
+- Spec: README, File Formats: `<path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>\t<dev>`;
+  Incrementality: skip rule, and the option that disables the ctime, inode and
+  dev comparisons.
 - Does: the same skip and racy rules (`max(mtime, ctime) >= last_checked - 2 s`,
-  `last_checked` read before the file's metadata). It also stores and compares
-  the device number, which `export` writes as a seventh, trailing field
-  (`<dev>`) of the Timestamp record; times are integer nanoseconds. The device
-  goes with the inode: the config key `CompareCtimeInode` (default true) false
-  compares only size and mtime, and the racy rule still reads the stored ctime.
+  `last_checked` read before the file's metadata). `export` writes `<dev>` as
+  the seventh, trailing field; times are integer nanoseconds. The config key
+  `CompareCtimeInode` (default true) false compares only size and mtime, and
+  the racy rule still reads the stored ctime.
   Directory records (Incrementality, Directories, "may also be recorded") are
   deferred; every file is examined by the rule above.
 - Why: an inode number is only meaningful with its device.
@@ -93,7 +103,7 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## Trust, stores and locations
 
-### Store ownership, mode and ancestors (differs, #2)
+### Store ownership, mode and ancestors (differs: implementation choice, #2)
 
 - Spec: README, Trust: a store "must be owned by the user running `ext`", and
   `ext` refuses any other; a system-wide store serving other users is future
@@ -120,7 +130,7 @@ into unless registered (README, Technical Considerations: Recursion).
   without `--d` or `EXTANT_DIR` reaches it first and gets exit 4 (foreign
   owner), even with `./.ext` present; that follows from the specced order.
 
-### `--d` names the store (differs)
+### `--d` names the store (differs: implementation choice)
 
 - Spec: README, Directories and Commands: "`ext --d <path>` - Specifies the working directory".
 - Does: `--d` names the store, or a directory whose `.ext` is a store. `init`
@@ -145,7 +155,7 @@ into unless registered (README, Technical Considerations: Recursion).
 - Why: a key that is accepted and ignored would let an operator believe a policy
   is in force.
 
-### `init` layout (differs, #13)
+### `init` layout (differs: implementation choice, #13)
 
 - Spec: README, Commands: "Create a `ext` directory with a new registry. If no
   path is specified CWD is used."; Subdirectory Registration puts a store in
@@ -231,7 +241,7 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## Sub-extants and traversal
 
-### Sub-extant marker (differs, #8, #13)
+### Sub-extant marker (differs: implementation choice, #8, #13)
 
 - Spec: README, Subdirectory Registration: a sub-extant keeps its store in
   `<dir>/.ext/`; it is a sub-extant "only if its `.ext/` is a directory
@@ -254,6 +264,10 @@ into unless registered (README, Technical Considerations: Recursion).
   content would index itself. Requiring all three files that `init` creates
   stops a planted `.ext` from hiding a subtree. The spec's own marker is
   weaker; adopting the stricter one is for its author.
+- Kind: a store created by another implementation with only a `registry` would
+  be indexed as content here, so this is arguably observable across
+  implementations; classed as a choice because stores made by `ext init` are
+  recognised by both rules.
 
 ### Sub-extant linking (follows, #13)
 
@@ -320,7 +334,7 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## Commands
 
-### `register` and `unregister` arguments (differs)
+### `register` and `unregister` arguments (differs: interface difference)
 
 - Spec: README, Commands: `register` "Supports both files and directories";
   URIs are covered under External services.
@@ -330,31 +344,28 @@ into unless registered (README, Technical Considerations: Recursion).
 - Why: the walk is rooted at directories; exact matching avoids removing a
   parent by accident.
 
-### `check` and `rebuild` (differs, #10)
+### `check` and `rebuild` (follows, #10)
 
-- Spec: README, Commands: `ext check`, `ext -check`, `ext check --full`,
-  `ext check --accept`, `ext -rerun` ("Rebuild all indexes and re-hash all
-  files"). A digest change under unchanged metadata is a violation: reported,
+- Spec: README, Commands: `ext check`, `ext check --full`, `ext check --accept`,
+  `ext rebuild` ("Rebuild all indexes and re-hash all files"). A digest change under unchanged metadata is a violation: reported,
   index not updated, exit 2.
 - Follows: `check`, `check --full` (violation, exit 2, not written) and
   `check --accept` (writes the new digests, reported `ACCEPTED`, exit 0). A file
   whose metadata changed and whose digest differs is `EDITED`, reported with
   both digests, and the index is updated.
-- Differs: `rebuild` replaces `-rerun`: it clears the index, re-hashes, and
-  accepts everything. The spellings `-check` and `-rerun` are not accepted; both
-  are exit 4 (checked by a run), since `-c` and `-e` parse as unknown short
-  options.
+- `rebuild` clears the index, re-hashes, and accepts everything. The earlier
+  spellings `-check` and `-rerun` are not accepted (exit 4, checked by a run).
 - Why: tampering that preserves metadata is distinguishable from an edit only by
   `--full`, and must not be absorbed silently.
 
-### Exit codes (differs, #10)
+### Exit codes (follows, #10)
 
 - Spec: README, Exit codes: 0 OK, 1 not found, 2 mismatch (`check`), 3 ambiguous, 4 usage
-  or configuration error.
+  or configuration error, 5 incomplete (a mismatch takes precedence).
 - Does: 0, 1 (`resolve` found nothing), 2 (an unaccepted violation, the
   mismatch) and 4 (usage, configuration or store error, including the argument
   parser's own errors) as specced. 3 is never emitted: ambiguity needs
-  truncation, which is not supported. 5 is an addition: the scan was incomplete
+  truncation, which is off (conformant). 5, in the spec as "Incomplete", is a scan that was incomplete
   (`ERROR`, `UNSTABLE` or `REFUSED`) and no violation was found. A violation
   outranks an incomplete scan; a store or database failure during a scan exits 4.
   `MISSING`, `DELETED`, `EXCLUDED`, `MOUNT`, `SUBEXTANT` and `ACCEPTED` exit 0. A closed
@@ -363,13 +374,13 @@ into unless registered (README, Technical Considerations: Recursion).
 - Why: per-file errors do not abort a scan (README, Extant Registry and Index paths), so a script needs a code that
   says coverage was partial; reusing 2 would conflate it with tampering.
 
-### Flags and commands the spec lacks (differs)
+### Flags and commands the spec lacks (differs: implementation choice)
 
 - Spec: README, Commands lists `-r`, `-u`, `--d`, `check --full` and
-  `check --accept`; these are implemented as specced (`-r`/`-u` as short names
+  `check --accept`, `rebuild`; these are implemented as specced (`-r`/`-u` as short names
   of `register`/`unregister`).
 - Does, beyond the spec: global `--hex` (the spec fixes hex output as
-  uppercase but names no flag), global `-0`, `init --bare`, `rebuild` (above),
+  uppercase but names no flag), global `-0`, `init --bare`,
   and `export` and `import` (see the SQLite entry).
 
 ### Not implemented (deferred)

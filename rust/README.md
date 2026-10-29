@@ -6,9 +6,9 @@ implementation of the userspace part of the Extant design in the repository's
 root [README](../README.md). The places where it departs from that text, or
 decides something the text leaves open, are listed one by one in
 [DIVERGENCES.md](DIVERGENCES.md), written against the spec as changed by
-PR #12 (branch `spec/consensus-fixes`, commit 5451659, with `docs/traversal.md`).
-Each entry there is marked as following the spec, differing from it, or
-deferred.
+PR #12 (branch `spec/consensus-fixes`, commit 4cdcefd, with `docs/traversal.md`).
+Each entry there is marked as following the spec, deferred, or differing from
+it as an implementation choice or an interface difference.
 
 Version 1 has no external services, no truncation, no tags, no watcher, and no
 parent/sub-extant linking. Of the config file's keys it honours only a few (see
@@ -49,7 +49,7 @@ ext [--d <path>] [--hex] [-0] <command>
 | `check` | Scan the registered roots, hash files whose metadata changed, report differences. Accepts ordinary edits into the index. |
 | `check --full` | Hash every file regardless of metadata. A digest change under unchanged metadata is a `VIOLATION`, not written. |
 | `check --accept` | As `check`, but write violations into the index as the new baseline (reported `ACCEPTED`). |
-| `rebuild` | Clear the index, then hash everything and accept it. The spec's `-rerun` and `-check` spellings are not accepted (exit 4). |
+| `rebuild` | Clear the index, then hash everything and accept it. The earlier `-rerun` and `-check` spellings are not accepted (exit 4). |
 | `export <dir>` | Write `registry`, `source` and `timestamp` (TSV, see Export and import) into the existing directory `<dir>`. |
 | `import <dir>` | Load an export into a store whose index is empty and replace its registry. Exit 4 otherwise. |
 
@@ -85,7 +85,7 @@ is exact (`SHA-256`). A name is not empty and has no `/`.
 | 2 | Mismatch: `check` found an unaccepted `VIOLATION`. |
 | 3 | Ambiguous. Never emitted, because truncation is not supported. |
 | 4 | Usage or configuration error, including a malformed registry, an untrusted store, and a failed write. Message on stderr. |
-| 5 | Not in the spec: the scan was incomplete (at least one `ERROR`, `UNSTABLE` or `REFUSED`) and found no violation. Per-file errors do not abort a scan, so a script needs a code that says coverage was partial. |
+| 5 | Incomplete (in the spec): the scan was incomplete (at least one `ERROR`, `UNSTABLE` or `REFUSED`) and found no violation. Per-file errors do not abort a scan, so a script needs a code that says coverage was partial. |
 
 A store or database failure during a scan exits 4 even if earlier records were
 printed. When both a violation and an incomplete item occur, the exit code is 2.
