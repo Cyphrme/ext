@@ -213,13 +213,18 @@ The order of operations for the lookups is:
 
 The cache has two indexes which provide O(log(n)) lookups, the Cache Index
 comprised of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.
-Once the cache reaches capacity, the oldest items are removed.
+Cache capacity is set in bytes in the config. Once the cache reaches capacity,
+the least recently used items are evicted.
 
 A fetched blob is hashed in full with the requested alg and compared with the
 requested digest before it is cached or returned. On mismatch it is discarded,
 nothing is cached, and the error names the service. Fetch size and timeout
 limits are configurable. By default, redirects to a different scheme are not
-followed. The cache records the origin service of each entry.
+followed, and a service may not direct `ext` to a loopback or other local
+address. A config option can relax both.
+
+A cache record holds the alg and digest, the origin service, the local file
+name (derived only from the verified digest), and the last access time.
 
 ## Directories
 `ext` checks for stores, indexes, and registrations. Default system wide userland
