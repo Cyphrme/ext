@@ -59,7 +59,9 @@ fn nothing_from_a_store(paths: &[Vec<u8>], sub: &Path) {
 fn unregistered_sub_extant_is_skipped() {
     let t = tree();
     let (reps, paths) = scan(&t, &[&t.root]);
-    assert!(reps.iter().any(|r| r.kind == K::SubExtant && r.path == b(&t.sub)));
+    assert!(reps
+        .iter()
+        .any(|r| r.kind == K::SubExtant && r.path == b(&t.sub)));
     assert!(has(&paths, &t.root.join("top")));
     assert!(!has(&paths, &t.sub.join("inner")));
     nothing_from_a_store(&paths, &t.sub);
@@ -77,7 +79,8 @@ fn registered_sub_extant_is_hashed_by_the_parent() {
             "{n} roots: {reps:?}"
         );
         assert!(
-            reps.iter().any(|r| r.kind == K::New && r.path == b(&t.sub.join("inner"))),
+            reps.iter()
+                .any(|r| r.kind == K::New && r.path == b(&t.sub.join("inner"))),
             "{n} roots: {reps:?}"
         );
         assert!(has(&paths, &t.sub.join("inner")), "{n} roots");

@@ -26,8 +26,14 @@ fn listed_filesystems_are_virtual() {
     for (name, magic) in table {
         assert!(is_virtual(magic), "{name} ({magic:#x}) must be virtual");
     }
-    assert!(is_virtual(linux_raw_sys::general::BINFMTFS_MAGIC), "binfmt_misc");
-    assert!(is_virtual(linux_raw_sys::general::EFIVARFS_MAGIC), "efivarfs");
+    assert!(
+        is_virtual(linux_raw_sys::general::BINFMTFS_MAGIC),
+        "binfmt_misc"
+    );
+    assert!(
+        is_virtual(linux_raw_sys::general::EFIVARFS_MAGIC),
+        "efivarfs"
+    );
 }
 
 // configfs, fusectl and mqueue are in neither table; the values are the

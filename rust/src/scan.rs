@@ -37,6 +37,7 @@ pub enum ReportKind {
     Error,
     Refused,
     SubExtant,
+    /// A virtual filesystem the walk did not enter.
     Mount,
 }
 
@@ -161,7 +162,7 @@ struct RootScan<'a> {
     /// Paths whose subtree (or content) could not be verified. Entries under
     /// them are unknown, not gone, so they are never reported Missing.
     unverified: HashSet<Vec<u8>>,
-    /// Sub-extants and mount points: entries under them are Excluded.
+    /// Sub-extants and virtual mounts: entries under them are Excluded.
     excluded: HashSet<Vec<u8>>,
     root_gone: bool,
     root_refused: bool,

@@ -230,7 +230,11 @@ echo "CODE=$?"
     };
     assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
     assert!(o.stdout.contains("NEW\t/work/root/f\n"), "{}", o.stdout);
-    assert!(o.stdout.contains("NEW\t/work/root/mnt/inside\n"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("NEW\t/work/root/mnt/inside\n"),
+        "{}",
+        o.stdout
+    );
     assert!(lines(&o.stdout, "MOUNT").is_empty(), "{}", o.stdout);
 }
 
@@ -261,7 +265,11 @@ echo "CODE=$?"
     };
     assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
     for f in ["a/a-file", "a/sub/b-file"] {
-        assert!(o.stdout.contains(&format!("NEW\t/work/root/{f}\n")), "{f}: {}", o.stdout);
+        assert!(
+            o.stdout.contains(&format!("NEW\t/work/root/{f}\n")),
+            "{f}: {}",
+            o.stdout
+        );
     }
     assert!(lines(&o.stdout, "MOUNT").is_empty(), "{}", o.stdout);
 }
@@ -287,8 +295,16 @@ echo "CODE=$?"
         return;
     };
     assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
-    assert!(o.stdout.contains("NEW\t/work/root/a/real\n"), "{}", o.stdout);
-    assert!(o.stdout.contains("MOUNT\t/work/root/a/tmp\n"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("NEW\t/work/root/a/real\n"),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains("MOUNT\t/work/root/a/tmp\n"),
+        "{}",
+        o.stdout
+    );
     assert!(!o.stdout.contains("hidden"), "entered tmpfs: {}", o.stdout);
 }
 
@@ -313,7 +329,11 @@ echo "CODE=$?"
     };
     assert!(o.stdout.contains("CODE=0"), "{}{}", o.stdout, o.stderr);
     for f in ["f", "sub/g"] {
-        assert!(o.stdout.contains(&format!("NEW\t/work/root/{f}\n")), "{f}: {}", o.stdout);
+        assert!(
+            o.stdout.contains(&format!("NEW\t/work/root/{f}\n")),
+            "{f}: {}",
+            o.stdout
+        );
     }
     assert!(o.stdout.contains("MOUNT\t/work/root/mnt\n"), "{}", o.stdout);
     assert!(!o.stdout.contains("hidden"), "{}", o.stdout);
