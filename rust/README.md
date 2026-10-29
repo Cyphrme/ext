@@ -6,12 +6,13 @@ implementation of the userspace part of the Extant design in the repository's
 root [README](../README.md). The places where it departs from that text, or
 decides something the text leaves open, are listed one by one in
 [DIVERGENCES.md](DIVERGENCES.md), written against the spec as changed by
-PR #12 (branch `spec/consensus-fixes`, commit bb9a46f).
+PR #12 (branch `spec/consensus-fixes`, commit 5451659).
 
 Version 1 has no external services, no truncation, no `hash://` parsing, no
-human names or tags, no watcher, no config file, and no parent/sub-extant
-linking. It needs Linux 5.6 or later (`openat2`); mount boundaries use
-`STATX_MNT_ID` (5.8) and fall back to `st_dev` with a warning.
+human names or tags, no watcher, and no parent/sub-extant linking. Of the
+config file's keys it honours only a few (see Config). It needs Linux 5.6 or
+later (`openat2`); mount boundaries use `STATX_MNT_ID` (5.8) and fall back to
+`st_dev` with a warning.
 
 ## Build and test
 
@@ -65,7 +66,7 @@ characters (either case).
 
 | Code | Meaning |
 |---|---|
-| 0 | OK. Also: a reader closed the pipe, or the only changes were `MISSING`, `ACCEPTED`, `EXCLUDED`, `MOUNT` or `SUBEXTANT`. |
+| 0 | OK. Also: a reader closed the pipe, or the only changes were `MISSING`, `DELETED`, `ACCEPTED`, `EXCLUDED`, `MOUNT` or `SUBEXTANT`. |
 | 1 | Not found: `resolve` found no path. |
 | 2 | Mismatch: `check` found an unaccepted `VIOLATION`. |
 | 3 | Ambiguous. Never emitted, because truncation is not supported. |
@@ -90,12 +91,13 @@ printed. When both a violation and an incomplete item occur, the exit code is 2.
 | `VIOLATION` | `--full` found a different digest under unchanged, non-racy metadata. Both digests follow the path. | not written |
 | `ACCEPTED` | A violation taken by `--accept`. Both digests follow the path. | written |
 | `MISSING` | An indexed file is gone. | entry removed |
-| `EXCLUDED` | An indexed path now lies under a sub-extant or mount. | entry removed |
+| `DELETED` | A registered root is gone from a filesystem that is still mounted. Its entries are reported `MISSING` first and the root is unregistered; with `UnregisterDeleted` false only this line is printed. | entries removed, root unregistered |
+| `EXCLUDED` | An indexed path now lies under a sub-extant or a skipped virtual mount. | entry removed |
 | `SUBEXTANT` | A directory holding a real `.ext/` store was not entered. | unchanged |
-| `MOUNT` | A directory on another mount was not entered. | unchanged |
+| `MOUNT` | A directory on a virtual filesystem (below) was not entered. | unchanged |
 | `UNSTABLE` | The file or directory changed while being read or opened. Cause follows. | entry removed |
 | `ERROR` | A file or directory could not be read. Cause follows. | entries kept |
-| `REFUSED` | A root could not be opened safely, or its filesystem identity changed. Cause follows. | entries kept |
+| `REFUSED` | A root could not be opened safely, its filesystem identity changed, or it is gone and not provably deleted (a missing mount). Cause follows. | entries kept |
 
 Files that are hashed with an equal digest are not printed. A counts line
 (`new=… edited=… unchanged=… skipped=… symlinks=… special=…`) goes to stderr
@@ -111,7 +113,7 @@ escaped.
 
 ## Store
 
-A store is a directory containing `registry`, `index.db` and `lock`.
+A store is a directory containing `registry`, `index.db` and `lock`, and optionally `config`.
 
 **Location**, first match wins:
 
@@ -119,6 +121,9 @@ A store is a directory containing `registry`, `index.db` and `lock`.
 2. `EXTANT_DIR` (empty counts as unset)
 3. `/var/lib/ext`
 4. `./.ext`
+
+When `ext` runs with elevated privilege (effective uid 0, or an effective uid or
+gid that differs from the real one), steps 2 and 4 are skipped.
 
 For steps 1 and 2 the path may be a store or a directory whose `.ext` is one. An
 explicit path that is neither is an error; resolution does not fall through to a
@@ -131,6 +136,20 @@ resolution) are owned by anyone but root or the effective user, or are
 group/other-writable without the sticky bit. `init` creates the directory with
 mode 0700 and the files with 0600, so `sudo ext init --bare /var/lib/ext`
 produces a root-owned, root-only system store; other users get exit 4.
+
+**Config.** `<store>/config`, JSON5, optional; it is judged like the registry
+(not a symlink, owned by the effective user, not group/other-writable) and a bad
+one is exit 4 for every command that opens the store. Keys:
+
+| Key | Effect |
+|---|---|
+| `Base64`, `Hex` | `false` makes `resolve` refuse that input encoding (default true). |
+| `DefaultEnc` | `"B64"` (default) or `"Hex"`: the output encoding; `--hex` overrides. |
+| `CompareCtimeInode` | `false` compares only size and mtime in the skip rule (default true). |
+| `UnregisterDeleted` | `false` makes a deleted root only reported (default true). |
+| `Aware`, `IndexEnc`, `Truncation`, `Unlabeled`, `Directory`, `Hash` | Accepted only at the default (`true`, `"B64"`, `false`, `false`, `"CWD"`, `"SHA-256"`); any other value is an error naming the key. |
+
+An unknown key is an error.
 
 **Registry.** One absolute path per line, escaped as above. Blank lines and
 lines starting with `#` are ignored. `//` and a trailing `/` are collapsed; `.`
@@ -151,7 +170,8 @@ exclusive `flock` on `lock` for the whole run and wait for it. `resolve` and
 ## Change detection
 
 A file is skipped without hashing only if its mtime, ctime, size, device and
-inode equal the stored values and the entry is not racy. An entry is racy when
+inode equal the stored values (with `CompareCtimeInode` false, only size and
+mtime) and the entry is not racy. An entry is racy when
 `max(mtime, ctime) >= last_checked - 2 s`; `last_checked` is read before the
 file's metadata. Metadata skipping is a performance heuristic. `check --full`
 ignores it.
@@ -165,13 +185,24 @@ after; on a change it is hashed once more, and if still changing it is
 Only regular files are hashed. Descent is relative to open directory
 descriptors; symlinks are counted and never followed, and a root with a symlink
 in any component is `REFUSED`. FIFOs, sockets and devices are counted and never
-opened. A directory on a different mount is not entered. A directory holding a
-real `.ext/` store (registry, index.db and lock present as regular files, owned
-by the root's owner or root, not group/other-writable) is a sub-extant and is
-not entered; any other `.ext` is ordinary content. The store being used is never
+opened. A directory on another mount is entered, so registering `/` covers the
+system, unless its filesystem (`statfs` type) is virtual: proc, sysfs, devtmpfs,
+devpts, tmpfs, ramfs, cgroup, cgroup2, debugfs, tracefs, securityfs, pstore, bpf,
+configfs, fusectl, mqueue, hugetlbfs, binfmt_misc, efivarfs or autofs. Such a
+mount is reported `MOUNT`; a registered root on one is still walked. A directory
+holding a real `.ext/` store (registry, index.db and lock present as regular
+files, owned by the root's owner or root, not group/other-writable) is a
+sub-extant and is not entered unless it is itself a registered root, in which
+case the files are hashed like any other root's; the `.ext` itself is never
+indexed, and any other `.ext` is ordinary content. The store being used is never
 indexed. An unreadable file or directory never causes its entries to be treated
-as deleted. A registered root that no longer exists reports each entry `MISSING`
-and leaves the registry line.
+as deleted.
+
+A registered root that no longer exists is *deleted* if its nearest existing
+ancestor is on the filesystem recorded for the root: its entries are reported
+`MISSING` and removed, it is unregistered, and `DELETED` is printed (exit 0). If
+the ancestor is on another filesystem, or no filesystem was recorded for the
+root, it is a missing mount: `REFUSED`, entries and registration kept, exit 5.
 
 ## Known limits
 
@@ -183,6 +214,8 @@ and leaves the registry line.
   a filesystem's id legitimately changes (for example across reboots on some
   filesystems), run `ext register <root>` to record the new identity; entries
   are kept. Whether the id is stable on every filesystem has not been verified.
+- A bind mount of a real directory is entered like any other mount, so its
+  files appear under every path it is mounted at.
 - Registered roots may be nested. A root's walk stops at another registered root,
   and each file is indexed once, by the inner root.
 - `register` takes directories only. A registry entry with a symlink in any

@@ -2,8 +2,9 @@
 
 This lists where the implementation departs from the spec, or decides something
 the spec leaves open. It is written against `README.md` as changed by PR #12
-(branch `spec/consensus-fixes`, commit bb9a46f), which records the decisions
-reached on issues #1-#10. Line numbers refer to that file. "Issue" is an issue
+(branch `spec/consensus-fixes`, commit 5451659, with `docs/traversal.md`), which
+records the decisions reached on issues #1-#13. Line numbers refer to the README
+before that commit and may have moved. "Issue" is an issue
 in Cyphrme/ext; "new" means no issue covers the point yet. Status is one of:
 
 - **open**: the issue is still under discussion with the spec author.
@@ -18,7 +19,7 @@ the registry is a parse error); directory precedence flag, `EXTANT_DIR`,
 `/var/lib/ext`, current directory, and an explicit path that is missing is an
 error (L224-L229); `-r` and `-u` aliases (L269); the timestamp index and racy
 rule (L285-L313), with the differences below; sub-extants are not recursed
-into (L357).
+into unless registered (L357, now amended).
 
 ## Index and registry
 
@@ -58,8 +59,9 @@ into (L357).
   comparisons".
 - Does: the same skip and racy rules (`max(mtime, ctime) >= last_checked - 2 s`,
   `last_checked` read before the file's metadata). It also stores and compares
-  the device number, and it has no option to disable the ctime or inode
-  comparison because there is no config file. Directory records (L317-L322) are
+  the device number, which goes with the inode: the config key
+  `CompareCtimeInode` (default true) false compares only size and mtime, and the
+  racy rule still reads the stored ctime. Directory records (L317-L322) are
   not implemented; every file is examined by the rule above.
 - Why: an inode number is only meaningful with its device.
 
@@ -82,8 +84,10 @@ into (L357).
   anyone but root or the effective user, or are group/other-writable without the
   sticky bit. `init` creates the store atomically with mode 0700 and files 0600,
   so `sudo ext init --bare /var/lib/ext` yields a root-owned, root-only system
-  store and other users get exit 4. The rule "with elevated privilege ignore
-  `EXTANT_DIR` and the current directory" is not implemented.
+  store and other users get exit 4. With elevated privilege (effective uid 0, or
+  an effective uid or gid differing from the real one) `EXTANT_DIR` and the
+  current directory are not consulted, as the spec's Trust section says; `--d`
+  still is.
 - Why: a store the user does not own, or that others can write, cannot vouch for
   anything.
 
@@ -105,15 +109,23 @@ into (L357).
 - Why: the store must be located before anything else, and there is no other
   working-directory notion to set.
 
-### No config file (deferred, #10)
+### Config file (partly implemented, #10)
 
 - Spec: L232-L243 "The config file is saved as <extant_path>/config. Its format
   is JSON5." with the flags Aware, Base64, Hex, DefaultEnc, IndexEnc, Truncation,
-  Unlabeled, Directory, Hash.
-- Does: no config file is read or written. Behaviour is fixed: SHA-256, b64ut
-  output by default (`--hex` for hex), b64ut and hex input, labelled digests
-  only, no truncation.
-- Why: each flag either selects something v1 does not implement or is undecided.
+  Unlabeled, Directory, Hash; L301-L303 "A configuration option may disable the
+  ctime and inode comparisons"; the traversal document's "a config option
+  disables" unregistering a deleted root.
+- Does: reads `<store>/config` (JSON5, optional) with the registry's ownership
+  and mode checks. Honoured: `Base64` and `Hex` (false refuses that encoding as
+  `resolve` input), `DefaultEnc` (`B64` or `Hex`; `--hex` overrides). Two keys
+  the spec describes without naming: `CompareCtimeInode` and
+  `UnregisterDeleted` (both default true). Every other key (`Aware`, `IndexEnc`,
+  `Truncation`, `Unlabeled`, `Directory`, `Hash`) is accepted only at the value
+  the code already behaves as; any other value, and any unknown key, is
+  exit 4 naming the key. `Directory` is not a working-directory setting here.
+- Why: a key that is accepted and ignored would let an operator believe a policy
+  is in force. The names of the two unnamed keys are this implementation's, to be settled with the spec.
 
 ### `init` layout (open, #10, #13)
 
@@ -188,7 +200,8 @@ into (L357).
   `<sub-extant_path>/registry`."; L357 "If an ext path contains another ext, it
   is ignored."
 - Does: a sub-extant's store is `<dir>/.ext/`. A directory containing a real
-  store there is not entered by a parent walk and is reported `SUBEXTANT`;
+  store there is not entered by a parent walk, unless it is itself a registered
+  root (see "Sub-extant linking"), and is reported `SUBEXTANT`;
   entries previously indexed beneath it are reported `EXCLUDED` and removed. A
   `.ext` counts only if `registry`, `index.db` and `lock` are regular files owned
   by the registered root's owner or root and not group/other-writable; any other
@@ -203,7 +216,10 @@ into (L357).
 
 - Spec: L27 "Sub-extants may be registered to a parent extant."
 - Does: no linking. A parent never reads a child's index. The proposed copy and
-  reference modes, and an opt-in flag, are not implemented.
+  reference modes, and an opt-in flag, are not implemented. A sub-extant whose
+  directory is itself registered to the parent is walked and hashed by the
+  parent like any other root (the spec's "no difference between adding a sub and
+  adding the dir"); its own `.ext/` is never indexed.
 
 ### Traversal (open for symlinks and special files, #9)
 
@@ -219,27 +235,41 @@ into (L357).
     (device, inode) re-checked on the descriptor; a mismatch is `UNSTABLE`.
   - Metadata is compared before and after hashing; one retry, then `UNSTABLE`
     and the entry is deleted.
-  - A directory on a different mount (by mount id, or `st_dev` where the kernel
-    lacks mount ids) is reported `MOUNT` and not entered.
+  - Other mounted filesystems are entered (the boundary is judged by mount id,
+    or `st_dev` where the kernel lacks mount ids, against the directory's
+    parent), so `/` covers the system. A mount whose `statfs` type is one of the
+    virtual types in `docs/traversal.md` is reported `MOUNT` and not entered; a
+    registered root on such a filesystem is walked. The type list is
+    `src/vfs.rs`; configfs, fusectl and mqueue are not in linux/magic.h and
+    their values come from the kernel. A bind mount is entered at each place it
+    is mounted, so its files are indexed under each path.
   - The walk is iterative; depth costs memory, not stack or descriptors.
   - Nested registered roots: the outer walk stops at the inner root.
 
-### Deleted roots and unreadable paths (open, #9)
+### Deleted roots and unreadable paths (follows the traversal document)
 
 - Spec: L251-L252 "Unregister, removing all references in indexing. (Deleting a
-  directory also unregisters.)" The author prefers that a deletion updates the
-  index by default (configurable), and that deletion be distinguished from a
-  failed mount.
-- Does: a registered root that no longer exists reports each entry `MISSING` and
-  removes the entries, but the registry line stays; there is no automatic
-  unregistration. An entry is `MISSING` only when the walk did not see the file
-  and a descriptor-relative check confirms it is no longer a regular file. A file
-  or directory that cannot be read or listed keeps its entries (`ERROR`, exit 5).
-  A root whose filesystem identity (`f_fsid` from `statvfs`, recorded on first
-  scan) has changed is `REFUSED`, keeps its entries and exits 5;
-  `ext register <root>` on a registered root records the current identity and
-  keeps its entries, `unregister` forgets it. Stability of `f_fsid` across
-  reboots on every filesystem is unverified.
+  directory also unregisters.)"; `docs/traversal.md` "Deleted roots".
+- Does: a registered root that no longer opens (ENOENT) is compared with its
+  nearest existing ancestor. If that ancestor is on the filesystem recorded for
+  the root (`f_fsid` from `statvfs`, recorded on first scan) the root is
+  *deleted*: each entry is reported `MISSING` and removed, the root is
+  unregistered, and `DELETED` is printed (exit 0). With config
+  `UnregisterDeleted` false only `DELETED` is printed and nothing changes. If
+  the ancestor is on another filesystem, or the ancestor cannot be examined, or
+  no filesystem was recorded for the root, it is a missing mount: `REFUSED`,
+  entries and registration kept, exit 5. A root that exists but whose filesystem
+  differs from the record is `REFUSED` in the same way. `ext register <root>`
+  on a registered root records the current identity and keeps its entries;
+  `unregister` forgets it.
+- An entry is `MISSING` only when the walk did not see the file and a
+  descriptor-relative check confirms it is no longer a regular file. A file or
+  directory that cannot be read or listed keeps its entries (`ERROR`, exit 5).
+- Not decided by the spec: a root with no recorded identity (a hand-edited
+  registry line never scanned) is treated as a missing mount, the safe side.
+  `f_fsid` on btrfs includes the subvolume, so a deleted subvolume root also
+  reads as a missing mount. Stability of `f_fsid` across reboots on every
+  filesystem is unverified.
 - Why: an unmounted disk looks like a deleted tree; wiping its baseline on that
   evidence loses data.
 
@@ -278,7 +308,7 @@ into (L357).
   truncation, which is not supported. 5 is an addition: the scan was incomplete
   (`ERROR`, `UNSTABLE` or `REFUSED`) and no violation was found. A violation
   outranks an incomplete scan; a store or database failure during a scan exits 4.
-  `MISSING`, `EXCLUDED`, `MOUNT`, `SUBEXTANT` and `ACCEPTED` exit 0. A closed
+  `MISSING`, `DELETED`, `EXCLUDED`, `MOUNT`, `SUBEXTANT` and `ACCEPTED` exit 0. A closed
   output pipe is a quiet stop: `list` and `resolve` exit 0; `check`, `register`
   and `rebuild` exit with the scan's code.
 - Why: per-file errors do not abort a scan (L42), so a script needs a code that
