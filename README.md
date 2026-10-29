@@ -60,6 +60,11 @@ tab delimited, records are newline delimited, and a backslash, tab, or newline
 in a field is escaped as `\\`, `\t`, or `\n`. Records are sorted by the raw
 bytes of their first field.
 
+A process that writes a store holds an exclusive lock on
+`<extant_path>/lock` for its whole run; readers take no lock. An index file is
+replaced atomically: it is written to a temporary file in the store and renamed
+over the old one, so a reader never sees a partial file.
+
 External service URIs are not stored in the system indexes.
 
 The same digest may appear more than once when multiple paths contain
