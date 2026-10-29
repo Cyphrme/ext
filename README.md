@@ -143,13 +143,14 @@ Tail is optional and resolution is out of scope.
 2. `digest` is the longest b64ut prefix of the remainder. First non-b64ut char
    starts `tail`.
 3. Prefer the decoding whose length equals `alg`'s digest size. Even-length
-   `0-9A-F` is hex. Otherwise strict b64ut. Non-canonical encoding is an error.
-4. When truncation is enabled, a shorter digest is accepted: `0-9A-F` only is
-   hex, anything else is b64ut. Else error.
+   hex, in any case, is hex. Otherwise strict b64ut. Non-canonical encoding is an error.
+4. When truncation is enabled, a shorter digest is accepted: hex characters only,
+   in any case, is hex, anything else is b64ut. Else error.
 
 Identity = (`alg`, raw digest bytes). `tail` is not identity.
 
-SHA-256 is 32 bytes, 43 b64ut chars, or 64 uppercase hex chars. No `=`.
+SHA-256 is 32 bytes, 43 b64ut chars, or 64 hex chars. No `=`.
+Hex is accepted in any case and written uppercase.
 
 ## System Integrated Extant: `/dev/ext`
 So far described is **userland extant**. The extant service is designed first as
@@ -184,6 +185,7 @@ ln -s /dev/ext /var/www/website_name/content
 
 ## Bases
 Both Base64 (b64ut) and hex (lower, upper, and mixed case) are supported.
+Hex output is uppercase.
 However, the default is b64ut.
 
 ## Truncation and Collision
