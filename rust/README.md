@@ -133,7 +133,7 @@ A store is a directory containing `registry`, `index.db` and `lock`, and optiona
 3. `/var/lib/ext`
 4. `./.ext`
 
-When `ext` runs with elevated privilege (effective uid 0, or an effective uid or
+When `ext` runs with elevated privilege (secure exec, effective uid 0, or an effective uid or
 gid that differs from the real one), steps 2 and 4 are skipped.
 
 For steps 1 and 2 the path may be a store or a directory whose `.ext` is one. An
