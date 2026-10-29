@@ -255,7 +255,7 @@ The waterfall for directories, highest precedence first:
 1. Flag value (`--d <path>`)
 2. Environment variable, `EXTANT_DIR`
 3. Default path, `/var/lib/ext`
-4. Current directory
+4. Current directory: its `.ext/` store, as for a sub-extant
 5. Fail if nothing exists.
 
 ## Trust
@@ -281,6 +281,9 @@ The config file is saved as <extant_path>/config. Its format is JSON5.
 - Unlabeled  - False - Do not require digest labeling.
 - Directory  - CWD   - Specify working directory for `ext`.
 - Hash     - SHA-256 - Default hash.
+- CompareCtimeInode - True - Compare ctime and inode when deciding to skip a file
+  (see Incrementality).
+- UnregisterDeleted - True - Unregister a deleted root (see docs/traversal.md).
 
 ## Commands
 `ext init <path>` - Create a `ext` directory with a new registry. If no path is
