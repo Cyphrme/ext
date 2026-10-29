@@ -67,11 +67,11 @@ fn unregistered_sub_extant_is_skipped() {
 
 #[test]
 fn registered_sub_extant_is_hashed_by_the_parent() {
-    let t = tree();
-    for roots in [vec![&t.root, &t.sub], vec![&t.sub]] {
-        let roots: Vec<&Path> = roots.into_iter().map(PathBuf::as_path).collect();
-        let (reps, paths) = scan(&t, &roots);
-        let n = roots.len();
+    // A fresh tree each time: `scan` creates the store.
+    for n in [2, 1] {
+        let t = tree();
+        let all = [t.root.as_path(), t.sub.as_path()];
+        let (reps, paths) = scan(&t, &all[2 - n..]);
         assert!(
             reps.iter().all(|r| r.kind != K::SubExtant),
             "{n} roots: {reps:?}"
