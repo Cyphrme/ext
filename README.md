@@ -238,6 +238,16 @@ The waterfall for directories, highest precedence first:
 4. Current directory
 5. Fail if nothing exists.
 
+## Trust
+`ext` runs as the invoking user and indexes only what that user can read. A
+store must be owned by the user running `ext`, and `ext` refuses any other.
+When `ext` runs with elevated privilege, `EXTANT_DIR` and the current
+directory are not consulted.
+
+Integrity means detecting change relative to the index, so the index is only
+as trustworthy as the store's protection. A system-wide store that serves
+queries from other users, filtered to what each may read, is future work.
+
 ## Config Flags
 The config file is saved as <extant_path>/config. Its format is JSON5.
 
