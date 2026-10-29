@@ -208,6 +208,7 @@ fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
                 full: *full,
                 accept: *accept,
                 only: None,
+                ..Opts::default()
             };
             scan_locked(&open_store(cli)?, &opts, false, fmt, w)?
         }
@@ -216,6 +217,7 @@ fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
                 full: true,
                 accept: true,
                 only: None,
+                ..Opts::default()
             };
             scan_locked(&open_store(cli)?, &opts, true, fmt, w)?
         }

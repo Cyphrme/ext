@@ -2,7 +2,7 @@
 
 use crate::digest::{Alg, Digest};
 use crate::escape::escape;
-use crate::fresh::{classify, should_skip, Status};
+use crate::fresh::{classify, should_skip, MetaCmp, Status};
 use crate::hash::{hash_stable, HashError};
 use crate::index::{Entry, Index, Meta};
 use crate::registry::RegPath;
@@ -17,11 +17,38 @@ use std::os::fd::OwnedFd;
 /// Files per index transaction: bounds the work a crash can lose.
 const BATCH: usize = 1000;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Opts {
     pub full: bool,
     pub accept: bool,
     pub only: Option<RegPath>,
+    /// Config `CompareCtimeInode`: false drops ctime, inode and device from
+    /// the skip rule.
+    pub compare_ctime_inode: bool,
+    /// Config `UnregisterDeleted`: false makes a deleted root only reported.
+    pub unregister_deleted: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Opts {
+        Opts {
+            full: false,
+            accept: false,
+            only: None,
+            compare_ctime_inode: true,
+            unregister_deleted: true,
+        }
+    }
+}
+
+impl Opts {
+    fn meta_cmp(&self) -> MetaCmp {
+        if self.compare_ctime_inode {
+            MetaCmp::Full
+        } else {
+            MetaCmp::SizeMtime
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -405,7 +432,7 @@ impl RootScan<'_> {
     ) -> Result<(), StoreError> {
         let stored = self.idx.get(&path)?;
         self.seen.insert(path.clone());
-        if should_skip(stored.as_ref(), &meta, self.opts.full) {
+        if should_skip(stored.as_ref(), &meta, self.opts.full, self.opts.meta_cmp()) {
             self.summary.skipped += 1;
             return Ok(());
         }
@@ -446,7 +473,7 @@ impl RootScan<'_> {
             last_checked_ns,
         };
         let stored_digest = stored.as_ref().map(|e| e.digest.clone());
-        match classify(stored.as_ref(), &current, &digest) {
+        match classify(stored.as_ref(), &current, &digest, self.opts.meta_cmp()) {
             Status::New => {
                 self.summary.new += 1;
                 self.push(Op::Put(entry))?;
