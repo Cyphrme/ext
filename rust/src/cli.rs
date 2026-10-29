@@ -3,7 +3,7 @@
 //! Exit codes (plan §1): 0 ok, 1 `resolve` found nothing, 2 unaccepted
 //! violation, 4 usage/config/store error, 5 incomplete scan. 3 is never used.
 
-use crate::digest::{Digest, Enc};
+use crate::digest::{Enc, Query};
 use crate::escape::{display, escape};
 use crate::index::Index;
 use crate::registry::RegPath;
@@ -199,8 +199,8 @@ fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
         }
         Cmd::Unregister { path } => unregister(&open_store(cli)?, path)?,
         Cmd::Resolve { digest } => {
-            let d = Digest::parse_labelled(digest)?;
-            resolve(&open_store(cli)?, &d, fmt, w)?
+            let q = Query::parse(digest)?;
+            resolve(&open_store(cli)?, &q, fmt, w)?
         }
         Cmd::List => list(&open_store(cli)?, fmt, w)?,
         Cmd::Check { full, accept } => {
@@ -288,8 +288,12 @@ fn unregister(store: &Store, path: &Path) -> Result<u8, CliError> {
     Ok(0)
 }
 
-fn resolve(store: &Store, d: &Digest, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
-    let mut paths = Index::open(store)?.by_digest(d)?;
+fn resolve(store: &Store, q: &Query, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
+    let mut paths = Index::open(store)?.by_digest(&q.digest)?;
+    // A name is the filename: only paths ending in it are returned.
+    if let Some(name) = &q.name {
+        paths.retain(|p| p.rsplit(|&b| b == b'/').next() == Some(name.as_slice()));
+    }
     if paths.is_empty() {
         return Ok(EXIT_NOT_FOUND);
     }

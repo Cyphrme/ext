@@ -59,8 +59,9 @@ fn hash_uri() {
 
 #[test]
 fn hash_uri_digest_is_case_sensitive() {
-    let swapped = V.to_lowercase();
-    let q = ok(&format!("hash://SHA-256/{swapped}"));
+    // Same length, canonical, different case in the first character.
+    let other = V.replacen('L', "l", 1);
+    let q = ok(&format!("hash://SHA-256/{other}"));
     assert_ne!(q.digest, hello());
 }
 
@@ -136,5 +137,39 @@ fn name_forms_reject() {
         format!("n:SHA-256:{V}x"),
     ] {
         assert!(Query::parse(&s).is_err(), "{s:?}");
+    }
+}
+
+mod props {
+    use super::*;
+    use ext::digest::Enc;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Every spelling of a digest and a name parses back to both, in
+        /// either encoding. Names are lowercase, so they cannot imitate the
+        /// uppercase algorithm label.
+        #[test]
+        fn forms_roundtrip(
+            bytes in prop::collection::vec(any::<u8>(), 32),
+            stem in "[a-z0-9.:_-]{1,12}",
+            ext in "[a-z0-9]{1,4}",
+            hex in any::<bool>(),
+        ) {
+            let d = Digest::from_bytes(Alg::Sha256, &bytes).unwrap();
+            let v = d.encode(if hex { Enc::Hex } else { Enc::B64ut });
+            let cases = [
+                (format!("SHA-256:{v}:{stem}"), stem.clone()),
+                (format!("{v}:SHA-256:{stem}"), stem.clone()),
+                (format!("{stem}:SHA-256:{v}"), stem.clone()),
+                (format!("{stem}:SHA-256:{v}.{ext}"), format!("{stem}.{ext}")),
+            ];
+            for (arg, name) in cases {
+                let q = Query::parse(&arg).unwrap();
+                prop_assert_eq!(&q.digest, &d, "{}", arg);
+                prop_assert_eq!(q.name, Some(name.into_bytes()), "{}", arg);
+            }
+            prop_assert_eq!(Query::parse(&format!("hash://SHA-256/{v}.{ext}")).unwrap().digest, d);
+        }
     }
 }
