@@ -205,7 +205,7 @@ pub(crate) fn walk_checked(
         before_open,
         visit,
     };
-    list_dir(&mut ctx, Rc::new(DirHandle { fd, path }));
+    list_dir(&mut ctx, Rc::new(DirHandle { fd, path }), true);
     // Explicit stack: depth costs heap, never call-stack or one fd per level.
     while let Some(p) = ctx.stack.pop() {
         let path = child_path(&p.parent.path, p.name.to_bytes());
@@ -228,7 +228,7 @@ pub(crate) fn walk_checked(
                 // Release the parent before descending; if this was its last
                 // pending child, its descriptor closes here.
                 drop(p);
-                list_dir(&mut ctx, Rc::new(DirHandle { fd, path }));
+                list_dir(&mut ctx, Rc::new(DirHandle { fd, path }), false);
             }
             Ok(_) => (ctx.visit)(Event::Unstable(path, changed("directory"))),
             Err(e) => (ctx.visit)(Event::Error(path, e.into())),
@@ -260,7 +260,9 @@ fn is_real_store(ctx: &Ctx<'_>, parent: &OwnedFd, ext: &Statx) -> bool {
     })
 }
 
-fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>) {
+/// A registered root is walked even if it holds a store of its own: the
+/// registration is what lets a parent hash a sub-extant's files itself.
+fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>, is_root: bool) {
     match statx(
         &dir.fd,
         ".ext",
@@ -268,7 +270,8 @@ fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>) {
         StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::INO,
     ) {
         Ok(st)
-            if is_type(&st, FileType::Directory)
+            if !is_root
+                && is_type(&st, FileType::Directory)
                 && (dev_of(&st), st.stx_ino) != ctx.store_id
                 && is_real_store(ctx, &dir.fd, &st) =>
         {
@@ -313,7 +316,12 @@ fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
     match FileType::from_raw_mode(st.stx_mode.into()) {
         FileType::Symlink => (ctx.visit)(Event::Symlink(path)),
         FileType::Directory => {
-            if id == ctx.store_id || (ctx.skip)(&path) {
+            // A store is never content, whether it is the one in use or a
+            // sub-extant's that a registered root hashes around.
+            if id == ctx.store_id
+                || (name.to_bytes() == b".ext" && is_real_store(ctx, &dir.fd, &st))
+                || (ctx.skip)(&path)
+            {
                 return;
             }
             let child_mnt = if ctx.use_dev { id.0 } else { st.stx_mnt_id };
