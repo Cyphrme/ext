@@ -16,7 +16,6 @@ use support::{b, canon_tmp, store_with_roots};
 
 struct Env {
     _t: tempfile::TempDir,
-    base: PathBuf,
     file: PathBuf,
     st: Store,
     ix: Index,
@@ -30,7 +29,6 @@ fn env() -> Env {
     let ix = Index::open(&st).unwrap();
     Env {
         _t: t,
-        base,
         file,
         st,
         ix,

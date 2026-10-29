@@ -835,13 +835,20 @@ fn init_rejects_dir_with_bare() {
     assert!(!p.exists() && !dir.join(".ext").exists());
 }
 
-/// `register` takes a directory: a regular file is refused before anything
-/// is written.
+/// `register` takes a directory or a regular file: anything else is refused
+/// before anything is written.
 #[test]
-fn register_refuses_a_regular_file() {
+fn register_refuses_a_special_file() {
     let fx = Fx::new();
-    let file = fx.base.join("afile");
-    fs::write(&file, b"x").unwrap();
+    let file = fx.base.join("afifo");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &file,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
     let before = fx.registry_text();
     let o = run(fx.ext().arg("register").arg(&file));
     assert_eq!(o.code, 4, "{}", o.stderr);

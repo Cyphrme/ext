@@ -218,7 +218,7 @@ fn open_root(root: &RegPath) -> io::Result<OwnedFd> {
     Ok(openat2(
         CWD,
         root.as_bytes(),
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )?)

@@ -99,8 +99,8 @@ enum CliError {
     },
     #[error("--d names a store to open, but init creates one; give the location as an argument")]
     InitWithStoreFlag,
-    #[error("not a directory: {}", .0.display())]
-    NotADirectory(PathBuf),
+    #[error("not a directory or regular file: {}", .0.display())]
+    NotADirectoryOrFile(PathBuf),
     #[error("not a registry entry (unregister needs an exact match): {0}")]
     NotAnEntry(String),
     #[error("cannot determine the current directory: {0}")]
@@ -303,8 +303,8 @@ fn register(
         path: path.to_path_buf(),
         source,
     })?;
-    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir()) {
-        return Err(CliError::NotADirectory(path.to_path_buf()));
+    if !std::fs::metadata(&canon).is_ok_and(|m| m.is_dir() || m.is_file()) {
+        return Err(CliError::NotADirectoryOrFile(path.to_path_buf()));
     }
     let root = RegPath::from_bytes(canon.as_os_str().as_bytes())
         .map_err(|kind| CliError::BadRoot { path: canon, kind })?;

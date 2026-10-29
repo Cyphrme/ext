@@ -50,6 +50,10 @@ const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::DIRECTORY);
 
+/// A root is first held by `O_PATH`: its type is known before anything that
+/// could block or act (a FIFO, a device) is opened for reading.
+const ROOT_FLAGS: OFlags = OFlags::PATH.union(OFlags::CLOEXEC).union(OFlags::NOFOLLOW);
+
 static NO_MNT_ID: Once = Once::new();
 
 /// A directory held open while any of its children are still to be visited.
@@ -125,7 +129,7 @@ pub fn root_id(root: &RegPath) -> io::Result<RootId> {
     let fd = openat2(
         CWD,
         root.as_bytes(),
-        DIR_FLAGS,
+        ROOT_FLAGS,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     )?;
@@ -209,18 +213,21 @@ pub(crate) fn walk_checked(
     visit: &mut dyn FnMut(Event),
 ) {
     let path = root.as_bytes().to_vec();
-    let fd = match openat2(
+    // Sampled before the metadata read, as for every file (see visit_child).
+    let last_checked_ns = now_ns();
+    let held = match openat2(
         CWD,
         root.as_bytes(),
-        DIR_FLAGS,
+        ROOT_FLAGS,
         Mode::empty(),
         ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
     ) {
         Ok(fd) => fd,
         Err(e) => return visit(Event::Refused(path, e.into())),
     };
+    let fd = &held;
     let st = match statx(
-        &fd,
+        fd,
         "",
         AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
         STAT_MASK,
@@ -235,13 +242,30 @@ pub(crate) fn walk_checked(
         });
     }
     let root_mnt = if use_dev { dev_of(&st) } else { st.stx_mnt_id };
-    let id = match fstatvfs(&fd) {
+    let id = match fstatvfs(fd) {
         Ok(v) => RootId(v.f_fsid),
         Err(e) => return visit(Event::Error(path, e.into())),
     };
     if let Err(e) = check(id) {
         return visit(Event::Refused(path, e));
     }
+    let fd = match FileType::from_raw_mode(st.stx_mode.into()) {
+        FileType::Directory => match openat(fd, ".", DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) => return visit(Event::Error(path, e.into())),
+        },
+        FileType::RegularFile => {
+            return file_root(path, (dev_of(&st), st.stx_ino), last_checked_ns, visit)
+        }
+        // Symlinks never get this far (the open refuses them); anything else
+        // is not content and is not opened.
+        _ => {
+            return visit(Event::Refused(
+                path,
+                io::Error::other("root is not a file or directory"),
+            ))
+        }
+    };
     let mut ctx = Ctx {
         store_id,
         root_uid: st.stx_uid,
@@ -303,6 +327,36 @@ pub(crate) fn walk_checked(
             Err(e) => (ctx.visit)(Event::Error(path, e.into())),
         }
     }
+}
+
+/// A root that is one regular file: hashed like any other file, by a read-only
+/// open that cannot block, checked against the identity just seen.
+fn file_root(path: Vec<u8>, id: (u64, u64), last_checked_ns: i64, visit: &mut dyn FnMut(Event)) {
+    let fd = match openat2(
+        CWD,
+        path.as_slice(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP) => return visit(Event::Unstable(path, changed("file"))),
+        Err(e) => return visit(Event::Error(path, e.into())),
+    };
+    let file = File::from(fd);
+    let md = match file.metadata() {
+        Ok(md) => md,
+        Err(e) => return visit(Event::Error(path, e)),
+    };
+    if !md.file_type().is_file() || (md.dev(), md.ino()) != id {
+        return visit(Event::Unstable(path, changed("file")));
+    }
+    visit(Event::File {
+        path,
+        file,
+        meta: meta_of(&md),
+        last_checked_ns,
+    });
 }
 
 /// A `.ext` directory makes its parent a sub-extant only if it holds a
@@ -401,6 +455,10 @@ fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
             });
         }
         FileType::RegularFile => {
+            // A registered file root is indexed by its own scan only.
+            if (ctx.skip)(&path) {
+                return;
+            }
             (ctx.before_open)(&path);
             // NONBLOCK: should the name be swapped for a FIFO after the
             // check above, the open still cannot hang.
