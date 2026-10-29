@@ -392,7 +392,7 @@ fn elevated_ignores_env_and_cwd_but_not_flag_or_default() {
     let (_t, [flag, env, default, cwd]) = all_four();
     let env = env.as_os_str();
     let at = |flag: Option<&Path>, env: Option<&OsStr>, default: &Path, elevated| {
-        locate(flag, env, default, &cwd, elevated).map(|(p, s)| (p, s))
+        locate(flag, env, default, &cwd, elevated)
     };
     // The control: unprivileged, env wins over default and cwd.
     let (p, s) = at(None, Some(env), &default, false).unwrap();
