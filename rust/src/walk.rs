@@ -132,6 +132,31 @@ pub fn root_id(root: &RegPath) -> io::Result<RootId> {
     Ok(RootId(fstatvfs(&fd)?.f_fsid))
 }
 
+/// The filesystem of the nearest existing ancestor of `root`, which is itself
+/// gone: what a deleted root is compared against (a root on an unmounted disk
+/// leaves an ancestor on a different filesystem). A symlink or any other
+/// obstacle on the way is an error, never a guess.
+pub fn nearest_ancestor_id(root: &RegPath) -> io::Result<RootId> {
+    let mut path = root.as_bytes();
+    loop {
+        path = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) | None => b"/",
+            Some(i) => &path[..i],
+        };
+        match openat2(
+            CWD,
+            path,
+            DIR_FLAGS,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(fd) => return Ok(RootId(fstatvfs(&fd)?.f_fsid)),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) if path != b"/" => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Every descent is relative to a held descriptor, so no component can be
 /// swapped for a symlink after it was checked.
 pub fn walk(root: &RegPath, store_id: (u64, u64), visit: &mut dyn FnMut(Event)) {

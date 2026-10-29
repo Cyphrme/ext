@@ -4,10 +4,10 @@ use crate::digest::{Alg, Digest};
 use crate::escape::escape;
 use crate::fresh::{classify, should_skip, MetaCmp, Status};
 use crate::hash::{hash_stable, HashError};
-use crate::index::{Entry, Index, Meta};
+use crate::index::{Entry, Index, Meta, RootId};
 use crate::registry::RegPath;
 use crate::store::{Store, StoreError, WriteLock};
-use crate::walk::{walk_checked, Event};
+use crate::walk::{nearest_ancestor_id, walk_checked, Event};
 use rustix::fs::{openat2, statx, AtFlags, FileType, Mode, OFlags, ResolveFlags, StatxFlags, CWD};
 use std::collections::HashSet;
 use std::fs::File;
@@ -59,6 +59,8 @@ pub enum ReportKind {
     /// A violation taken as the new baseline by `--accept`.
     Accepted,
     Missing,
+    /// A registered root that is gone from a filesystem still mounted.
+    Deleted,
     Excluded,
     Unstable,
     Error,
@@ -90,6 +92,7 @@ pub struct Summary {
     /// Violations taken by `--accept`; never affects the exit code.
     pub accepted: u64,
     pub missing: u64,
+    pub deleted: u64,
     pub excluded: u64,
     pub unstable: u64,
     pub error: u64,
@@ -130,7 +133,7 @@ pub fn run(
 /// that a type-level requirement.
 pub fn run_hooked(
     store: &Store,
-    _lock: &WriteLock,
+    lock: &WriteLock,
     idx: &Index,
     opts: &Opts,
     after_chunk: &mut dyn FnMut(&[u8], u64),
@@ -151,6 +154,8 @@ pub fn run_hooked(
         .filter(|r| opts.only.as_ref().is_none_or(|o| o == *r))
     {
         let mut rs = RootScan {
+            store,
+            lock,
             idx,
             opts,
             roots: &roots,
@@ -176,6 +181,8 @@ enum Op {
 }
 
 struct RootScan<'a> {
+    store: &'a Store,
+    lock: &'a WriteLock,
     idx: &'a Index,
     opts: &'a Opts,
     roots: &'a [RegPath],
@@ -245,6 +252,36 @@ fn confirmed_absent(rootfd: &OwnedFd, root: &RegPath, path: &[u8]) -> bool {
     }
 }
 
+/// Why a registered root no longer opens.
+#[derive(Debug, PartialEq, Eq)]
+enum Gone {
+    Deleted,
+    /// Not a deletion, or not provably one; the string says why.
+    MissingMount(String),
+}
+
+/// A root is deleted only if the filesystem it was recorded on is still
+/// there: its nearest existing ancestor is on it. Anything else, including
+/// not knowing, is treated as an unmounted disk, because forgetting a
+/// baseline cannot be undone.
+fn judge_gone(recorded: Option<RootId>, ancestor: io::Result<RootId>) -> Gone {
+    match (recorded, ancestor) {
+        (Some(was), Ok(now)) if was == now => Gone::Deleted,
+        (Some(was), Ok(now)) => Gone::MissingMount(format!(
+            "root is missing and its nearest existing ancestor is on another filesystem \
+             (recorded {was}, ancestor {now}); not mounted"
+        )),
+        (None, _) => Gone::MissingMount(
+            "root is missing and no filesystem identity was recorded for it, so a deletion \
+             cannot be told from an unmounted disk"
+                .into(),
+        ),
+        (Some(_), Err(e)) => Gone::MissingMount(format!(
+            "root is missing and its nearest existing ancestor cannot be examined: {e}"
+        )),
+    }
+}
+
 impl RootScan<'_> {
     fn scan(&mut self, root: &RegPath, store_id: (u64, u64)) -> Result<(), StoreError> {
         let idx = self.idx;
@@ -285,6 +322,33 @@ impl RootScan<'_> {
             return Err(e);
         }
         self.flush()?;
+        if self.root_gone {
+            let verdict = judge_gone(self.idx.root_id(root)?, nearest_ancestor_id(root));
+            match verdict {
+                Gone::Deleted if !self.opts.unregister_deleted => {
+                    self.summary.deleted += 1;
+                    let note = "not unregistered: UnregisterDeleted is off".to_owned();
+                    self.report(
+                        ReportKind::Deleted,
+                        root.as_bytes().to_vec(),
+                        None,
+                        Some(note),
+                    );
+                    return Ok(());
+                }
+                Gone::Deleted => {}
+                Gone::MissingMount(why) => {
+                    self.root_refused = true;
+                    self.summary.refused += 1;
+                    self.report(
+                        ReportKind::Refused,
+                        root.as_bytes().to_vec(),
+                        None,
+                        Some(why),
+                    );
+                }
+            }
+        }
         // A root that could not be opened for any reason but ENOENT says
         // nothing about its files; their entries stay.
         if self.root_refused {
@@ -326,6 +390,15 @@ impl RootScan<'_> {
         for chunk in gone.chunks(BATCH) {
             self.idx
                 .batch(|ix| chunk.iter().try_for_each(|p| ix.remove(p)))?;
+        }
+        if self.root_gone {
+            // Registry first, as `unregister` does: if we die between the two,
+            // the next run's reconcile drops what is left.
+            self.store
+                .edit_registry(self.lock, |v| v.retain(|r| r != root))?;
+            self.idx.remove_under(root)?;
+            self.summary.deleted += 1;
+            self.report(ReportKind::Deleted, root.as_bytes().to_vec(), None, None);
         }
         Ok(())
     }

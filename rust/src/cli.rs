@@ -335,6 +335,7 @@ fn label(kind: ReportKind) -> &'static str {
         ReportKind::Violation => "VIOLATION",
         ReportKind::Accepted => "ACCEPTED",
         ReportKind::Missing => "MISSING",
+        ReportKind::Deleted => "DELETED",
         ReportKind::Excluded => "EXCLUDED",
         ReportKind::Unstable => "UNSTABLE",
         ReportKind::Error => "ERROR",
@@ -387,7 +388,7 @@ fn report_scan(
 
 fn summary_line(s: &Summary) -> String {
     format!(
-        "new={} edited={} unchanged={} skipped={} violation={} accepted={} missing={} \
+        "new={} edited={} unchanged={} skipped={} violation={} accepted={} missing={} deleted={} \
          excluded={} unstable={} error={} refused={} subextant={} mount={} symlinks={} special={}",
         s.new,
         s.edited,
@@ -396,6 +397,7 @@ fn summary_line(s: &Summary) -> String {
         s.violation,
         s.accepted,
         s.missing,
+        s.deleted,
         s.excluded,
         s.unstable,
         s.error,
