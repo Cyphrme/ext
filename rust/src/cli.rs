@@ -251,8 +251,8 @@ fn command(cli: &Cli, w: &mut impl Write) -> Result<u8, CliError> {
             let (store, _cfg) = open_store(cli)?;
             // Writers hold this lock, so the registry and the index are read
             // with none between them.
-            let _lock = store.lock()?;
-            crate::transfer::export(&store, dir)?;
+            let lock = store.lock()?;
+            crate::transfer::export(&store, &lock, dir)?;
             0
         }
         Cmd::Import { dir } => {

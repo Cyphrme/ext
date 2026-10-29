@@ -15,7 +15,7 @@ use crate::digest::{Alg, Digest, Enc};
 use crate::escape::{escape, unescape};
 use crate::index::{Entry, Index, Meta};
 use crate::registry::{self, RegPath};
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, WriteLock};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
@@ -66,7 +66,9 @@ fn join_fields(fields: &[&[u8]]) -> Vec<u8> {
 
 /// Writes the three files into `dir`, each through a temp file in `dir`
 /// renamed into place, so a reader sees an old file or a new one.
-pub fn export(store: &Store, dir: &Path) -> Result<(), TransferError> {
+/// `_lock` proves the caller holds the store lock, so the registry and the
+/// index are read with no writer between them.
+pub fn export(store: &Store, _lock: &WriteLock, dir: &Path) -> Result<(), TransferError> {
     let io_err = |what, path: &Path| {
         let path = path.to_path_buf();
         move |source| TransferError::Io { what, path, source }
