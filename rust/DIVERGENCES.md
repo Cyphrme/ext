@@ -112,17 +112,13 @@ into unless registered (README, Technical Considerations: Recursion).
 - Why: a store the user does not own, or that others can write, cannot vouch for
   anything.
 
-### Current-directory step is `./.ext` (differs, #13)
+### Current-directory step is `./.ext` (follows, #13)
 
-- Spec: README, Directories: "4. Current directory"; elevated privilege skips
-  it (Trust).
-- Does: the order is as specced, but the current-directory step looks for
-  `./.ext`, not `./`. A candidate "exists" only if `registry`, `index.db` and
-  `lock` are regular files in it. Once `/var/lib/ext` is a store, a non-root
-  user without `--d` or `EXTANT_DIR` reaches it first and gets exit 4 (foreign
+- Spec: README, Directories: "4. Current directory: its `.ext/` store".
+- Does: the same. A candidate exists only if `registry`, `index.db` and `lock`
+  are regular files in it. Once `/var/lib/ext` is a store, a non-root user
+  without `--d` or `EXTANT_DIR` reaches it first and gets exit 4 (foreign
   owner), even with `./.ext` present; that follows from the specced order.
-- Why: `init` and the sub-extant rule put a store in `<dir>/.ext/`. The spec's
-  wording could also mean `./` as the store; the spec does not say.
 
 ### `--d` names the store (differs)
 
@@ -141,16 +137,13 @@ into unless registered (README, Technical Considerations: Recursion).
   disables" unregistering a deleted root.
 - Does: reads `<store>/config` (JSON5, optional) with the registry's ownership
   and mode checks. Honoured: `Base64` and `Hex` (false refuses that encoding as
-  `resolve` input), `DefaultEnc` (`B64` or `Hex`; `--hex` overrides). Two keys
-  the spec describes without naming: `CompareCtimeInode` and
-  `UnregisterDeleted` (both default true). Every other key (`Aware`, `IndexEnc`,
+  `resolve` input), `DefaultEnc` (`B64` or `Hex`; `--hex` overrides),
+  `CompareCtimeInode` and `UnregisterDeleted` (both default true). Every other key (`Aware`, `IndexEnc`,
   `Truncation`, `Unlabeled`, `Directory`, `Hash`) is accepted only at the value
   the code already behaves as; any other value, and any unknown key, is
   exit 4 naming the key. `Directory` is not a working-directory setting here.
 - Why: a key that is accepted and ignored would let an operator believe a policy
-  is in force. The names `CompareCtimeInode` and `UnregisterDeleted` are this
-  implementation's: the spec says "a configuration option" without naming one.
-  They need names in the spec.
+  is in force.
 
 ### `init` layout (differs, #13)
 
