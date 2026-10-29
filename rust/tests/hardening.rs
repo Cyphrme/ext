@@ -331,7 +331,7 @@ fn locate_prefers_p_over_p_dot_ext_when_both_are_stores() {
     let p = t.path().join("p");
     mk_store(&p);
     mk_store(&p.join(".ext"));
-    let got = locate(Some(&p), None, &t.path().join("nodef"), t.path()).unwrap();
+    let got = locate(Some(&p), None, &t.path().join("nodef"), t.path(), false).unwrap();
     assert_eq!(got, (p, Source::Flag));
 }
 
