@@ -229,3 +229,110 @@ fn a_file_root_survives_export_and_import() {
         .1
         .contains(&format!("\t{}\n", f.display())));
 }
+
+// ---- the store is never indexed, whatever the root is.
+
+fn scan_roots(base: &Path, roots: &[&Path]) -> (Summary, Vec<Report>, Vec<Vec<u8>>) {
+    let st = store_with_roots(base, roots);
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    let mut reps = Vec::new();
+    let s = run(&st, &lock, &ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
+    let paths = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+    (s, reps, paths)
+}
+
+// A hand-edited registry bypasses `register`, so the walk refuses too.
+#[test]
+fn a_store_file_as_a_root_is_refused_by_the_walk() {
+    for name in ["registry", "index.db", "lock"] {
+        let (_t, base) = canon_tmp();
+        let target = base.join("store").join(name);
+        let (s, reps, paths) = scan_roots(&base, &[&target]);
+        assert_eq!(
+            kinds(&reps, K::Refused),
+            vec![b(&target)],
+            "{name}: {reps:?}"
+        );
+        assert_eq!(s.exit_code(), 5, "{name}");
+        assert!(paths.is_empty(), "{name}: indexed {paths:?}");
+    }
+}
+
+#[test]
+fn the_store_directory_or_a_directory_inside_it_is_refused_as_a_root() {
+    let (_t, base) = canon_tmp();
+    let store = base.join("store");
+    for root in [store.clone(), store.join("sub")] {
+        // The store is created by store_with_roots; add the subdirectory first.
+        let _ = fs::create_dir_all(&root.parent().unwrap());
+        let (_s, reps, paths) = scan_roots_in(&base, &root);
+        assert_eq!(kinds(&reps, K::Refused), vec![b(&root)], "{reps:?}");
+        assert!(paths.is_empty(), "indexed {paths:?}");
+        fs::remove_dir_all(&store).unwrap();
+    }
+}
+
+fn scan_roots_in(base: &Path, root: &Path) -> (Summary, Vec<Report>, Vec<Vec<u8>>) {
+    let st = store_with_roots_unchecked(base, root);
+    let ix = Index::open(&st).unwrap();
+    let lock = st.lock().unwrap();
+    let mut reps = Vec::new();
+    let s = run(&st, &lock, &ix, &Opts::default(), &mut |r| reps.push(r)).unwrap();
+    let paths = ix.iter().unwrap().into_iter().map(|e| e.path).collect();
+    (s, reps, paths)
+}
+
+fn store_with_roots_unchecked(base: &Path, root: &Path) -> Store {
+    let st = Store::init_bare(&base.join("store")).unwrap();
+    fs::create_dir_all(root).unwrap();
+    let lock = st.lock().unwrap();
+    st.edit_registry(&lock, |v| *v = vec![support::rp(root)])
+        .unwrap();
+    drop(lock);
+    st
+}
+
+// The same rule the directory walk applies to a sub-extant's store.
+#[test]
+fn a_file_inside_a_sub_extants_store_is_refused_as_a_root() {
+    let (_t, base) = canon_tmp();
+    let sub = base.join("sub");
+    fs::create_dir(&sub).unwrap();
+    Store::init_extant(&sub).unwrap();
+    let target = sub.join(".ext/registry");
+    let (s, reps, paths) = scan_roots(&base, &[&target]);
+    assert_eq!(kinds(&reps, K::Refused), vec![b(&target)], "{reps:?}");
+    assert_eq!(s.exit_code(), 5);
+    assert!(paths.is_empty(), "{paths:?}");
+}
+
+#[test]
+fn register_refuses_the_stores_own_files_and_its_sub_extants() {
+    let (_t, base) = canon_tmp();
+    let store = base.join("store");
+    Store::init_bare(&store).unwrap();
+    let sub = base.join("sub");
+    fs::create_dir(&sub).unwrap();
+    Store::init_extant(&sub).unwrap();
+    for target in [
+        store.join("registry"),
+        store.join("index.db"),
+        store.clone(),
+        sub.join(".ext/index.db"),
+        sub.join(".ext"),
+    ] {
+        let before = fs::read(store.join("registry")).unwrap();
+        let (code, _, err) = ext(&store, &["register", target.to_str().unwrap()]);
+        assert_eq!(code, 4, "{}: {err}", target.display());
+        assert_eq!(fs::read(store.join("registry")).unwrap(), before);
+    }
+    // A control: an ordinary file beside the store is fine.
+    let ok = base.join("ok");
+    fs::write(&ok, b"x").unwrap();
+    assert_eq!(ext(&store, &["register", ok.to_str().unwrap()]).0, 0);
+    // After which a check does not report the store's own files.
+    let (code, out, err) = ext(&store, &["check"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+}
