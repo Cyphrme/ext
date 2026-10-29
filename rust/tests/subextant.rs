@@ -101,3 +101,35 @@ fn registered_sub_extant_under_a_registered_root_is_indexed_once() {
     assert_eq!(news, 1, "{reps:?}");
     assert!(reps.iter().all(|r| r.kind != K::Excluded), "{reps:?}");
 }
+
+// README, Subdirectory Registration: the marker is a `.ext/` directory
+// holding a registry. A sub-extant made by another implementation has no
+// index.db or lock of ours, and must still not be indexed as content.
+#[test]
+fn a_dot_ext_with_only_a_registry_is_a_sub_extant() {
+    let t = tree();
+    let ext = t.sub.join(".ext");
+    for f in ["index.db", "lock"] {
+        fs::remove_file(ext.join(f)).unwrap();
+    }
+    let (reps, paths) = scan(&t, &[&t.root]);
+    assert!(
+        reps.iter()
+            .any(|r| r.kind == K::SubExtant && r.path == b(&t.sub)),
+        "{reps:?}"
+    );
+    assert!(!has(&paths, &t.sub.join("inner")));
+    nothing_from_a_store(&paths, &t.sub);
+}
+
+// Hardening beyond the spec: a group-writable `.ext` is not trusted to hide
+// a subtree, whatever it holds.
+#[test]
+fn a_group_writable_dot_ext_does_not_exclude() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tree();
+    fs::set_permissions(t.sub.join(".ext"), fs::Permissions::from_mode(0o770)).unwrap();
+    let (reps, paths) = scan(&t, &[&t.root]);
+    assert!(reps.iter().all(|r| r.kind != K::SubExtant), "{reps:?}");
+    assert!(has(&paths, &t.sub.join("inner")));
+}
