@@ -305,10 +305,12 @@ pub(crate) fn walk_checked(
     }
 }
 
-/// A `.ext` directory makes its parent a sub-extant only if it is a real
-/// store: registry, index.db and lock present as regular files, owned by the
-/// root's owner or by root, and not group/other-writable. Any other `.ext`
-/// is ordinary content, so planting one cannot hide a subtree.
+/// A `.ext` directory makes its parent a sub-extant only if it holds a
+/// `registry` file (README, Subdirectory Registration), both owned by the
+/// root's owner or by root. Another implementation's store need not have the
+/// index and lock files this one keeps, so they are not required. Not being
+/// group/other-writable is added hardening. Any other `.ext` is ordinary
+/// content, so planting one cannot hide a subtree.
 fn is_real_store(ctx: &Ctx<'_>, parent: &OwnedFd, ext: &Statx) -> bool {
     let trusted =
         |st: &Statx| (st.stx_uid == 0 || st.stx_uid == ctx.root_uid) && st.stx_mode & 0o022 == 0;
@@ -318,19 +320,15 @@ fn is_real_store(ctx: &Ctx<'_>, parent: &OwnedFd, ext: &Statx) -> bool {
     let Ok(dir) = openat(parent, ".ext", DIR_FLAGS, Mode::empty()) else {
         return false;
     };
-    ["registry", "index.db", "lock"].iter().all(|f| {
-        statx(
-            &dir,
-            *f,
-            AtFlags::SYMLINK_NOFOLLOW,
-            StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID,
-        )
-        .is_ok_and(|st| is_type(&st, FileType::RegularFile) && trusted(&st))
-    })
+    statx(
+        &dir,
+        "registry",
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID,
+    )
+    .is_ok_and(|st| is_type(&st, FileType::RegularFile) && trusted(&st))
 }
 
-/// A registered root is walked even if it holds a store of its own: the
-/// registration is what lets a parent hash a sub-extant's files itself.
 fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>, is_root: bool) {
     match statx(
         &dir.fd,

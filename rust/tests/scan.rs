@@ -746,7 +746,7 @@ fn unstable_report_carries_the_detail() {
 }
 
 // A directory named `.ext` makes its parent a sub-extant only if it is a
-// real store: registry, index.db and lock present, not group/other-writable.
+// real store: a registry file inside, not group/other-writable.
 // Anything else is an ordinary directory, walked and indexed normally.
 #[test]
 fn only_a_real_store_dot_ext_excludes() {
@@ -954,18 +954,24 @@ fn very_deep_tree_is_walked_without_crashing() {
     );
 }
 
-// A `.ext` is a store only with all three files: one holding just a registry
-// is ordinary content, walked and indexed.
+// A `.ext` is a store because of its registry (README, Subdirectory
+// Registration): index.db and lock without one are ordinary content.
 #[test]
-fn dot_ext_with_only_a_registry_is_walked() {
+fn dot_ext_without_a_registry_is_walked() {
     let e = env();
     fs::create_dir_all(e.root.join("d/.ext")).unwrap();
     fs::write(e.root.join("d/f"), b"f").unwrap();
-    fs::write(e.root.join("d/.ext/registry"), b"").unwrap();
+    for f in ["index.db", "lock"] {
+        fs::write(e.root.join("d/.ext").join(f), b"").unwrap();
+    }
     let (s, reps) = scan(&e, &Opts::default());
     let mut new = kinds(&reps, K::New);
     new.sort();
-    let want = [b(&e.root.join("d/.ext/registry")), b(&e.root.join("d/f"))];
+    let want = [
+        b(&e.root.join("d/.ext/index.db")),
+        b(&e.root.join("d/.ext/lock")),
+        b(&e.root.join("d/f")),
+    ];
     assert_eq!(new, want);
     assert_eq!(s.subextant, 0);
 }

@@ -267,22 +267,14 @@ pub enum Gone {
     MissingMount(String),
 }
 
-/// The whole verdict, a pure function of what was observed: the walk's open
-/// of the root (`first`), the identity recorded for it, the identity of its
-/// nearest existing ancestor, and a second open (`again`) made after the
-/// ancestor was read. A root is deleted only if both opens saw it absent and
-/// the ancestor is on the recorded filesystem. Anything else, including not
+/// The whole verdict for a root the walk found missing (ENOENT), a pure
+/// function of what was observed: the identity recorded for it, the identity
+/// of its nearest existing ancestor, and a second open (`again`) made after
+/// the ancestor was read. A root is deleted only if that open still saw it
+/// absent and the ancestor is on the recorded filesystem. Anything else, including not
 /// knowing, is treated as an unmounted disk, because forgetting a baseline
 /// cannot be undone.
-pub fn judge_gone(
-    first: Probe,
-    recorded: Option<RootId>,
-    ancestor: io::Result<RootId>,
-    again: Probe,
-) -> Gone {
-    if first != Probe::Absent {
-        return Gone::MissingMount("root was not seen to be missing".into());
-    }
+pub fn judge_gone(recorded: Option<RootId>, ancestor: io::Result<RootId>, again: Probe) -> Gone {
     match (recorded, ancestor) {
         (None, _) => Gone::MissingMount(
             "root is missing and no filesystem identity was recorded for it, so a deletion \
@@ -343,6 +335,9 @@ impl RootScan<'_> {
             return Err(e);
         }
         self.flush()?;
+        // Set only by the verdict itself, so the unregistration below cannot
+        // run for a root that was not judged deleted.
+        let mut unregister = false;
         if self.root_gone {
             let recorded = self.idx.root_id(root)?;
             let ancestor = nearest_ancestor_id(root);
@@ -351,7 +346,7 @@ impl RootScan<'_> {
             } else {
                 Probe::Present
             };
-            match judge_gone(Probe::Absent, recorded, ancestor, again) {
+            match judge_gone(recorded, ancestor, again) {
                 Gone::Deleted if !self.opts.unregister_deleted => {
                     self.summary.deleted += 1;
                     let note = "not unregistered: UnregisterDeleted is off".to_owned();
@@ -363,7 +358,7 @@ impl RootScan<'_> {
                     );
                     return Ok(());
                 }
-                Gone::Deleted => {}
+                Gone::Deleted => unregister = true,
                 Gone::MissingMount(why) => {
                     self.root_refused = true;
                     self.summary.refused += 1;
@@ -418,7 +413,7 @@ impl RootScan<'_> {
             self.idx
                 .batch(|ix| chunk.iter().try_for_each(|p| ix.remove(p)))?;
         }
-        if self.root_gone {
+        if unregister {
             // Registry first, as `unregister` does: if we die between the two,
             // the next run's reconcile drops what is left.
             self.store
