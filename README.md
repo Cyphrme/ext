@@ -204,12 +204,12 @@ Truncation is supported but disabled by default. For example:
 Note that the strength of the integrity protection is lessened with truncation.
 
 **Collision**
-A collision is where two distinct inputs resolve to a single digest. This may happen when
-using a non-cryptographic hash, truncation, or a broken cryptographic hash.
-Although `ext` is designed for cryptographic hashes, there are circumstances
-where non-cryptographic hashes are useful, such as speed and smaller lookup
-keys. Non-cryptographic algorithms are "locate only": they are never used
-for verification, cache admission, or fetching.
+A collision is where two distinct inputs resolve to a single digest. This may
+happen when using a non-cryptographic hash, truncation, or a broken
+cryptographic hash. Although `ext` is designed for cryptographic hashes, there
+are circumstances where non-cryptographic hashes are useful, such as speed and
+smaller lookup keys. Non-cryptographic algorithms are "locate only": they are
+never used for verification, cache admission, or fetching.
 
 On collision for truncation or non-cryptographic hashed, tooling provides top
 matches. For cryptographic hashes provided with full sized digests, tooling must
@@ -232,9 +232,9 @@ The order of operations for the lookups is:
 3. Query external services
 
 The cache has two indexes which provide O(log(n)) lookups, the Cache Index
-comprised of <dig>:<path> and the Cache Time Index, comprised of <dig>:<time>.
-Cache capacity is set in bytes in the config. Once the cache reaches capacity,
-the least recently used items are evicted.
+comprises <dig>:<path> pairs and the Cache Time Index comprises <dig>:<time>
+pairs. Cache capacity is set in bytes in the config. Once the cache reaches
+capacity, the least recently used items are evicted.
 
 A fetched blob is hashed in full with the requested alg and compared with the
 requested digest before it is cached or returned. On mismatch it is discarded,
@@ -286,7 +286,7 @@ The config file is saved as <extant_path>/config. Its format is JSON5.
 - UnregisterDeleted - True - Unregister a deleted root (see docs/traversal.md).
 
 ## Commands
-`ext init <path>` - Create a `ext` directory with a new registry. If no path is
+`ext init <path>` - Create an `ext` directory with a new registry. If no path is
 specified CWD is used.
 
 `ext register`,`ext -r`  - Registration. Supports both files and directories.
@@ -413,7 +413,7 @@ the sub-extant's files itself and does not read the sub-extant's index.
 
 **Digest Labeling** - Unlabeled digests are a security concern: the weakest hash
 becomes the security floor of the system overall. A system with unlabeled
-digests is only as strong as the weakest supported hash algorithm.
+digests are only as strong as the weakest supported hash algorithm.
 
 If the hashes are trusted, or for systems that only support one hash type or
 otherwise inferred, the label may be dropped, but the responsibility should be
