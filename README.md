@@ -55,7 +55,7 @@ Path Index: <path>\t<digest>:<alg>
 Tag:        <tag>\t<digest>:<alg>
 Cache:      <digest>:<alg>\t<path>
 Cache Time: <digest>:<alg>\t<time>
-Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>
+Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>\t<dev>
 
 Index files are TSV as defined in https://github.com/Cyphrme/TSV: fields are
 tab delimited, records are newline delimited, and a backslash, tab, or newline
@@ -281,7 +281,7 @@ The config file is saved as <extant_path>/config. Its format is JSON5.
 - Unlabeled  - False - Do not require digest labeling.
 - Directory  - CWD   - Specify working directory for `ext`.
 - Hash     - SHA-256 - Default hash.
-- CompareCtimeInode - True - Compare ctime and inode when deciding to skip a file
+- CompareCtimeInode - True - Compare ctime, inode and dev when deciding to skip a file
   (see Incrementality).
 - UnregisterDeleted - True - Unregister a deleted root (see docs/traversal.md).
 
@@ -299,7 +299,7 @@ indexing. A deleted root is also unregistered; see
 
 `ext list` - prints the source index.
 
-`ext check`, `ext -check` - Re-hash files whose metadata changed (see
+`ext check` - Re-hash files whose metadata changed (see
 Incrementality) and record their new digests as edits. Skip unchanged paths.
 
 `ext check --full` - Re-hash all files and do not skip unchanged paths. A
@@ -308,7 +308,7 @@ reported, the index is not updated, and `check` exits 2.
 
 `ext check --accept` - Record reported violations as the new digests.
 
-`ext -rerun` - Rebuild all indexes and re-hash all files.
+`ext rebuild` - Rebuild all indexes and re-hash all files.
 
 `ext --d <path>` - Specifies the working directory for `ext`.
 
@@ -323,6 +323,8 @@ reported, the index is not updated, and `check` exits 2.
 - 2 - Mismatch (`check`)
 - 3 - Ambiguous
 - 4 - Usage or configuration error
+- 5 - Incomplete: some paths could not be read or were refused, and no
+  mismatch was found. A mismatch (2) takes precedence.
 
 ## Incrementality
 Incrementality uses a persistent timestamp index and an optional continuous
@@ -336,17 +338,19 @@ verification.
   nanoseconds, as observed at that examination
 - `size` - the file's size in bytes
 - `inode` - the file's inode number (or platform equivalent)
+- `dev` - the device number of the file's filesystem; an inode number only
+  identifies a file together with its device
 
 On run (CLI or watcher):
 
-1. A path is skipped only if its current `mtime`, `ctime`, `size`, and `inode`
-   all match the stored values, and the entry is not *racy* (below).
+1. A path is skipped only if its current `mtime`, `ctime`, `size`, `inode`, and
+   `dev` all match the stored values, and the entry is not *racy* (below).
 2. Otherwise the file is re-hashed, indexes are updated, and the record is
    rewritten.
 
 mtime alone is not sufficient: it can be set by any process (`touch -d`,
 `utimensat`, `cp -p`, `rsync -t`, archive extraction), whereas ctime cannot be
-set from userspace. A configuration option may disable the ctime and inode
+set from userspace. A configuration option may disable the ctime, inode and dev
 comparisons for filesystems where they are unstable (some FUSE and network
 filesystems).
 
