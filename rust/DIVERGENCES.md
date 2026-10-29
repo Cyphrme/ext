@@ -37,10 +37,12 @@ into (L357).
   The index file is not itself a TSV file, so the spec's "index file replaced
   atomically by rename" holds for the registry and the export files only; SQLite
   provides its own atomicity.
-- Sort order: by the unescaped bytes of the first field. For `source` that field
-  is the text `<b64ut>:SHA-256`, with the path breaking ties, which is not the
-  order of the digest bytes. `ext list` still sorts by digest bytes then path,
-  so `list` and `export` order `source` differently.
+- Sort order: by the unescaped bytes of the first field. For `source` and for
+  `ext list` that field is the text `<value>:SHA-256` as printed (b64ut, or hex
+  with `--hex`), with the path breaking ties; this is not the order of the
+  digest bytes.
+- `export` holds the store's write lock while it reads, so the registry and the
+  index come from one moment. It therefore waits behind a running writer.
 - Import writes the index rows in one transaction and swaps the registry before
   it commits; if the commit itself fails after the swap, the registry is the
   imported one and the index is empty. Rerunning the import is safe.

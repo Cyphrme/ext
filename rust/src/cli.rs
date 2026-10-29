@@ -222,7 +222,11 @@ fn command(cli: &Cli, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
             scan_locked(&open_store(cli)?, &opts, false, fmt, w)?
         }
         Cmd::Export { dir } => {
-            crate::transfer::export(&open_store(cli)?, dir)?;
+            let store = open_store(cli)?;
+            // Writers hold this lock, so the registry and the index are read
+            // with none between them.
+            let _lock = store.lock()?;
+            crate::transfer::export(&store, dir)?;
             0
         }
         Cmd::Import { dir } => {
@@ -323,10 +327,16 @@ fn resolve(store: &Store, q: &Query, fmt: Fmt, w: &mut impl Write) -> Result<u8,
 }
 
 fn list(store: &Store, fmt: Fmt, w: &mut impl Write) -> Result<u8, CliError> {
-    let mut entries = Index::open(store)?.iter()?;
-    entries.sort_by(|a, b| (a.digest.bytes(), &a.path).cmp(&(b.digest.bytes(), &b.path)));
-    for e in &entries {
-        fmt.record(w, &[&e.digest.to_reverse(fmt.enc)], &e.path, &[])?;
+    let entries = Index::open(store)?.iter()?;
+    // The record's first field is the encoded text, so that is the sort key
+    // (the same order `export` gives `source`).
+    let mut rows: Vec<(String, &[u8])> = entries
+        .iter()
+        .map(|e| (e.digest.to_reverse(fmt.enc), e.path.as_slice()))
+        .collect();
+    rows.sort();
+    for (d, p) in &rows {
+        fmt.record(w, &[d], p, &[])?;
     }
     Ok(0)
 }

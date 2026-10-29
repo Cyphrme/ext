@@ -42,7 +42,7 @@ ext [--d <path>] [--hex] [-0] <command>
 | `register <path>`, `-r <path>` | Add the directory (canonicalised) to the registry and scan it. Registering an already registered root re-records its filesystem identity and keeps its entries. |
 | `unregister <path>`, `-u <path>` | Remove an exact registry entry and every index entry under it. |
 | `resolve <arg>` | Print the paths whose last-scanned content has this digest, sorted by bytes. With a name, only paths whose filename equals it. |
-| `list` | Print every `<digest>:SHA-256<TAB><path>`, sorted by digest bytes then path bytes. |
+| `list` | Print every `<digest>:SHA-256<TAB><path>`, sorted by the printed digest text then path bytes. |
 | `check` | Scan the registered roots, hash files whose metadata changed, report differences. Accepts ordinary edits into the index. |
 | `check --full` | Hash every file regardless of metadata. A digest change under unchanged metadata is a `VIOLATION`, not written. |
 | `check --accept` | As `check`, but write violations into the index as the new baseline (reported `ACCEPTED`). |
@@ -156,8 +156,9 @@ files, so an interrupted run loses at most uncommitted work and the next run
 converges.
 
 **Locking.** `register`, `unregister`, `check` and `rebuild` hold an
-exclusive `flock` on `lock` for the whole run and wait for it. `import` takes the same lock.
-`resolve`, `list` and `export` do not lock.
+exclusive `flock` on `lock` for the whole run and wait for it. `import` and `export` take the same lock.
+`resolve` and `list` do not lock. `export` takes the lock so that the
+registry and index it writes agree.
 
 ## Export and import
 
