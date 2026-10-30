@@ -4,8 +4,11 @@ use crate::digest::{Alg, Digest};
 use crate::registry::RegPath;
 use crate::store::{wrap, Store, StoreError};
 use rusqlite::config::DbConfig;
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use std::collections::HashSet;
+use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -158,6 +161,72 @@ impl Index {
         Ok(ix)
     }
 
+    /// For a store the effective user cannot write (ES-25: a `resolve`
+    /// answered from the index must still succeed there). Nothing is created
+    /// or migrated, so a store whose index was never initialised reads as
+    /// empty.
+    pub fn open_read_only(store: &Store) -> Result<Index, StoreError> {
+        store.check_unmoved()?;
+        let db = store.path().join("index.db");
+        // A WAL database can be read without writing only as `immutable`:
+        // otherwise SQLite must create its `-shm` file beside it. Immutable
+        // also drops SQLite's locking, which is sound here because the
+        // effective user, the store's only permitted writer, cannot write.
+        let mut uri = String::from("file:");
+        for &b in db.as_os_str().as_bytes() {
+            if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+                uri.push(char::from(b));
+            } else {
+                uri.push_str(&format!("%{b:02X}"));
+            }
+        }
+        uri.push_str("?immutable=1");
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&uri, flags).map_err(|e| wrap_db(e, &db))?;
+        store.check_unmoved()?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
+        conn.pragma_update(None, "trusted_schema", "OFF")?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if found != SCHEMA_VERSION && found != 0 {
+            return Err(StoreError::Schema {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        Ok(Index { conn })
+    }
+
+    /// The writable index, or the read-only one when the store cannot be
+    /// written: for the lookups, which must not fail on a read-only store.
+    pub fn open_for_lookup(store: &Store) -> Result<Index, StoreError> {
+        if store.read_only() {
+            Index::open_read_only(store)
+        } else {
+            Index::open(store)
+        }
+    }
+
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Whether `table` exists; a read-only open of an old or never-written
+    /// index may lack tables a writable open would have created.
+    pub(crate) fn has_table(&self, table: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// No migrations: an unknown version is refused rather than guessed at.
     fn ensure_schema(&self) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
@@ -195,6 +264,13 @@ impl Index {
                  path BLOB PRIMARY KEY,
                  kind TEXT NOT NULL,
                  id INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cache (
+                 alg TEXT NOT NULL,
+                 digest BLOB NOT NULL,
+                 size INTEGER NOT NULL,
+                 atime_ns INTEGER NOT NULL,
+                 PRIMARY KEY (alg, digest)
              );",
         )?;
         tx.commit()?;
@@ -204,7 +280,7 @@ impl Index {
     /// IMMEDIATE so the write lock is taken up front: a deferred transaction
     /// that reads first can fail on upgrade with BUSY, which `busy_timeout`
     /// does not retry.
-    fn write_tx(&self) -> Result<Transaction<'_>, StoreError> {
+    pub(crate) fn write_tx(&self) -> Result<Transaction<'_>, StoreError> {
         Ok(Transaction::new_unchecked(
             &self.conn,
             TransactionBehavior::Immediate,
@@ -222,6 +298,10 @@ impl Index {
 
     /// Sorted by raw path bytes so `resolve` output is deterministic.
     pub fn by_digest(&self, digest: &Digest) -> Result<Vec<Vec<u8>>, StoreError> {
+        // Only a read-only open of a never-written index lacks the table.
+        if !self.has_table("files")? {
+            return Ok(Vec::new());
+        }
         let mut stmt = self.conn.prepare_cached(
             "SELECT path FROM files WHERE alg = ?1 AND digest = ?2 ORDER BY path",
         )?;
