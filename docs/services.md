@@ -105,12 +105,13 @@ index hits; the store's protection is the trust boundary (README, Trust).
 complete content has been read once into a private copy and hashed, and MUST
 then write that copy. The copy is a 0600 file in `cache/tmp/` (never a memory
 buffer of unbounded size), counted by the sweep and removed on every path. A
-read-only store is unsupported for anything that writes: if the copy cannot be
-created or completed (a read error aside), `cat` stops with exit 5 and a clear
-error, because the blob may exist; it never reports 1 in that case. An index or
-cache file that fails verification is skipped (a cache file is evicted if the
-lock is available), the lookup continues, and a failed index record is reported
-on stderr.
+read-only store is unsupported for anything that writes, and `cat` always
+writes its copy, so `cat` on a read-only store exits 5 even for an indexed
+file. If the copy cannot be created or completed (a read error aside), `cat`
+stops with exit 5 and a clear error, because the blob may exist; it never
+reports 1 in that case. An index or cache file that fails verification is
+skipped (a cache file is evicted if the lock is available), the lookup
+continues, and a failed index record is reported on stderr.
 
 ## Fetch limits and network safety
 
@@ -287,10 +288,10 @@ busy timeout, no space) the lookup (`resolve` or `cat`) stops with exit 5 and a
 clear error, no later service is tried, nothing is delivered and nothing
 partial remains, unless an earlier row of the ES-7 list (exit 2) matches: the
 ES-7 order governs. Temporary files MUST be removed on every error path. A
-read-only store supports reads only: a lookup answered from the local index
-(`resolve`, or `cat --offline` of an indexed file) MUST succeed on one, and
-only the writes (private copy, admission, touch, eviction) are unsupported
-there.
+read-only store supports no writes (private copy, admission, touch,
+eviction), but a `resolve` answered from the local index MUST succeed on one.
+`cat` always needs its private copy (ES-11), so on a read-only store it exits
+5.
 
 **ES-26** After every command, the sum of record sizes is at most
 `CacheCapacity` and the files under `cache/` excluding `tmp/` total no more,
