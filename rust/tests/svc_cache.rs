@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Once};
 use std::time::{Duration, SystemTime};
@@ -975,4 +975,214 @@ fn sweep_age_floor_is_strict() {
     assert!(p.exists(), "exactly 60 s old is not older than 60 s");
     sweep(mtime + Duration::from_secs(60) + Duration::from_nanos(1));
     assert!(!p.exists(), "60 s and 1 ns old is older");
+}
+
+// ------------------------------------------- unlink and discard failures ----
+
+/// Runs every effect for real except `Unlink`/`Commit` of the chosen kind
+/// when the target's file name is in `fail`, which reports EACCES without
+/// doing it: an unlink the OS refuses, or a commit that cannot be made.
+struct Refuse<'a> {
+    inner: FsExecutor<'a>,
+    kind: &'static str,
+    fail: Vec<String>,
+    refused: usize,
+}
+
+impl<'a> Refuse<'a> {
+    fn new(store: &'a Store, kind: &'static str, fail: Vec<String>) -> Refuse<'a> {
+        Refuse {
+            inner: FsExecutor { store },
+            kind,
+            fail,
+            refused: 0,
+        }
+    }
+}
+
+impl StepExecutor for Refuse<'_> {
+    fn step(&mut self, e: &Effect) -> std::io::Result<()> {
+        let hit = match e {
+            Effect::Unlink { path } if self.kind == "unlink" => self
+                .fail
+                .iter()
+                .any(|n| path.file_name().is_some_and(|f| f == n.as_str())),
+            // A commit has no path; `fail` non-empty means "refuse it".
+            Effect::Commit { .. } if self.kind == "commit" => !self.fail.is_empty(),
+            _ => false,
+        };
+        if hit {
+            self.refused += 1;
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        self.inner.step(e)
+    }
+}
+
+/// ES-26: "modulo orphans left by a failed unlink and swept at the next
+/// admit." The commit is the point of no return; an unlink the OS refuses
+/// afterwards leaves an orphan and must not turn a committed admission into
+/// an error. Over every subset of three victims whose unlink fails: admit is
+/// Ok, exactly the new record remains, its file is present, the refused
+/// victims' files are the orphans and the others are gone, and the on-disk
+/// invariants hold. Violator: `ex.step(Unlink)?` after the commit.
+#[test]
+fn a_refused_unlink_after_the_commit_leaves_an_orphan_not_an_error() {
+    let olds: Vec<Vec<u8>> = (0..3).map(|i| blob(10, 10 + i)).collect();
+    let new = blob(30, 99);
+    for mask in 1u8..8 {
+        let f = fixture();
+        let cache = Cache::new(&f.store, 35); // 30 + one old would be 40: all three go
+        let lock = f.store.lock().unwrap();
+        let mut fs_ex = FsExecutor { store: &f.store };
+        for (i, o) in olds.iter().enumerate() {
+            cache
+                .admit(&lock, &mut fs_ex, verified(&cache, o), 1 + i as i64)
+                .unwrap();
+        }
+        let refused: Vec<String> = (0..3)
+            .filter(|i| mask >> i & 1 == 1)
+            .map(|i| hex_name(&digest_of(&olds[i])))
+            .collect();
+        let mut ex = Refuse::new(&f.store, "unlink", refused.clone());
+        let r = cache.admit(&lock, &mut ex, verified(&cache, &new), 10);
+        assert!(
+            r.is_ok(),
+            "mask {mask:03b}: a failed victim unlink failed the committed admit: {r:?}"
+        );
+        assert_eq!(ex.refused, refused.len(), "mask {mask:03b}: setup");
+        drop(lock);
+        let recs = cache.records().unwrap();
+        assert_eq!(
+            recs.iter().map(|r| r.digest.clone()).collect::<Vec<_>>(),
+            [digest_of(&new)],
+            "mask {mask:03b}"
+        );
+        let dir = f.dir.join("cache/SHA-256");
+        assert!(dir.join(hex_name(&digest_of(&new))).is_file());
+        for o in &olds {
+            let n = hex_name(&digest_of(o));
+            assert_eq!(
+                dir.join(&n).exists(),
+                refused.contains(&n),
+                "mask {mask:03b}: only refused victims remain, as orphans"
+            );
+        }
+        assert_cache_invariants(&f);
+    }
+}
+
+/// ES-25 and ES-26 for `evict`: the record delete is committed, so a refused
+/// unlink is an orphan, not an error. Violator: `ex.step(Unlink)?`.
+#[test]
+fn evict_with_a_refused_unlink_still_succeeds() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let content = blob(30, 1);
+    let d = digest_of(&content);
+    let lock = f.store.lock().unwrap();
+    cache
+        .admit(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            verified(&cache, &content),
+            1,
+        )
+        .unwrap();
+    let mut ex = Refuse::new(&f.store, "unlink", vec![hex_name(&d)]);
+    let r = cache.evict(&lock, &mut ex, &d);
+    assert!(r.is_ok(), "committed eviction reported as failed: {r:?}");
+    assert_eq!(ex.refused, 1, "setup");
+    assert!(cache.records().unwrap().is_empty());
+    assert!(f.dir.join(Cache::relative_path(&d)).exists(), "the orphan");
+}
+
+/// ES-10: "Otherwise the record is removed when the lock is available ...
+/// the lookup continues as a miss." Removal is best effort: a stale record
+/// whose removal fails (the commit or the unlink refused) is still a miss,
+/// never an error. Violator: `discard_if_free(..)?` in `lookup`.
+#[test]
+fn a_stale_record_whose_removal_fails_is_still_a_miss() {
+    type Tamper = fn(&Path, &Path);
+    let stale: Vec<(&str, Tamper)> = vec![
+        ("wrong size", |p, _| fs::write(p, blob(99, 1)).unwrap()),
+        ("missing", |p, _| fs::remove_file(p).unwrap()),
+        ("symlink", |p, aside| {
+            fs::write(aside, blob(100, 1)).unwrap();
+            fs::remove_file(p).unwrap();
+            symlink(aside, p).unwrap();
+        }),
+    ];
+    for (name, tamper) in stale {
+        for kind in ["commit", "unlink"] {
+            let f = fixture();
+            let cache = Cache::new(&f.store, 1 << 20);
+            let content = blob(100, 1);
+            let d = digest_of(&content);
+            let lock = f.store.lock().unwrap();
+            cache
+                .admit(
+                    &lock,
+                    &mut FsExecutor { store: &f.store },
+                    verified(&cache, &content),
+                    1,
+                )
+                .unwrap();
+            drop(lock);
+            tamper(&f.dir.join(Cache::relative_path(&d)), &f.dir.join("aside"));
+            let mut ex = Refuse::new(&f.store, kind, vec![hex_name(&d)]);
+            let got = cache.lookup(&d, &mut ex);
+            assert_eq!(
+                got.as_ref().ok(),
+                Some(&None),
+                "{name}, {kind} refused: expected a miss, got {got:?}"
+            );
+        }
+    }
+}
+
+/// ES-10: "`ext` never deletes recursively or opens special files." A FIFO
+/// stands where the record's file should be. Opening it for reading, even
+/// non-blocking, releases a writer blocked in `open(O_WRONLY)`, so the
+/// writer's open completing is the observable of an open. Violator: opening
+/// the path before checking that it is a regular file.
+#[test]
+fn lookup_does_not_open_a_fifo() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let content = blob(100, 1);
+    let d = digest_of(&content);
+    let lock = f.store.lock().unwrap();
+    cache
+        .admit(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            verified(&cache, &content),
+            1,
+        )
+        .unwrap();
+    drop(lock);
+    let file = f.dir.join(Cache::relative_path(&d));
+    fs::remove_file(&file).unwrap();
+    let c = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "setup");
+
+    let (tx, rx) = mpsc::channel();
+    let p = file.clone();
+    let writer = std::thread::spawn(move || {
+        let w = fs::OpenOptions::new().write(true).open(&p);
+        tx.send(w.is_ok()).ok();
+        drop(w);
+    });
+    std::thread::sleep(Duration::from_millis(300)); // let the writer block in open
+    let got = cache.lookup(&d, &mut FsExecutor { store: &f.store });
+    let opened = rx.recv_timeout(Duration::from_millis(300)).is_ok();
+    // Release the writer if lookup did not, so the thread ends either way.
+    let _ = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&file);
+    writer.join().unwrap();
+    assert!(!opened, "lookup opened the FIFO (a reader appeared)");
+    assert_eq!(got.ok(), Some(None), "a FIFO is a miss");
 }
