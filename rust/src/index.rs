@@ -56,6 +56,8 @@ pub struct Index {
     /// A read-only open of an index nobody has written yet: its tables are
     /// absent, and that alone means "empty".
     uninitialised: bool,
+    /// For messages naming the database.
+    path: std::path::PathBuf,
 }
 
 /// SQLite integers are signed 64-bit; `u64` fields are stored as their
@@ -179,6 +181,7 @@ impl Index {
         let ix = Index {
             conn,
             uninitialised: false,
+            path: db,
         };
         ix.ensure_schema()?;
         Ok(ix)
@@ -229,6 +232,7 @@ impl Index {
         Ok(Index {
             conn,
             uninitialised: found == 0,
+            path: db,
         })
     }
 
@@ -362,7 +366,11 @@ impl Index {
             if self.uninitialised {
                 return Ok(Vec::new());
             }
-            return Err(StoreError::Corrupt("the index has no files table".into()));
+            // Damage, not a usage error: the blob may be indexed (ES-7).
+            return Err(StoreError::IndexUnreadable {
+                path: self.path.clone(),
+                why: "it is initialised but has no files table".into(),
+            });
         }
         let mut stmt = self.conn.prepare_cached(
             "SELECT path FROM files WHERE alg = ?1 AND digest = ?2 ORDER BY path",

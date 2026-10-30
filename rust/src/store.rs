@@ -70,7 +70,8 @@ pub enum StoreError {
     Schema { found: i64, expected: i64 },
     #[error("corrupt index row: {0}")]
     Corrupt(String),
-    /// A read-only store whose index cannot be read completely. Not a usage
+    /// An index that cannot be read completely: a read-only store whose WAL
+    /// is unreadable, or an initialised index missing a table. Not a usage
     /// error: the blob may be indexed (exit 5, as ES-25's failed writes).
     #[error("cannot read index {}: {why}", path.display())]
     IndexUnreadable { path: PathBuf, why: String },
