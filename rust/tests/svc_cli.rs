@@ -1123,3 +1123,27 @@ fn service_errors_say_why() {
         );
     }
 }
+
+/// ES-7: 4 is usage or configuration. An initialised index that has lost
+/// its `files` table is a damaged store, where the blob may be indexed:
+/// a lookup must fail loudly with 5, never 4 and never "absent".
+/// Violator: reading the missing table as empty, or as a usage error.
+#[test]
+fn an_index_missing_its_table_is_a_store_error() {
+    let env = setup(&[]);
+    let b = blob(10, 2);
+    env.index_file("f", &b);
+    let c = rusqlite::Connection::open(env.store.join("index.db")).unwrap();
+    c.execute_batch("DROP TABLE files").unwrap();
+    drop(c);
+    for cmd in ["resolve", "cat"] {
+        let o = env.ext(&[cmd, &label(&b)]);
+        assert_eq!(o.code, 5, "{cmd}: {}", o.stderr);
+        assert!(
+            o.stderr.contains("index"),
+            "{cmd}: names the index: {}",
+            o.stderr
+        );
+        assert!(o.stdout.is_empty());
+    }
+}
