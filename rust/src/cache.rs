@@ -568,8 +568,9 @@ impl<'a> Cache<'a> {
                     .and_then(|n| data_encoding::HEXUPPER.decode(n.as_bytes()).ok())
                     .and_then(|b| Digest::from_bytes(*alg, &b).ok())
                     .is_some_and(|d| resident.contains(&d));
+                // One that cannot be removed stays an orphan (ES-26).
                 if !known {
-                    ex.step(&Effect::Unlink { path })?;
+                    let _ = ex.step(&Effect::Unlink { path });
                 }
             }
         }
@@ -593,7 +594,9 @@ impl<'a> Cache<'a> {
                 continue;
             };
             match rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => ex.step(&Effect::Unlink { path })?,
+                Ok(()) => {
+                    let _ = ex.step(&Effect::Unlink { path });
+                }
                 Err(rustix::io::Errno::WOULDBLOCK) => {}
                 Err(e) => return Err(CacheError::Io(e.into())),
             }
