@@ -52,6 +52,15 @@ pub enum Cmd {
         path: PathBuf,
     },
     Resolve {
+        /// Consult the local index and cache only (ES-32).
+        #[arg(long)]
+        offline: bool,
+        digest: String,
+    },
+    /// Write the verified bytes of a blob to stdout (ES-11).
+    Cat {
+        #[arg(long)]
+        offline: bool,
         digest: String,
     },
     List,
@@ -230,7 +239,8 @@ fn command(cli: &Cli, w: &mut impl Write) -> Result<u8, CliError> {
             register(&store, path, &cfg, fmt_for(cli, &cfg), w)?
         }
         Cmd::Unregister { path } => unregister(&open_store(cli)?.0, path)?,
-        Cmd::Resolve { digest } => {
+        Cmd::Cat { .. } => todo!("ES-11 cat"),
+        Cmd::Resolve { digest, .. } => {
             let q = Query::parse(digest)?;
             let (store, cfg) = open_store(cli)?;
             cfg.check_input(q.enc)?;
