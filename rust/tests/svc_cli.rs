@@ -554,7 +554,8 @@ fn an_admission_that_cannot_happen_is_exit_5_not_1() {
 #[test]
 fn a_cache_hit_never_waits_for_the_lock() {
     let b = blob(64, 4);
-    let env = setup(&[&honest(&b)]);
+    let fb = honest(&b);
+    let env = setup(&[&fb]);
     assert_eq!(env.ext(&["resolve", &label(&b)]).code, 0, "admit");
     let before = env.records();
     let lock = Store::open(&env.store).unwrap().lock().unwrap();
@@ -577,7 +578,8 @@ fn the_cache_is_invisible_to_list_and_scans() {
         return;
     }
     let b = blob(64, 1);
-    let env = setup(&[&honest(&b)]);
+    let fb = honest(&b);
+    let env = setup(&[&fb]);
     env.index_file("w", b"work");
     assert_eq!(env.ext(&["-r", env.base.to_str().unwrap()]).code, 0, "register the directory holding the store");
     let list0 = env.ext(&["list"]).stdout;
@@ -622,7 +624,8 @@ fn the_lock_is_not_held_while_waiting_on_a_service() {
     let out = child.wait_with_output().unwrap();
     assert_eq!((out.status.code(), &out.stdout), (Some(0), &b));
 
-    let env = setup(&[&honest(&b)]);
+    let fb = honest(&b);
+    let env = setup(&[&fb]);
     let outs: Vec<Out> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..4).map(|_| s.spawn(|| env.ext(&["cat", &label(&b)]))).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
