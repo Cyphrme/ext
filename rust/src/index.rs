@@ -155,7 +155,24 @@ impl Index {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
         // Readers must not block the single writer or vice versa; the mode is
         // persisted in the file, so this is a no-op on later opens.
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
+        // Switching a fresh file to WAL needs an exclusive lock that SQLite
+        // does not wait for through the busy handler, so processes opening a
+        // new store together retry here instead of failing.
+        let deadline = std::time::Instant::now() + Duration::from_millis(5000);
+        loop {
+            match conn
+                .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))
+            {
+                Ok(_) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         let ix = Index { conn };
         ix.ensure_schema()?;
         Ok(ix)
