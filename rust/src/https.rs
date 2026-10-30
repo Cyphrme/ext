@@ -55,8 +55,8 @@ pub struct Client {
 }
 
 impl Client {
-    /// Loads trust roots lazily (ES-17): a failure is an `Error` outcome of
-    /// the attempt, not a failure here.
+    /// Trust roots load once, before an attempt's ES-13 clock starts (ES-17);
+    /// a load failure is an `Error` outcome of the attempt, not a failure here.
     pub fn new(cfg: HttpsConfig, resolver: Box<dyn Resolver>, table: AddrTable) -> Client {
         let _ = (cfg, resolver, table);
         todo!("ES-17")

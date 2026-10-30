@@ -10,7 +10,7 @@ use crate::services::Fetchable;
 use crate::store::{Store, WriteLock};
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Nanoseconds since the epoch; the CLI passes the real clock (S6).
@@ -55,9 +55,42 @@ impl StepExecutor for FsExecutor<'_> {
 }
 
 /// An in-flight file: 0600 in `cache/tmp/`, `flock`ed for its fetch's life.
+/// It is deleted when dropped unless [`TmpFile::persist`] ran, so cleanup on
+/// every error path is structural and no caller has to remember it.
 pub struct TmpFile {
-    pub file: File,
-    pub path: PathBuf,
+    file: File,
+    path: PathBuf,
+    persisted: bool,
+}
+
+impl TmpFile {
+    /// A file with no name on disk (nothing to delete on drop): for stubs and
+    /// in-memory sinks.
+    pub fn anonymous(file: File) -> TmpFile {
+        TmpFile { file, path: PathBuf::new(), persisted: false }
+    }
+
+    pub fn file(&mut self) -> &mut File {
+        &mut self.file
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Admit calls this once the file has its final name.
+    #[allow(dead_code)] // called by `Cache::admit` once the file has its final name
+    pub(crate) fn persist(&mut self) {
+        self.persisted = true;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if !self.persisted && !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,8 +124,8 @@ impl Verified {
         self.size
     }
 
-    pub fn tmp(&self) -> &TmpFile {
-        &self.tmp
+    pub fn path(&self) -> &Path {
+        self.tmp.path()
     }
 }
 
