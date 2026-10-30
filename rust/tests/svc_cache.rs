@@ -509,13 +509,27 @@ fn touch_is_monotone_and_never_waits() {
         .unwrap();
     drop(lock);
     let atime = || cache.records().unwrap()[0].atime_ns;
-    assert!(cache.touch(&d, 900).unwrap());
+    // The lock is free here, but a `sha256sum` spawned by a parallel test
+    // inherits this process's lock descriptor until it execs, which can hold
+    // the flock for a moment after `drop(lock)`. A touch that skips then is
+    // correct (ES-27), so retry a bounded number of times and require that
+    // the touch ran: an assertion after a skipped touch would prove nothing.
+    let touched = |d: &Digest, now: i64| {
+        for _ in 0..500 {
+            if cache.touch(d, now).unwrap() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the free lock never became available to touch");
+    };
+    touched(&d, 900);
     assert_eq!(atime(), 900);
-    cache.touch(&d, 100).unwrap();
+    touched(&d, 100);
     assert_eq!(atime(), 900, "a touch never lowers atime");
     // Touching a digest that is not resident is a no-op, not an error.
     let before = cache.records().unwrap();
-    assert!(cache.touch(&digest_of(b"absent"), 7_000).is_ok());
+    touched(&digest_of(b"absent"), 7_000);
     assert_eq!(cache.records().unwrap(), before);
     // Re-admission keeps atime := max(old, now), even with a backward clock.
     let lock = f.store.lock().unwrap();
