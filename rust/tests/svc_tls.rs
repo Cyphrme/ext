@@ -439,6 +439,9 @@ fn an_unreadable_named_source_is_an_error_even_if_another_is_good() {
         &[("SSL_CERT_DIR", dir), ("SSL_CERT_FILE", &present)],
     );
     assert_eq!(o.code, 0, "control: both sources readable: {}", o.stderr);
+    // A fresh store: the control cached the blob, and a cache hit (ES-1)
+    // would answer without loading any root.
+    let env = env_for(&fb, "");
     let missing = env.base.join("none.pem");
     let missing = missing.to_str().unwrap();
     let o = cat_with(
