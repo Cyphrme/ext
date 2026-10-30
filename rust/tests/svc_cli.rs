@@ -660,7 +660,9 @@ fn config_limits_govern_the_fetch() {
 
     let hang = Fb::start("127.0.0.2", |_| Resp::hang());
     env.services(&[hang.base()]);
-    let o = env.ext_env(&["cat", &label(&ok)], &[], Duration::from_secs(8));
+    // A digest the cache does not hold: `ok` was admitted above, and a cache
+    // hit (ES-1) would answer without contacting the hanging service.
+    let o = env.ext_env(&["cat", &label(&over)], &[], Duration::from_secs(8));
     assert_eq!(o.code, 5, "{}", o.stderr);
     assert!(o.elapsed < Duration::from_secs(3), "idle timeout of 300 ms ended it after {:?}", o.elapsed);
     assert!(o.stderr.contains(&hang.base()), "{}", o.stderr);
