@@ -153,17 +153,21 @@ The table is a constant. If no returned address is allowed, the attempt is
 unless `AllowHTTP`. An `http` entry already in the file when `AllowHTTP` is
 false MUST be `Error` naming the service, not skipped silently.
 
-**ES-17** TLS certificate and hostname validation MUST NOT be disable-able:
-no flag, environment variable or config key turns either off. Trust roots MUST
-come from the system trust store, loaded through the platform's certificate
-loader, and not from a list compiled into `ext`, so that root updates and
-distrust of a CA are the platform's concern and not a release of `ext`. The
-variables that locate the system store, `SSL_CERT_FILE` and `SSL_CERT_DIR`,
-are honoured exactly as the platform loader honours them: they only choose
-which CAs are trusted and are under the invoking user's own control. `ext` MUST
-NOT read any other environment variable or config key that alters trust,
-routing or name resolution. In particular the proxy variables (`HTTP_PROXY`,
-`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, in any case) and the
+**ES-17** TLS certificate and hostname validation MUST NOT be disable-able: no
+flag, environment variable or config key turns either off. Trust roots MUST be
+loaded once per process, before any service attempt and outside the ES-13
+budget, from the operating system's trust store through the platform's native
+certificate loader, and MUST NOT come from a list compiled into `ext`, so that
+root updates and distrust of a CA are the platform's concern and not a release
+of `ext`. `SSL_CERT_FILE` and `SSL_CERT_DIR` are the only environment variables
+that may alter the trust roots, and only through that loader. When either is
+set, the loader's result is used as it returns it; if it yields no usable root,
+or the named file or directory cannot be read, the attempt is `Error` naming
+the cause (ES-19 applies to the path) and there is no fallback to any other
+root source. `ext` MUST NOT read any other environment variable or config key
+that alters trust, routing or name resolution, and MUST NOT log TLS key
+material (`SSLKEYLOGFILE` is ignored). In particular the proxy variables
+(`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, in any case) and the
 resolver-altering variables (`RES_OPTIONS`, `HOSTALIASES`, `LOCALDOMAIN` and
 the like) are ignored, so ES-15 is judged on the real peer. `AllowHTTP` and
 `AllowLocal` are settable only in the config file, never by flag or

@@ -282,7 +282,7 @@ The waterfall for directories, highest precedence first:
 5. Fail if nothing exists.
 
 ## Trust
-`ext` runs as the invoking user and indexes only what that user can read. A
+`ext` runs as the invoking user and indexes only what that user can read. A setuid installation is unsupported. A
 store must be owned by the user running `ext`, and `ext` refuses any other.
 When `ext` runs with elevated privilege, `EXTANT_DIR` and the current
 directory are not consulted.
