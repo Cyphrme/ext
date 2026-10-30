@@ -453,3 +453,59 @@ fn an_unreadable_named_source_is_an_error_even_if_another_is_good() {
     assert!(o.stderr.contains(missing), "{}", o.stderr);
     assert!(o.stdout.is_empty());
 }
+
+/// ES-17 (nrd's ruling): a corrupt certificate (bad base64, or a missing END
+/// line) in a named source fails closed with exit 5 naming the source, even
+/// though another file in it supplied a good root; a section in a format the
+/// library does not recognise (`TRUSTED CERTIFICATE`) is skipped, not an
+/// error. Each case has a fresh store and server. Violator: ignoring the
+/// loader's errors when any root was found.
+#[test]
+fn a_corrupt_certificate_in_a_named_dir_fails_closed_but_foreign_formats_are_skipped() {
+    let b = blob(64, 5);
+    let good = ca("trusted");
+    let body = good
+        .pem
+        .replace(
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN TRUSTED CERTIFICATE-----",
+        )
+        .replace(
+            "-----END CERTIFICATE-----",
+            "-----END TRUSTED CERTIFICATE-----",
+        );
+    let cases: Vec<(&str, String, i32)> = vec![
+        (
+            "bad base64",
+            "-----BEGIN CERTIFICATE-----\nnot base64 !!\n-----END CERTIFICATE-----\n".into(),
+            5,
+        ),
+        (
+            "missing END",
+            good.pem.replace("-----END CERTIFICATE-----", ""),
+            5,
+        ),
+        ("TRUSTED CERTIFICATE", body, 0),
+    ];
+    for (name, extra, want) in cases {
+        let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Blob(b.clone()));
+        let env = env_for(&fb, "");
+        let dir = env.base.join("certs");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("good.pem"), &good.pem).unwrap();
+        fs::write(dir.join("other.pem"), &extra).unwrap();
+        let d = dir.to_str().unwrap();
+        let o = cat_with(&env, &b, &[("SSL_CERT_DIR", d)]);
+        assert_eq!(o.code, want, "{name}: {}", o.stderr);
+        if want == 5 {
+            assert!(
+                o.stderr.contains(d),
+                "{name}: must name the source: {}",
+                o.stderr
+            );
+            assert!(o.stdout.is_empty());
+        } else {
+            assert_eq!(o.stdout, b, "{name}");
+        }
+    }
+}

@@ -1079,6 +1079,8 @@ fn relative_redirects_resolve_dot_segments() {
         ("/x/y/../z/./w", "/x/z/w"),
         ("p/q/../../r", "/r"),
         ("/a/b/c/../../d", "/a/d"),
+        ("9:x", "/9:x"),
+        ("a_b:c", "/a_b:c"),
     ] {
         let (b2, first2, landing2) = (b.clone(), first.to_string(), landing.to_string());
         let fb = Fb::start("127.0.0.2", move |r| {
