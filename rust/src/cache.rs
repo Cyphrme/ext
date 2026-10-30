@@ -1,20 +1,31 @@
 //! The blob cache (ES-8, ES-10, ES-24 to ES-27, ES-30): records in the
 //! `cache` table of `index.db`, files under `<store>/cache/<ALG>/<HEX>`.
 //!
-//! Contract skeleton: signatures only. Every effect of admit, evict, sweep and
-//! the services-file write goes through a [`StepExecutor`], so a test executor
-//! can drop effect k and every later one and model a killed process.
+//! Every effect of admit, evict, sweep and the services-file write goes
+//! through a [`StepExecutor`], so a test executor can drop effect k and every
+//! later one and model a killed process.
 
-use crate::digest::Digest;
+use crate::digest::{Alg, Digest, Enc};
+use crate::index::Index;
 use crate::services::Fetchable;
-use crate::store::{Store, WriteLock};
+use crate::store::{Store, StoreError, WriteLock};
+use rusqlite::params;
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 /// Nanoseconds since the epoch; the CLI passes the real clock (S6).
 pub type Timestamp = i64;
+
+const CACHE: &str = "cache";
+const TMP: &str = "tmp";
+
+/// ES-30: a temporary younger than this may not be locked yet.
+const TMP_AGE_FLOOR: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -27,15 +38,25 @@ pub struct Record {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     /// Create `path` (0600, exclusive) holding `bytes`.
-    Write { path: PathBuf, bytes: Vec<u8> },
-    Fsync { path: PathBuf },
-    Rename { from: PathBuf, to: PathBuf },
+    Write {
+        path: PathBuf,
+        bytes: Vec<u8>,
+    },
+    Fsync {
+        path: PathBuf,
+    },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
     /// One transaction: insert `insert`, delete the records of `delete`.
     Commit {
         insert: Option<Record>,
         delete: Vec<Digest>,
     },
-    Unlink { path: PathBuf },
+    Unlink {
+        path: PathBuf,
+    },
 }
 
 pub trait StepExecutor {
@@ -49,9 +70,74 @@ pub struct FsExecutor<'a> {
 
 impl StepExecutor for FsExecutor<'_> {
     fn step(&mut self, effect: &Effect) -> io::Result<()> {
-        let _ = effect;
-        todo!("perform one effect")
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let at = |e: io::Error, what: &str, p: &Path| {
+            io::Error::new(e.kind(), format!("{what} {}: {e}", p.display()))
+        };
+        match effect {
+            Effect::Write { path, bytes } => {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+                    .map_err(|e| at(e, "create", path))?;
+                // The mode above passed through the umask; state it outright.
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| at(e, "chmod", path))?;
+                f.write_all(bytes).map_err(|e| at(e, "write", path))
+            }
+            Effect::Fsync { path } => File::open(path)
+                .and_then(|f| f.sync_all())
+                .map_err(|e| at(e, "sync", path)),
+            Effect::Rename { from, to } => {
+                std::fs::rename(from, to).map_err(|e| at(e, "rename onto", to))?;
+                if let Some(dir) = to.parent() {
+                    File::open(dir)
+                        .and_then(|d| d.sync_all())
+                        .map_err(|e| at(e, "sync directory", dir))?;
+                }
+                Ok(())
+            }
+            Effect::Commit { insert, delete } => commit(self.store, insert.as_ref(), delete)
+                .map_err(|e| io::Error::other(format!("cache record commit: {e}"))),
+            Effect::Unlink { path } => match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(at(e, "remove", path)),
+            },
+        }
     }
+}
+
+fn commit(store: &Store, insert: Option<&Record>, delete: &[Digest]) -> Result<(), StoreError> {
+    let idx = Index::open(store)?;
+    let tx = idx.write_tx()?;
+    for d in delete {
+        tx.execute(
+            "DELETE FROM cache WHERE alg = ?1 AND digest = ?2",
+            params![d.alg().name(), d.bytes()],
+        )?;
+    }
+    if let Some(r) = insert {
+        // A re-admission keeps the later atime, as a touch does.
+        tx.execute(
+            "INSERT INTO cache (alg, digest, size, atime_ns) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (alg, digest) DO UPDATE SET
+                 size = excluded.size,
+                 atime_ns = max(atime_ns, excluded.atime_ns)",
+            params![
+                r.digest.alg().name(),
+                r.digest.bytes(),
+                r.size as i64,
+                r.atime_ns
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 /// An in-flight file: 0600 in `cache/tmp/`, `flock`ed for its fetch's life.
@@ -67,7 +153,11 @@ impl TmpFile {
     /// A file with no name on disk (nothing to delete on drop): for stubs and
     /// in-memory sinks.
     pub fn anonymous(file: File) -> TmpFile {
-        TmpFile { file, path: PathBuf::new(), persisted: false }
+        TmpFile {
+            file,
+            path: PathBuf::new(),
+            persisted: false,
+        }
     }
 
     pub fn file(&mut self) -> &mut File {
@@ -79,7 +169,6 @@ impl TmpFile {
     }
 
     /// Admit calls this once the file has its final name.
-    #[allow(dead_code)] // called by `Cache::admit` once the file has its final name
     pub(crate) fn persist(&mut self) {
         self.persisted = true;
     }
@@ -112,8 +201,23 @@ pub struct Verified {
 impl Verified {
     /// Hashes all of `tmp` from offset 0.
     pub fn check(tmp: TmpFile, want: &Fetchable) -> Result<Verified, VerifyError> {
-        let _ = (tmp, want);
-        todo!("ES-8 full hash")
+        let want = want.digest();
+        let (digest, meta) =
+            crate::hash::hash_stable(&tmp.file, want.alg(), &mut |_| {}).map_err(|e| match e {
+                crate::hash::HashError::Io(e) => VerifyError::Io(e),
+                // Only another process could change our private file.
+                crate::hash::HashError::Unstable => VerifyError::Io(io::Error::other(
+                    "the candidate changed while it was being hashed",
+                )),
+            })?;
+        if digest != *want {
+            return Err(VerifyError::Mismatch);
+        }
+        Ok(Verified {
+            tmp,
+            digest,
+            size: meta.size,
+        })
     }
 
     pub fn digest(&self) -> &Digest {
@@ -127,6 +231,12 @@ impl Verified {
     pub fn path(&self) -> &Path {
         self.tmp.path()
     }
+
+    /// A second handle on the verified content, which stays valid after
+    /// admit renames the file: `cat` delivers through it (ES-11, ES-25).
+    pub fn reopen(&self) -> io::Result<File> {
+        self.tmp.file.try_clone()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +245,18 @@ pub enum CacheError {
     Io(#[from] io::Error),
     #[error("cache: {0}")]
     Store(String),
+}
+
+impl From<StoreError> for CacheError {
+    fn from(e: StoreError) -> CacheError {
+        CacheError::Store(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for CacheError {
+    fn from(e: rusqlite::Error) -> CacheError {
+        CacheError::Store(e.to_string())
+    }
 }
 
 pub struct Cache<'a> {
@@ -150,14 +272,75 @@ impl<'a> Cache<'a> {
     /// `cache/<ALG>/<HEX>` with the digest in uppercase hex (ES-24), relative
     /// to the store directory.
     pub fn relative_path(d: &Digest) -> PathBuf {
-        let _ = d;
-        todo!("ES-24 name")
+        Path::new(CACHE)
+            .join(d.alg().name())
+            .join(d.encode(Enc::Hex))
+    }
+
+    /// ES-21: `cache/` and its directories, where present, pass the store's
+    /// owner check.
+    pub fn check(&self) -> Result<(), CacheError> {
+        if self.store.check_subdir(Path::new(CACHE))? {
+            let sub = Alg::ALL.iter().map(|a| a.name()).chain([TMP]);
+            for s in sub {
+                self.store.check_subdir(&Path::new(CACHE).join(s))?;
+            }
+        }
+        Ok(())
     }
 
     /// A fresh locked 0600 file in `cache/tmp/`, creating directories 0700.
     pub fn create_tmp(&self) -> io::Result<TmpFile> {
-        let _ = (self.store, self.capacity);
-        todo!("ES-24 tmp")
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let base = self.store.path().join(CACHE);
+        let dirs = [base.clone(), base.join(TMP)]
+            .into_iter()
+            .chain(Alg::ALL.iter().map(|a| base.join(a.name())));
+        for d in dirs {
+            match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+                Ok(()) => std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|e| io::Error::new(e.kind(), format!("chmod {}: {e}", d.display())))?,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(io::Error::new(
+                        e.kind(),
+                        format!("create {}: {e}", d.display()),
+                    ))
+                }
+            }
+        }
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!(
+            "{}-{nanos}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = base.join(TMP).join(name);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|e| io::Error::new(e.kind(), format!("create {}: {e}", path.display())))?;
+        // From here on, dropping `tmp` removes the file on every error path.
+        let tmp = TmpFile {
+            file,
+            path,
+            persisted: false,
+        };
+        tmp.file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // Sweep tells a live fetch's file from a dead one by this lock (ES-30).
+        rustix::fs::flock(
+            &tmp.file,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )?;
+        Ok(tmp)
     }
 
     /// Fsync, rename into the final name, then one commit that inserts the
@@ -169,8 +352,56 @@ impl<'a> Cache<'a> {
         v: Verified,
         now: Timestamp,
     ) -> Result<(), CacheError> {
-        let _ = (lock, ex, v, now);
-        todo!("ES-8 admit")
+        self.own(lock)?;
+        let mut v = v;
+        if v.path().as_os_str().is_empty() {
+            return Err(CacheError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "admit needs a file in cache/tmp, not an anonymous one",
+            )));
+        }
+        self.sweep(lock, ex, SystemTime::now())?;
+        let final_path = self.store.path().join(Self::relative_path(&v.digest));
+        ex.step(&Effect::Fsync {
+            path: v.path().to_path_buf(),
+        })?;
+        ex.step(&Effect::Rename {
+            from: v.path().to_path_buf(),
+            to: final_path,
+        })?;
+        v.tmp.persist();
+
+        let records = self.records()?;
+        let atime = records
+            .iter()
+            .find(|r| r.digest == v.digest)
+            .map_or(now, |r| r.atime_ns.max(now));
+        let mut others: Vec<&Record> = records.iter().filter(|r| r.digest != v.digest).collect();
+        others.sort_by(|a, b| (a.atime_ns, &a.digest).cmp(&(b.atime_ns, &b.digest)));
+        let mut total = others.iter().map(|r| r.size).sum::<u64>() + v.size;
+        let mut victims = Vec::new();
+        for r in others {
+            if total <= self.capacity {
+                break;
+            }
+            total -= r.size;
+            victims.push(r.digest.clone());
+        }
+        ex.step(&Effect::Commit {
+            insert: Some(Record {
+                digest: v.digest.clone(),
+                size: v.size,
+                atime_ns: atime,
+            }),
+            delete: victims.clone(),
+        })?;
+        // After the commit a kill leaves orphans, which the next sweep takes.
+        for d in &victims {
+            ex.step(&Effect::Unlink {
+                path: self.store.path().join(Self::relative_path(d)),
+            })?;
+        }
+        Ok(())
     }
 
     /// Deletes the record (commit), then unlinks the file.
@@ -180,27 +411,127 @@ impl<'a> Cache<'a> {
         ex: &mut dyn StepExecutor,
         d: &Digest,
     ) -> Result<(), CacheError> {
-        let _ = (lock, ex, d);
-        todo!("evict")
+        self.own(lock)?;
+        ex.step(&Effect::Commit {
+            insert: None,
+            delete: vec![d.clone()],
+        })?;
+        ex.step(&Effect::Unlink {
+            path: self.store.path().join(Self::relative_path(d)),
+        })?;
+        Ok(())
+    }
+
+    /// Removes the record of `d` and, unless a directory or other special
+    /// file stands there, its file; only when the lock is free right now
+    /// and the store is writable (ES-10, ES-11, ES-27). Returns whether it
+    /// ran.
+    pub fn discard_if_free(
+        &self,
+        d: &Digest,
+        ex: &mut dyn StepExecutor,
+    ) -> Result<bool, CacheError> {
+        if self.store.read_only() {
+            return Ok(false);
+        }
+        let Some(lock) = self.store.try_lock()? else {
+            return Ok(false);
+        };
+        ex.step(&Effect::Commit {
+            insert: None,
+            delete: vec![d.clone()],
+        })?;
+        let path = self.store.path().join(Self::relative_path(d));
+        // A symlink is removed (unlink never follows it); a directory or a
+        // device is left for its owner to look at.
+        if let Ok(md) = path.symlink_metadata() {
+            if md.file_type().is_file() || md.file_type().is_symlink() {
+                ex.step(&Effect::Unlink { path })?;
+            }
+        }
+        drop(lock);
+        Ok(true)
     }
 
     /// The file for `d` if the record's file is a regular file, opened without
     /// following symlinks, of the recorded size (ES-10). Otherwise `None`,
     /// and the record and file are evicted if the lock is free.
-    pub fn lookup(&self, d: &Digest, ex: &mut dyn StepExecutor) -> Result<Option<PathBuf>, CacheError> {
-        let _ = (d, ex);
-        todo!("ES-10")
+    pub fn lookup(
+        &self,
+        d: &Digest,
+        ex: &mut dyn StepExecutor,
+    ) -> Result<Option<PathBuf>, CacheError> {
+        let Some(rec) = self.record(d)? else {
+            return Ok(None);
+        };
+        let rel = Self::relative_path(d);
+        let answers = self
+            .store
+            .open_nofollow(&rel)
+            .and_then(|f| f.metadata())
+            .is_ok_and(|m| m.is_file() && m.len() == rec.size);
+        if answers {
+            return Ok(Some(self.store.path().join(rel)));
+        }
+        self.discard_if_free(d, ex)?;
+        Ok(None)
     }
 
     /// `atime := max(now, atime)` under a non-blocking lock attempt; `false`
     /// when skipped because the lock was busy (ES-27).
     pub fn touch(&self, d: &Digest, now: Timestamp) -> Result<bool, CacheError> {
-        let _ = (d, now);
-        todo!("ES-27")
+        if self.store.read_only() {
+            return Ok(false);
+        }
+        let Some(_lock) = self.store.try_lock()? else {
+            return Ok(false);
+        };
+        let idx = Index::open(self.store)?;
+        idx.conn().execute(
+            "UPDATE cache SET atime_ns = max(atime_ns, ?3) WHERE alg = ?1 AND digest = ?2",
+            params![d.alg().name(), d.bytes(), now],
+        )?;
+        Ok(true)
     }
 
     pub fn records(&self) -> Result<Vec<Record>, CacheError> {
-        todo!("read the cache table")
+        self.select(None)
+    }
+
+    fn record(&self, d: &Digest) -> Result<Option<Record>, CacheError> {
+        Ok(self.select(Some(d))?.pop())
+    }
+
+    fn select(&self, only: Option<&Digest>) -> Result<Vec<Record>, CacheError> {
+        let idx = Index::open_for_lookup(self.store)?;
+        if !idx.has_table("cache")? {
+            return Ok(Vec::new());
+        }
+        let raw: Vec<(String, Vec<u8>, i64, i64)> = {
+            let mut stmt = idx.conn().prepare(
+                "SELECT alg, digest, size, atime_ns FROM cache
+                 WHERE ?1 IS NULL OR (alg = ?1 AND digest = ?2)",
+            )?;
+            let rows = stmt.query_map(
+                params![only.map(|d| d.alg().name()), only.map(|d| d.bytes())],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            rows.collect::<Result<_, _>>()?
+        };
+        raw.into_iter()
+            .map(|(alg, digest, size, atime_ns)| {
+                let a = Alg::from_name(&alg).ok_or_else(|| {
+                    CacheError::Store(format!("cache record: unknown algorithm {alg:?}"))
+                })?;
+                let digest = Digest::from_bytes(a, &digest)
+                    .map_err(|e| CacheError::Store(format!("cache record: {e}")))?;
+                Ok(Record {
+                    digest,
+                    size: size as u64,
+                    atime_ns,
+                })
+            })
+            .collect()
     }
 
     /// Deletes files without a record and unlocked temporary files older than
@@ -211,11 +542,86 @@ impl<'a> Cache<'a> {
         ex: &mut dyn StepExecutor,
         now: SystemTime,
     ) -> Result<(), CacheError> {
-        let _ = (lock, ex, now);
-        todo!("ES-30")
+        self.own(lock)?;
+        let resident: HashSet<Digest> = self.records()?.into_iter().map(|r| r.digest).collect();
+        let base = self.dir();
+        for alg in Alg::ALL {
+            let dir = base.join(alg.name());
+            for (path, name) in regular_files(&dir)? {
+                let known = name
+                    .to_str()
+                    .and_then(|n| data_encoding::HEXUPPER.decode(n.as_bytes()).ok())
+                    .and_then(|b| Digest::from_bytes(*alg, &b).ok())
+                    .is_some_and(|d| resident.contains(&d));
+                if !known {
+                    ex.step(&Effect::Unlink { path })?;
+                }
+            }
+        }
+        for (path, name) in regular_files(&base.join(TMP))? {
+            let old = path
+                .symlink_metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age > TMP_AGE_FLOOR);
+            if !old {
+                continue;
+            }
+            // The fetch that owns a temporary holds its flock; a free lock
+            // means the owner is gone. The probe's lock is held across the
+            // unlink so no new owner can appear in between.
+            let Ok(probe) = self
+                .store
+                .open_nofollow(&Path::new(CACHE).join(TMP).join(&name))
+            else {
+                continue;
+            };
+            match rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => ex.step(&Effect::Unlink { path })?,
+                Err(rustix::io::Errno::WOULDBLOCK) => {}
+                Err(e) => return Err(CacheError::Io(e.into())),
+            }
+        }
+        Ok(())
     }
 
     pub fn dir(&self) -> PathBuf {
-        todo!("<store>/cache")
+        self.store.path().join(CACHE)
     }
+
+    fn own(&self, lock: &WriteLock) -> Result<(), CacheError> {
+        if self.store.holds(lock) {
+            Ok(())
+        } else {
+            Err(CacheError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the lock belongs to another store",
+            )))
+        }
+    }
+}
+
+/// Regular files directly in `dir` (not followed), with their names; an
+/// absent directory has none.
+fn regular_files(dir: &Path) -> Result<Vec<(PathBuf, OsString)>, CacheError> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(CacheError::Io(io::Error::new(
+                e.kind(),
+                format!("read {}: {e}", dir.display()),
+            )))
+        }
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        out.push((entry.path(), entry.file_name()));
+    }
+    Ok(out)
 }
