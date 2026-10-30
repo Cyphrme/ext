@@ -454,25 +454,34 @@ impl<'a> Cache<'a> {
         drop(lock);
     }
 
-    /// The file for `d` if the record's file is a regular file, opened without
-    /// following symlinks, of the recorded size (ES-10). Otherwise `None`,
-    /// and the record and file are evicted if the lock is free.
+    /// The file for `d`, opened for reading, if the record's file is a
+    /// regular file of the recorded size, not reached through a symlink
+    /// (ES-10). Otherwise `None`, and the record and file are evicted if the
+    /// lock is free.
     pub fn lookup(
         &self,
         d: &Digest,
         ex: &mut dyn StepExecutor,
-    ) -> Result<Option<PathBuf>, CacheError> {
+    ) -> Result<Option<File>, CacheError> {
         let Some(rec) = self.record(d)? else {
             return Ok(None);
         };
         let rel = Self::relative_path(d);
-        let answers = self
+        let answers = |m: &std::fs::Metadata| m.is_file() && m.len() == rec.size;
+        // Opening a FIFO or device has effects even without blocking, so the
+        // type is checked by name first; the open handle is checked again in
+        // case the entry was replaced in between.
+        let file = self
             .store
-            .open_nofollow(&rel)
-            .and_then(|f| f.metadata())
-            .is_ok_and(|m| m.is_file() && m.len() == rec.size);
-        if answers {
-            return Ok(Some(self.store.path().join(rel)));
+            .path()
+            .join(&rel)
+            .symlink_metadata()
+            .is_ok_and(|m| answers(&m))
+            .then(|| self.store.open_nofollow(&rel).ok())
+            .flatten()
+            .filter(|f| f.metadata().is_ok_and(|m| answers(&m)));
+        if file.is_some() {
+            return Ok(file);
         }
         self.discard_if_free(d, ex);
         Ok(None)

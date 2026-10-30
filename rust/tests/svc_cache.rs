@@ -14,7 +14,7 @@ use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Once};
 use std::time::{Duration, SystemTime};
@@ -453,7 +453,7 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
                     .lookup(&d, &mut FsExecutor { store: &f.store })
                     .unwrap()
             });
-            assert_eq!(got, None, "{name}: busy lock");
+            assert!(got.is_none(), "{name}: busy lock");
             assert_eq!(
                 cache.records().unwrap().len(),
                 1,
@@ -464,10 +464,14 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
             .lookup(&d, &mut FsExecutor { store: &f.store })
             .unwrap();
         if hit {
-            assert_eq!(got.as_deref(), Some(file.as_path()), "{name}");
+            assert_eq!(
+                got.map(|f| f.metadata().unwrap().ino()),
+                Some(fs::metadata(&file).unwrap().ino()),
+                "{name}"
+            );
             assert_eq!(cache.records().unwrap().len(), 1);
         } else {
-            assert_eq!(got, None, "{name}");
+            assert!(got.is_none(), "{name}");
             assert!(
                 cache.records().unwrap().is_empty(),
                 "{name}: record evicted"
@@ -1132,9 +1136,8 @@ fn a_stale_record_whose_removal_fails_is_still_a_miss() {
             tamper(&f.dir.join(Cache::relative_path(&d)), &f.dir.join("aside"));
             let mut ex = Refuse::new(&f.store, kind, vec![hex_name(&d)]);
             let got = cache.lookup(&d, &mut ex);
-            assert_eq!(
-                got.as_ref().ok(),
-                Some(&None),
+            assert!(
+                matches!(got, Ok(None)),
                 "{name}, {kind} refused: expected a miss, got {got:?}"
             );
         }
@@ -1184,5 +1187,5 @@ fn lookup_does_not_open_a_fifo() {
         .open(&file);
     writer.join().unwrap();
     assert!(!opened, "lookup opened the FIFO (a reader appeared)");
-    assert_eq!(got.ok(), Some(None), "a FIFO is a miss");
+    assert!(matches!(got, Ok(None)), "a FIFO is a miss");
 }

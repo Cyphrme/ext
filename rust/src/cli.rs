@@ -441,7 +441,11 @@ fn resolve(
     let cache = Cache::new(store, cfg.cache_capacity);
     cache.check()?;
     let d = Fetchable::new(q.digest.clone());
-    if let Some(p) = cache.lookup(d.digest(), &mut FsExecutor { store })? {
+    let p = store.path().join(Cache::relative_path(d.digest()));
+    if cache
+        .lookup(d.digest(), &mut FsExecutor { store })?
+        .is_some()
+    {
         touch(&cache, &d);
         fmt.record(w, &[], p.as_os_str().as_bytes(), &[])?;
         return Ok(0);
@@ -461,7 +465,6 @@ fn resolve(
         eprintln!("ext: error: {e}");
         return Ok(lookup::exit_code(&found.outcomes, false, true));
     }
-    let p = store.path().join(Cache::relative_path(d.digest()));
     fmt.record(w, &[], p.as_os_str().as_bytes(), &[])?;
     Ok(0)
 }
@@ -514,34 +517,27 @@ fn cat(
         }
     }
     let mut ex = FsExecutor { store };
-    if let Some(p) = cache.lookup(d.digest(), &mut ex)? {
-        let rel = Cache::relative_path(d.digest());
-        match store.open_nofollow(&rel) {
-            Ok(src) => match emit(&cache, src, d, w) {
-                Emitted::Done => {
-                    touch(&cache, d);
-                    return Ok(0);
-                }
-                Emitted::Mismatch => {
-                    eprintln!(
-                        "ext: cached file does not match its digest, discarded: {}",
-                        terminal(p.as_os_str().as_bytes())
-                    );
-                    cache.discard_if_free(d.digest(), &mut ex);
-                }
-                Emitted::ReadFailed(e) => eprintln!(
-                    "ext: cannot read cached file {}: {}",
-                    terminal(p.as_os_str().as_bytes()),
-                    terminal(e.to_string().as_bytes())
-                ),
-                Emitted::CopyFailed(e) => return Ok(copy_failed(&e, index_failed)),
-                Emitted::OutFailed(e) => return Err(CliError::Out(e)),
-            },
-            Err(e) => eprintln!(
+    if let Some(src) = cache.lookup(d.digest(), &mut ex)? {
+        let p = store.path().join(Cache::relative_path(d.digest()));
+        match emit(&cache, src, d, w) {
+            Emitted::Done => {
+                touch(&cache, d);
+                return Ok(0);
+            }
+            Emitted::Mismatch => {
+                eprintln!(
+                    "ext: cached file does not match its digest, discarded: {}",
+                    terminal(p.as_os_str().as_bytes())
+                );
+                cache.discard_if_free(d.digest(), &mut ex);
+            }
+            Emitted::ReadFailed(e) => eprintln!(
                 "ext: cannot read cached file {}: {}",
                 terminal(p.as_os_str().as_bytes()),
                 terminal(e.to_string().as_bytes())
             ),
+            Emitted::CopyFailed(e) => return Ok(copy_failed(&e, index_failed)),
+            Emitted::OutFailed(e) => return Err(CliError::Out(e)),
         }
     }
     if offline {
