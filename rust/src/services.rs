@@ -38,6 +38,15 @@ pub enum Scheme {
     Http,
 }
 
+impl Scheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Https => "https",
+            Scheme::Http => "http",
+        }
+    }
+}
+
 /// A line of the services file in normal form (scheme and host lowercased).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceUri {
@@ -201,13 +210,10 @@ impl ServiceUri {
                 Err(_) => return Err(base_err),
             },
         };
-        let scheme = match p.scheme {
-            Scheme::Https => "https",
-            Scheme::Http => "http",
-        };
         Ok(ServiceUri {
             normal: format!(
-                "{scheme}://{}{}{}",
+                "{}://{}{}{}",
+                p.scheme.as_str(),
                 p.host.to_ascii_lowercase(),
                 p.port,
                 p.rest

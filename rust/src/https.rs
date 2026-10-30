@@ -377,10 +377,7 @@ fn resolve_reference(base: &str, r: &str) -> Result<(Scheme, String), String> {
     });
     // The base was itself built from a valid line, so it splits.
     let b = services::split(base).map_err(|e| e.to_string())?;
-    let base_scheme = match b.scheme {
-        Scheme::Https => "https",
-        Scheme::Http => "http",
-    };
+    let base_scheme = b.scheme.as_str();
     let origin = format!("{base_scheme}://{}{}", b.host, b.port);
     let base_path = b.rest.split('?').next().unwrap_or("");
     let target = if has_scheme {
@@ -408,13 +405,9 @@ fn resolve_reference(base: &str, r: &str) -> Result<(Scheme, String), String> {
         None => path,
     };
     services::check_path(&rest, true, false).map_err(|e| e.to_string())?;
-    let scheme_text = match t.scheme {
-        Scheme::Https => "https",
-        Scheme::Http => "http",
-    };
     Ok((
         t.scheme,
-        format!("{scheme_text}://{}{}{rest}", t.host, t.port),
+        format!("{}://{}{}{rest}", t.scheme.as_str(), t.host, t.port),
     ))
 }
 
