@@ -416,3 +416,37 @@ fn an_https_to_https_redirect_needs_no_allow_http() {
         "one redirect, one blob"
     );
 }
+
+/// ES-17. "The named file or directory cannot be read" is an Error naming the
+/// cause, for each named source independently: an unreadable
+/// `SSL_CERT_FILE` fails the attempt even when `SSL_CERT_DIR` would supply
+/// good roots (no fallback, no partial trust). Violator: ignoring the
+/// loader's read error whenever roots were found elsewhere.
+#[test]
+fn an_unreadable_named_source_is_an_error_even_if_another_is_good() {
+    let b = blob(64, 5);
+    let good = ca("trusted");
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Blob(b.clone()));
+    let env = env_for(&fb, "");
+    let dir = env.base.join("certs");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("good.pem"), &good.pem).unwrap();
+    let dir = dir.to_str().unwrap();
+    let present = write_ca(&env, "ok.pem", &good.pem);
+    let o = cat_with(
+        &env,
+        &b,
+        &[("SSL_CERT_DIR", dir), ("SSL_CERT_FILE", &present)],
+    );
+    assert_eq!(o.code, 0, "control: both sources readable: {}", o.stderr);
+    let missing = env.base.join("none.pem");
+    let missing = missing.to_str().unwrap();
+    let o = cat_with(
+        &env,
+        &b,
+        &[("SSL_CERT_DIR", dir), ("SSL_CERT_FILE", missing)],
+    );
+    assert_eq!(o.code, 5, "{}", o.stderr);
+    assert!(o.stderr.contains(missing), "{}", o.stderr);
+    assert!(o.stdout.is_empty());
+}
