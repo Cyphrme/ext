@@ -122,6 +122,9 @@ fn every_final_status_classifies_per_the_table() {
             return Resp::ok(&b2);
         }
         let n = c2.load(Ordering::SeqCst);
+        if n == 200 {
+            return Resp::ok(&b2);
+        }
         let resp = Resp::status(n);
         if (300..400).contains(&n) { resp.header("Location", b"/ok") } else { resp }
     });
