@@ -517,16 +517,21 @@ impl<'a> Cache<'a> {
         if !idx.has_table("cache")? {
             return Ok(Vec::new());
         }
-        let raw: Vec<(String, Vec<u8>, i64, i64)> = {
-            let mut stmt = idx.conn().prepare(
-                "SELECT alg, digest, size, atime_ns FROM cache
-                 WHERE ?1 IS NULL OR (alg = ?1 AND digest = ?2)",
-            )?;
-            let rows = stmt.query_map(
-                params![only.map(|d| d.alg().name()), only.map(|d| d.bytes())],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )?;
-            rows.collect::<Result<_, _>>()?
+        // A keyed statement of its own: an optional key (`?1 IS NULL OR`)
+        // would keep SQLite from using the primary key.
+        let all = "SELECT alg, digest, size, atime_ns FROM cache";
+        let row = |r: &rusqlite::Row| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?));
+        let raw: Vec<(String, Vec<u8>, i64, i64)> = match only {
+            Some(d) => idx
+                .conn()
+                .prepare(&format!("{all} WHERE alg = ?1 AND digest = ?2"))?
+                .query_map(params![d.alg().name(), d.bytes()], row)?
+                .collect::<Result<_, _>>()?,
+            None => idx
+                .conn()
+                .prepare(all)?
+                .query_map([], row)?
+                .collect::<Result<_, _>>()?,
         };
         raw.into_iter()
             .map(|(alg, digest, size, atime_ns)| {
