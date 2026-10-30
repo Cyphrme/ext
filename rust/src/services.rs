@@ -45,11 +45,10 @@ pub struct UriError(pub String);
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FileError {
-    /// `line` is 1-based.
+    /// `line` is 1-based. A duplicate, a blank line, a missing final LF and
+    /// the 65th service are all reported against their own line.
     #[error("services file: line {line}: {source}")]
     Line { line: usize, source: UriError },
-    #[error("services file: more than {MAX_SERVICES} services")]
-    TooMany,
 }
 
 impl ServiceUri {
