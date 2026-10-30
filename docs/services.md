@@ -94,10 +94,12 @@ MAY make `ext` abort early, and then only to `Error`, never to `Hit`.
 
 **ES-10** On `resolve`, a cache record is an answer only if its file is a
 regular file (opened without following symlinks) whose size equals the
-record's size. Otherwise the record is removed, and the file with it when it
-is a regular file, when the lock is available, and the lookup continues as a
-miss. A directory or other non-regular file found where a cache file should be
-is left in place; only its record is removed. `resolve` does not hash cache or
+record's size. Otherwise the record is removed when the lock is available,
+and with it the entry at the cache path if that is a regular file or a
+symlink; the lookup continues as a miss. Unlinking never follows a symlink, so
+its target is untouched. A directory, FIFO, socket or device found at the
+cache path is left in place and only its record is removed, because `ext`
+never deletes recursively or opens special files. `resolve` does not hash cache or
 index hits; the store's protection is the trust boundary (README, Trust).
 
 **ES-11** `ext cat` MUST hash in full every blob it returns, on every layer
