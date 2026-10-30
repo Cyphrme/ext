@@ -893,3 +893,61 @@ fn a_new_record_takes_its_own_clock() {
     want.sort();
     assert_eq!(got, want);
 }
+
+/// No silent failures (ES-25): an unlink that fails for a reason other than
+/// "already gone" is reported; a missing file is not a failure. Violator: an
+/// executor that swallows every unlink error.
+#[test]
+fn unlink_reports_real_failures_but_not_absence() {
+    let f = fixture();
+    let mut ex = FsExecutor { store: &f.store };
+    let dir = f.dir.join("a-directory");
+    fs::create_dir(&dir).unwrap();
+    assert!(ex.step(&Effect::Unlink { path: dir }).is_err());
+    assert!(ex
+        .step(&Effect::Unlink {
+            path: f.dir.join("absent")
+        })
+        .is_ok());
+}
+
+/// ES-30. A cache directory that cannot be listed is an error, not "nothing
+/// to sweep"; only an absent one is empty. Violator: swallowing every
+/// read_dir failure, which would let a broken store skip its sweep silently.
+#[test]
+fn sweep_reports_an_unreadable_tmp_directory() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    fs::create_dir_all(f.dir.join("cache")).unwrap();
+    fs::write(f.dir.join("cache/tmp"), b"not a directory").unwrap();
+    let lock = f.store.lock().unwrap();
+    assert!(cache
+        .sweep(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            SystemTime::now()
+        )
+        .is_err());
+}
+
+/// ES-25. A store that cannot hold the cache layout fails `create_tmp` up
+/// front, before any bytes are fetched, whichever directory is the one that
+/// cannot be made. Violator: swallowing a directory-creation error other than
+/// "already exists", so the fetch runs and only the admit fails.
+#[test]
+fn create_tmp_fails_early_when_a_cache_directory_cannot_be_made() {
+    if skip_if_root("mode bits do not stop uid 0") {
+        return;
+    }
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    drop(cache.create_tmp().unwrap()); // lays out cache/, cache/tmp, cache/SHA-256
+    fs::remove_dir(f.dir.join("cache/SHA-256")).unwrap();
+    fs::set_permissions(f.dir.join("cache"), fs::Permissions::from_mode(0o500)).unwrap();
+    let r = cache.create_tmp();
+    fs::set_permissions(f.dir.join("cache"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        r.is_err(),
+        "the SHA-256 directory could not be made yet a tmp file was handed out"
+    );
+}

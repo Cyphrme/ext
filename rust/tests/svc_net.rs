@@ -682,3 +682,14 @@ fn requests_are_plain_gets_with_the_five_headers() {
         );
     }
 }
+
+/// ES-5/ES-13. A server that closes the connection before any response is an
+/// Error at once, not a wait for the timeout: end-of-stream is not input.
+/// Violator: treating a zero-byte read as data arriving.
+#[test]
+fn a_connection_closed_before_any_response_is_an_error_promptly() {
+    let fb = Fb::start("127.0.0.2", |_| Resp::close());
+    let (got, took) = fetch(&local_client(), &fb.base(), b"x", &limits());
+    assert!(is_err(&got), "{got:?}");
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+}

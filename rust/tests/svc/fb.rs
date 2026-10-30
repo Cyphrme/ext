@@ -62,6 +62,8 @@ pub struct Resp {
     pub body: Body,
     /// Do not answer at all: accept, read the request, hold the socket.
     pub hang: bool,
+    /// Read the request, then close the connection without a byte.
+    pub close: bool,
 }
 
 impl Resp {
@@ -73,11 +75,18 @@ impl Resp {
             headers: vec![],
             body: Body::Bytes(vec![]),
             hang: false,
+            close: false,
         }
     }
     pub fn ok(blob: &[u8]) -> Resp {
         Resp {
             body: Body::Bytes(blob.to_vec()),
+            ..Resp::status(200)
+        }
+    }
+    pub fn close() -> Resp {
+        Resp {
+            close: true,
             ..Resp::status(200)
         }
     }
@@ -226,6 +235,9 @@ fn serve(mut c: TcpStream, h: &Handler, log: &Mutex<Vec<Req>>, stop: &AtomicBool
     };
     log.lock().unwrap().push(req.clone());
     let r = h(&req);
+    if r.close {
+        return;
+    }
     if r.hang {
         while !stop.load(Ordering::Relaxed) {
             // Detect the client giving up.

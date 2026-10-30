@@ -80,6 +80,9 @@ enum Mode {
     Stall,
     /// Answers 302 with this Location.
     Redirect(String),
+    /// Redirects the service's own request path to `/b` on the same server
+    /// (https to https), and serves the blob at `/b`.
+    Hop(Vec<u8>),
 }
 
 fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
@@ -122,7 +125,23 @@ fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
                     head.push(b[0]);
                 }
                 served.fetch_add(1, Ordering::SeqCst);
+                let target = String::from_utf8_lossy(&head)
+                    .split(' ')
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
                 match &blob {
+                    Mode::Hop(_) if target.starts_with("/SHA") => {
+                        let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    Mode::Hop(b) => {
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            b.len()
+                        );
+                        let _ = s.write_all(b);
+                    }
                     Mode::Redirect(to) => {
                         let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
                     }
@@ -377,4 +396,23 @@ fn an_https_to_http_redirect_needs_allow_http() {
         o.stderr
     );
     assert_eq!(plain.requests().len(), 1);
+}
+
+/// ES-14. An https-to-https redirect is followed with `AllowHTTP` off: only a
+/// change to http needs the flag. Violator: demanding `AllowHTTP` for any
+/// redirect target that is not http.
+#[test]
+fn an_https_to_https_redirect_needs_no_allow_http() {
+    let b = blob(64, 5);
+    let good = ca("trusted");
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Hop(b.clone()));
+    let env = env_for(&fb, "");
+    let trusted = write_ca(&env, "good.pem", &good.pem);
+    let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
+    assert_eq!((o.code, &o.stdout), (0, &b), "{}", o.stderr);
+    assert_eq!(
+        fb.served.load(Ordering::SeqCst),
+        2,
+        "one redirect, one blob"
+    );
 }

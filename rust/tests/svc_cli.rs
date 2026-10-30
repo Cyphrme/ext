@@ -1095,3 +1095,31 @@ fn relative_redirects_resolve_dot_segments() {
         assert_eq!((o.code, &o.stdout), (0, &b), "{first}: {}", o.stderr);
     }
 }
+
+/// ES-6, ES-25. A failed attempt prints `SERVICE <uri> ERROR <message>` with a
+/// message that says why: a timeout says so, a refused connection carries the
+/// OS cause. Violators: an empty or placeholder message.
+#[test]
+fn service_errors_say_why() {
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.2:0").unwrap();
+        format!("http://{}/", l.local_addr().unwrap())
+    };
+    let hang = Fb::start("127.0.0.2", |_| Resp::hang());
+    for (uri, why) in [(dead, "refused"), (hang.base(), "timed out")] {
+        let env = Env::new();
+        env.config("ServiceTimeout: 1500, ServiceIdleTimeout: 300");
+        env.services(std::slice::from_ref(&uri));
+        let o = env.ext(&["cat", &label(b"x")]);
+        assert_eq!(o.code, 5, "{}", o.stderr);
+        let line = o
+            .stderr
+            .lines()
+            .find(|l| l.starts_with(&format!("SERVICE {uri} ERROR ")))
+            .unwrap_or_else(|| panic!("no ERROR line: {}", o.stderr));
+        assert!(
+            line.to_lowercase().contains(why),
+            "message should say `{why}`: {line}"
+        );
+    }
+}

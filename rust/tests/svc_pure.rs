@@ -441,6 +441,44 @@ fn v4(n: u32) -> Ipv4Addr {
     Ipv4Addr::from(n)
 }
 
+/// ES-15. Teredo (2001::/32) is denied whatever a table allows, and the test
+/// is exact: public IPv6 whose second segment happens to be 0 is not Teredo.
+/// Violators: the Teredo test matching on the second segment alone (denies
+/// 2606:0::), or not matching at all (an allow-all table lets it through).
+#[test]
+fn teredo_is_denied_and_nothing_else_with_a_zero_second_segment() {
+    let all = AddrTable {
+        allow: vec![("::".parse().unwrap(), 0), ("0.0.0.0".parse().unwrap(), 0)],
+        deny: vec![],
+    };
+    assert!(
+        !permitted("2001:0:4136:e378::1".parse().unwrap(), &all),
+        "Teredo"
+    );
+    assert!(permitted("2606:0:1::1".parse().unwrap(), &all));
+    let iana = AddrTable::iana();
+    for ok in ["2606:0:1::1", "2a00:0:1::1", "2400:0:1::1"] {
+        assert!(
+            permitted(ok.parse().unwrap(), &iana),
+            "{ok} is public space"
+        );
+    }
+}
+
+/// ES-21. Any number of `{digest}`/`{hex}` placeholders is a template, even
+/// or odd. Violator: tracking "has an id placeholder" with xor, which flips
+/// back to false on the second one.
+#[test]
+fn templates_accept_several_placeholders() {
+    for l in [
+        "https://h.example/{digest}/{hex}",
+        "https://h.example/{digest}/{digest}",
+        "https://h.example/{hex}/{alg}/{hex}/{digest}",
+    ] {
+        assert!(ServiceUri::parse(l).is_ok(), "{l}");
+    }
+}
+
 proptest! {
     /// ES-15 metamorphic: canonicalisation. A v4-mapped v6 is judged exactly as
     /// its v4, and a 6to4 address exactly as its embedded v4, for every v4.
