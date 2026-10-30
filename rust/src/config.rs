@@ -20,8 +20,7 @@ pub struct Config {
     pub compare_ctime_inode: bool,
     /// `UnregisterDeleted`: false makes a deleted root only reported.
     pub unregister_deleted: bool,
-    /// ES-31 keys. Units are not fixed by the spec text; sizes are bytes and
-    /// the two timeouts milliseconds here.
+    /// ES-31 keys: sizes in bytes, the two timeouts in milliseconds.
     pub cache_capacity: u64,
     pub service_max_size: u64,
     pub service_timeout_ms: u64,
@@ -66,6 +65,8 @@ pub enum ConfigError {
     },
     #[error("{0} input is disabled by the config (key {0} is false)")]
     InputDisabled(&'static str),
+    #[error("ServiceMaxSize {max_size} is above CacheCapacity {capacity}: a fetched blob must fit the cache")]
+    MaxSizeAboveCapacity { max_size: u64, capacity: u64 },
 }
 
 /// A value of any JSON5 type, so a wrong type can be reported against its key.
@@ -176,6 +177,13 @@ pub fn parse(bytes: &[u8]) -> Result<Config, ConfigError> {
             }
             _ => return Err(ConfigError::UnknownKey(key.clone())),
         }
+    }
+    // ES-31: rejected, not clamped, so the operator sees which one to change.
+    if c.service_max_size > c.cache_capacity {
+        return Err(ConfigError::MaxSizeAboveCapacity {
+            max_size: c.service_max_size,
+            capacity: c.cache_capacity,
+        });
     }
     Ok(c)
 }
