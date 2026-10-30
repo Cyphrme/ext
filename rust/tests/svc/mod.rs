@@ -143,13 +143,17 @@ impl Env {
 
     /// Runs `ext --d <store> args...` with proxies, trust and resolver
     /// variables scrubbed unless `env` sets them.
-    pub fn ext_env(&self, args: &[&str], env: &[(&str, &str)], limit: Duration) -> Out {
+    pub fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_ext"));
         for k in SCRUB {
             c.env_remove(k);
         }
         c.envs(env.iter().copied()).arg("--d").arg(&self.store).args(args);
-        run(c, limit)
+        c
+    }
+
+    pub fn ext_env(&self, args: &[&str], env: &[(&str, &str)], limit: Duration) -> Out {
+        run(self.command(args, env), limit)
     }
 
     pub fn ext(&self, args: &[&str]) -> Out {
