@@ -130,7 +130,12 @@ pub struct Fb {
 impl Fb {
     /// Serves `handler` on `ip:0`.
     pub fn start(ip: &str, handler: impl Fn(&Req) -> Resp + Send + Sync + 'static) -> Fb {
-        let l = TcpListener::bind((ip, 0)).expect("bind loopback FB");
+        Fb::start_on(ip, 0, handler)
+    }
+
+    /// As `start`, on a chosen port, so two addresses can share one port.
+    pub fn start_on(ip: &str, port: u16, handler: impl Fn(&Req) -> Resp + Send + Sync + 'static) -> Fb {
+        let l = TcpListener::bind((ip, port)).expect("bind loopback FB");
         let addr = l.local_addr().unwrap();
         let log: Arc<Mutex<Vec<Req>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
