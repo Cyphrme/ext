@@ -176,6 +176,9 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
     assert_eq!(fb.served.load(Ordering::SeqCst), 1);
     assert!(!keylog.exists(), "SSLKEYLOGFILE must be ignored");
 
+    // A fresh store: the control cached the blob, and a cache hit (ES-1)
+    // would answer without contacting the service.
+    let env = env_for(&fb, "");
     let untrusted = write_ca(&env, "other.pem", &other.pem);
     let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &untrusted)]);
     assert_eq!(o.code, 5, "a chain from a CA the roots do not name: {}", o.stderr);
@@ -208,6 +211,9 @@ fn a_bad_ssl_cert_file_is_an_error_naming_the_cause() {
     let env = env_for(&fb, "");
     let pem = write_ca(&env, "ok.pem", &good.pem);
     assert_eq!(cat_with(&env, &b, &[("SSL_CERT_FILE", &pem)]).code, 0, "control: the good file works");
+    // A fresh store: the control cached the blob, and a cache hit (ES-1)
+    // would answer without loading any root.
+    let env = env_for(&fb, "");
     let garbled = env.base.join("garbled.pem");
     fs::write(&garbled, b"-----BEGIN CERTIFICATE-----\nnot base64 !!\n-----END CERTIFICATE-----\n").unwrap();
     let empty = env.base.join("empty.pem");
