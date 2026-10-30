@@ -208,8 +208,9 @@ into unless registered (README, Technical Considerations: Recursion).
   valid scheme (a letter, then letters, digits, `+`, `-`, `.`). Otherwise it is
   a relative reference: `9:x` and `a_b:c` resolve to the paths `/9:x` and
   `/a_b:c`. A valid scheme other than `http` or `https` is an Error.
-- Why: this is how the WHATWG URL parser reads such text, and RFC 3986 gives
-  the same reading since a scheme cannot start with a digit or contain `_`.
+- Why: RFC 3986 treats such text as an invalid reference, neither a scheme nor
+  a relative path; the WHATWG parser, which browsers and most HTTP clients
+  follow, reads it as a relative path.
 
 ### `resolve` with a file name (follows: implementation choice)
 
