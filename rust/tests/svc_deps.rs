@@ -29,7 +29,9 @@ fn no_compiled_in_root_list_is_in_the_dependency_tree() {
 
 /// Removes the brace-delimited item that starts at `marker`, if present.
 fn without_item(src: &str, marker: &str) -> String {
-    let Some(at) = src.find(marker) else { return src.to_string() };
+    let Some(at) = src.find(marker) else {
+        return src.to_string();
+    };
     let open = at + src[at..].find('{').expect("item has a body");
     let mut depth = 0;
     for (i, c) in src[open..].char_indices() {
@@ -58,21 +60,44 @@ fn without_item(src: &str, marker: &str) -> String {
 #[test]
 fn cache_and_services_write_effects_go_through_the_executor() {
     const EFFECTS: &[&str] = &[
-        "fs::rename", "fs::remove_file", "fs::remove_dir", "fs::write", "fs::create_dir",
-        "fs::set_permissions", "fs::copy", "fs::hard_link", "fs::symlink", "File::create",
-        "OpenOptions", "renameat", "unlinkat", "mkdirat", "fsync", "fdatasync", ".sync_all(",
-        ".sync_data(", ".set_len(", ".write_all(", ".set_modified(", "ftruncate",
+        "fs::rename",
+        "fs::remove_file",
+        "fs::remove_dir",
+        "fs::write",
+        "fs::create_dir",
+        "fs::set_permissions",
+        "fs::copy",
+        "fs::hard_link",
+        "fs::symlink",
+        "File::create",
+        "OpenOptions",
+        "renameat",
+        "unlinkat",
+        "mkdirat",
+        "fsync",
+        "fdatasync",
+        ".sync_all(",
+        ".sync_data(",
+        ".set_len(",
+        ".write_all(",
+        ".set_modified(",
+        "ftruncate",
     ];
     let mut bad = vec![];
     for file in ["src/cache.rs", "src/services.rs"] {
-        let raw = std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let raw =
+            std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let mut src: String = raw
             .lines()
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
         if file == "src/cache.rs" {
-            for m in ["impl StepExecutor for FsExecutor", "impl Drop for TmpFile", "pub fn create_tmp"] {
+            for m in [
+                "impl StepExecutor for FsExecutor",
+                "impl Drop for TmpFile",
+                "pub fn create_tmp",
+            ] {
                 src = without_item(&src, m);
             }
         }

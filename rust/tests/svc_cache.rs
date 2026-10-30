@@ -61,7 +61,12 @@ struct Crash<'a> {
 
 impl<'a> Crash<'a> {
     fn new(store: &'a Store, at: usize) -> Crash<'a> {
-        Crash { inner: FsExecutor { store }, at, seen: 0, log: vec![] }
+        Crash {
+            inner: FsExecutor { store },
+            at,
+            seen: 0,
+            log: vec![],
+        }
     }
 }
 
@@ -99,14 +104,23 @@ fn assert_cache_invariants(f: &Fixture) {
     let cache = Cache::new(&store, u64::MAX);
     for r in cache.records().unwrap() {
         let p = f.dir.join("cache/SHA-256").join(hex_name(&r.digest));
-        let data = fs::read(&p).unwrap_or_else(|e| panic!("F1: record {} without file: {e}", hex_name(&r.digest)));
+        let data = fs::read(&p)
+            .unwrap_or_else(|e| panic!("F1: record {} without file: {e}", hex_name(&r.digest)));
         assert_eq!(data.len() as u64, r.size, "record size vs file size");
-        assert_eq!(sha256_hex(&data), hex_name(&r.digest), "F2: file does not hash to its name");
+        assert_eq!(
+            sha256_hex(&data),
+            hex_name(&r.digest),
+            "F2: file does not hash to its name"
+        );
     }
     if let Ok(rd) = fs::read_dir(f.dir.join("cache/SHA-256")) {
         for e in rd.flatten() {
             let data = fs::read(e.path()).unwrap();
-            assert_eq!(sha256_hex(&data), e.file_name().to_string_lossy(), "F10: final name with other content");
+            assert_eq!(
+                sha256_hex(&data),
+                e.file_name().to_string_lossy(),
+                "F10: final name with other content"
+            );
         }
     }
 }
@@ -127,7 +141,9 @@ fn admit_killed_at_any_effect_leaves_a_consistent_cache() {
             let cache = Cache::new(&f.store, 1 << 20);
             let lock = f.store.lock().unwrap();
             let mut ex = Crash::new(&f.store, usize::MAX);
-            cache.admit(&lock, &mut ex, verified(&cache, &content), 10).expect("admit");
+            cache
+                .admit(&lock, &mut ex, verified(&cache, &content), 10)
+                .expect("admit");
             assert_eq!(ex.log, order, "admit effects, in program order");
             drop(lock);
             assert_cache_invariants(&f);
@@ -146,10 +162,16 @@ fn admit_killed_at_any_effect_leaves_a_consistent_cache() {
             // The next run (sweep is part of admit) must converge.
             let lock = f.store.lock().unwrap();
             let mut fs_ex = FsExecutor { store: &f.store };
-            cache.admit(&lock, &mut fs_ex, verified(&cache, &content), 11).expect("recovery admit");
+            cache
+                .admit(&lock, &mut fs_ex, verified(&cache, &content), 11)
+                .expect("recovery admit");
             drop(lock);
             assert_cache_invariants(&f);
-            assert_eq!(cache.records().unwrap().len(), 1, "killed at {k}: one record after recovery");
+            assert_eq!(
+                cache.records().unwrap().len(),
+                1,
+                "killed at {k}: one record after recovery"
+            );
         }
     }
 }
@@ -165,7 +187,9 @@ fn eviction_killed_at_any_effect_never_leaves_a_dangling_record() {
         let cache = Cache::new(&f.store, 15); // room for one
         let lock = f.store.lock().unwrap();
         let mut fs_ex = FsExecutor { store: &f.store };
-        cache.admit(&lock, &mut fs_ex, verified(&cache, &a), 1).unwrap();
+        cache
+            .admit(&lock, &mut fs_ex, verified(&cache, &a), 1)
+            .unwrap();
         let mut ex = Crash::new(&f.store, at);
         let _ = cache.admit(&lock, &mut ex, verified(&cache, &b), 2);
         drop(lock);
@@ -173,9 +197,20 @@ fn eviction_killed_at_any_effect_never_leaves_a_dangling_record() {
         (ex.log.clone(), cache.records().unwrap(), f)
     };
     let (full, recs, f) = probe(usize::MAX);
-    assert_eq!(full, ["fsync", "rename", "commit", "unlink"], "evicted file is unlinked after the commit");
-    assert_eq!(recs.iter().map(|r| r.digest.clone()).collect::<Vec<_>>(), [digest_of(&b)]);
-    assert!(!f.dir.join("cache/SHA-256").join(hex_name(&digest_of(&a))).exists());
+    assert_eq!(
+        full,
+        ["fsync", "rename", "commit", "unlink"],
+        "evicted file is unlinked after the commit"
+    );
+    assert_eq!(
+        recs.iter().map(|r| r.digest.clone()).collect::<Vec<_>>(),
+        [digest_of(&b)]
+    );
+    assert!(!f
+        .dir
+        .join("cache/SHA-256")
+        .join(hex_name(&digest_of(&a)))
+        .exists());
     for k in 0..full.len() {
         probe(k);
     }
@@ -194,7 +229,11 @@ enum Op {
 fn check_model(cap: u64, sizes: &[usize], ops: &[Op], ties: bool) {
     let f = fixture();
     let cache = Cache::new(&f.store, cap);
-    let blobs: Vec<Vec<u8>> = sizes.iter().enumerate().map(|(i, n)| blob(*n, 40 + i as u8)).collect();
+    let blobs: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| blob(*n, 40 + i as u8))
+        .collect();
     let digests: Vec<Digest> = blobs.iter().map(|b| digest_of(b)).collect();
     let mut model: BTreeMap<Digest, (u64, i64)> = BTreeMap::new();
     let mut clock = 1_000i64;
@@ -206,9 +245,13 @@ fn check_model(cap: u64, sizes: &[usize], ops: &[Op], ties: bool) {
                 }
                 let lock = f.store.lock().unwrap();
                 let mut ex = FsExecutor { store: &f.store };
-                cache.admit(&lock, &mut ex, verified(&cache, &blobs[*i]), clock).unwrap();
+                cache
+                    .admit(&lock, &mut ex, verified(&cache, &blobs[*i]), clock)
+                    .unwrap();
                 drop(lock);
-                let e = model.entry(digests[*i].clone()).or_insert((sizes[*i] as u64, clock));
+                let e = model
+                    .entry(digests[*i].clone())
+                    .or_insert((sizes[*i] as u64, clock));
                 e.1 = e.1.max(clock);
                 // Reference eviction: oldest (atime, digest) first, never the new one.
                 while model.values().map(|v| v.0).sum::<u64>() > cap {
@@ -234,12 +277,18 @@ fn check_model(cap: u64, sizes: &[usize], ops: &[Op], ties: bool) {
         got.sort_by(|a, b| a.digest.cmp(&b.digest));
         let want: Vec<Record> = model
             .iter()
-            .map(|(d, (s, a))| Record { digest: d.clone(), size: *s, atime_ns: *a })
+            .map(|(d, (s, a))| Record {
+                digest: d.clone(),
+                size: *s,
+                atime_ns: *a,
+            })
             .collect();
         assert_eq!(got, want, "after {op:?}");
         assert!(got.iter().map(|r| r.size).sum::<u64>() <= cap);
         assert_cache_invariants(&f);
-        let files = fs::read_dir(f.dir.join("cache/SHA-256")).map(|rd| rd.count()).unwrap_or(0);
+        let files = fs::read_dir(f.dir.join("cache/SHA-256"))
+            .map(|rd| rd.count())
+            .unwrap_or(0);
         assert_eq!(files, got.len(), "files on disk equal records");
     }
 }
@@ -277,9 +326,24 @@ proptest! {
 #[test]
 fn eviction_boundaries() {
     use Op::*;
-    check_model(1, &[1, 1, 1], &[Admit(0), Admit(1), Admit(0), Admit(2)], false);
-    check_model(50, &[10, 10, 50, 10], &[Admit(0), Admit(1), Admit(2), Admit(3)], false);
-    check_model(10, &[10, 10], &[Admit(0), Touch(0, 5), Admit(1), Admit(0)], true);
+    check_model(
+        1,
+        &[1, 1, 1],
+        &[Admit(0), Admit(1), Admit(0), Admit(2)],
+        false,
+    );
+    check_model(
+        50,
+        &[10, 10, 50, 10],
+        &[Admit(0), Admit(1), Admit(2), Admit(3)],
+        false,
+    );
+    check_model(
+        10,
+        &[10, 10],
+        &[Admit(0), Touch(0, 5), Admit(1), Admit(0)],
+        true,
+    );
 }
 
 #[test]
@@ -288,11 +352,19 @@ fn the_empty_blob_is_cacheable_and_free() {
     let cache = Cache::new(&f.store, 5);
     let lock = f.store.lock().unwrap();
     let mut ex = FsExecutor { store: &f.store };
-    cache.admit(&lock, &mut ex, verified(&cache, b""), 1).unwrap();
-    cache.admit(&lock, &mut ex, verified(&cache, &blob(5, 3)), 2).unwrap();
+    cache
+        .admit(&lock, &mut ex, verified(&cache, b""), 1)
+        .unwrap();
+    cache
+        .admit(&lock, &mut ex, verified(&cache, &blob(5, 3)), 2)
+        .unwrap();
     drop(lock);
     let sizes: Vec<u64> = cache.records().unwrap().iter().map(|r| r.size).collect();
-    assert_eq!(sizes.len(), 2, "a zero-size record does not count against the capacity: {sizes:?}");
+    assert_eq!(
+        sizes.len(),
+        2,
+        "a zero-size record does not count against the capacity: {sizes:?}"
+    );
     assert_cache_invariants(&f);
 }
 
@@ -329,18 +401,34 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
     type Tamper = fn(&Path, &Path);
     let cases: Vec<(&str, Tamper, bool)> = vec![
         ("intact", |_, _| {}, true),
-        ("same size, other bytes", |p, _| fs::write(p, blob(100, 99)).unwrap(), true),
+        (
+            "same size, other bytes",
+            |p, _| fs::write(p, blob(100, 99)).unwrap(),
+            true,
+        ),
         ("missing", |p, _| fs::remove_file(p).unwrap(), false),
-        ("wrong size", |p, _| fs::write(p, blob(99, 1)).unwrap(), false),
-        ("symlink to a right-size file", |p, aside| {
-            fs::write(aside, blob(100, 1)).unwrap();
-            fs::remove_file(p).unwrap();
-            symlink(aside, p).unwrap();
-        }, false),
-        ("directory", |p, _| {
-            fs::remove_file(p).unwrap();
-            fs::create_dir(p).unwrap();
-        }, false),
+        (
+            "wrong size",
+            |p, _| fs::write(p, blob(99, 1)).unwrap(),
+            false,
+        ),
+        (
+            "symlink to a right-size file",
+            |p, aside| {
+                fs::write(aside, blob(100, 1)).unwrap();
+                fs::remove_file(p).unwrap();
+                symlink(aside, p).unwrap();
+            },
+            false,
+        ),
+        (
+            "directory",
+            |p, _| {
+                fs::remove_file(p).unwrap();
+                fs::create_dir(p).unwrap();
+            },
+            false,
+        ),
     ];
     for (name, tamper, hit) in cases {
         let f = fixture();
@@ -349,7 +437,9 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
         let d = digest_of(&content);
         let lock = f.store.lock().unwrap();
         let mut ex = FsExecutor { store: &f.store };
-        cache.admit(&lock, &mut ex, verified(&cache, &content), 1).unwrap();
+        cache
+            .admit(&lock, &mut ex, verified(&cache, &content), 1)
+            .unwrap();
         drop(lock);
         let file = f.dir.join("cache/SHA-256").join(hex_name(&d));
         let aside = f.dir.join("aside");
@@ -358,24 +448,40 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
 
         // A busy lock: a miss, no eviction, no wait.
         if !hit {
-            let got = while_locked(&f.store, || cache.lookup(&d, &mut FsExecutor { store: &f.store }).unwrap());
+            let got = while_locked(&f.store, || {
+                cache
+                    .lookup(&d, &mut FsExecutor { store: &f.store })
+                    .unwrap()
+            });
             assert_eq!(got, None, "{name}: busy lock");
-            assert_eq!(cache.records().unwrap().len(), 1, "{name}: not evicted while the lock is busy");
+            assert_eq!(
+                cache.records().unwrap().len(),
+                1,
+                "{name}: not evicted while the lock is busy"
+            );
         }
-        let got = cache.lookup(&d, &mut FsExecutor { store: &f.store }).unwrap();
+        let got = cache
+            .lookup(&d, &mut FsExecutor { store: &f.store })
+            .unwrap();
         if hit {
             assert_eq!(got.as_deref(), Some(file.as_path()), "{name}");
             assert_eq!(cache.records().unwrap().len(), 1);
         } else {
             assert_eq!(got, None, "{name}");
-            assert!(cache.records().unwrap().is_empty(), "{name}: record evicted");
+            assert!(
+                cache.records().unwrap().is_empty(),
+                "{name}: record evicted"
+            );
             if name == "directory" {
                 assert!(file.is_dir(), "{name}: the directory is left in place");
             } else {
                 assert!(fs::symlink_metadata(&file).is_err(), "{name}: file evicted");
             }
             if aside_existed {
-                assert!(aside.exists(), "{name}: a symlink's target is never touched");
+                assert!(
+                    aside.exists(),
+                    "{name}: a symlink's target is never touched"
+                );
             }
         }
     }
@@ -393,7 +499,14 @@ fn touch_is_monotone_and_never_waits() {
     let content = blob(8, 1);
     let d = digest_of(&content);
     let lock = f.store.lock().unwrap();
-    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 500).unwrap();
+    cache
+        .admit(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            verified(&cache, &content),
+            500,
+        )
+        .unwrap();
     drop(lock);
     let atime = || cache.records().unwrap()[0].atime_ns;
     assert!(cache.touch(&d, 900).unwrap());
@@ -406,9 +519,20 @@ fn touch_is_monotone_and_never_waits() {
     assert_eq!(cache.records().unwrap(), before);
     // Re-admission keeps atime := max(old, now), even with a backward clock.
     let lock = f.store.lock().unwrap();
-    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 100).unwrap();
+    cache
+        .admit(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            verified(&cache, &content),
+            100,
+        )
+        .unwrap();
     drop(lock);
-    assert_eq!(atime(), 900, "re-admission with an older clock does not lower atime");
+    assert_eq!(
+        atime(),
+        900,
+        "re-admission with an older clock does not lower atime"
+    );
     let skipped = while_locked(&f.store, || cache.touch(&d, 5_000).unwrap());
     assert!(!skipped, "busy lock: skipped, reported");
     assert_eq!(atime(), 900);
@@ -418,7 +542,8 @@ fn touch_is_monotone_and_never_waits() {
 
 fn backdate(p: &Path, secs: u64) {
     let f = fs::OpenOptions::new().write(true).open(p).unwrap();
-    f.set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(secs))
+        .unwrap();
 }
 
 /// ES-30. Sweep removes orphans and unlocked temporaries older than 60 s, and
@@ -431,11 +556,21 @@ fn sweep_removes_the_dead_and_keeps_the_live() {
     let cache = Cache::new(&f.store, 1 << 20);
     let keep = blob(20, 1);
     let lock = f.store.lock().unwrap();
-    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &keep), 1).unwrap();
+    cache
+        .admit(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            verified(&cache, &keep),
+            1,
+        )
+        .unwrap();
     drop(lock);
 
     let tmp = f.dir.join("cache/tmp");
-    let orphan = f.dir.join("cache/SHA-256").join(hex_name(&digest_of(b"orphan")));
+    let orphan = f
+        .dir
+        .join("cache/SHA-256")
+        .join(hex_name(&digest_of(b"orphan")));
     fs::write(&orphan, b"orphan").unwrap();
     // Locked by another open file description, as a running fetch's file is.
     let live_path = tmp.join("live");
@@ -450,13 +585,25 @@ fn sweep_removes_the_dead_and_keeps_the_live() {
 
     let sweep = |cache: &Cache| {
         let lock = f.store.lock().unwrap();
-        cache.sweep(&lock, &mut FsExecutor { store: &f.store }, SystemTime::now()).unwrap();
+        cache
+            .sweep(
+                &lock,
+                &mut FsExecutor { store: &f.store },
+                SystemTime::now(),
+            )
+            .unwrap();
     };
     sweep(&cache);
     assert!(!orphan.exists(), "orphan file removed");
     assert!(!old.exists(), "unlocked stale temporary removed");
-    assert!(young.exists(), "a temporary younger than 60 s survives (create-then-lock window)");
-    assert!(live_path.exists(), "a locked temporary survives whatever its age");
+    assert!(
+        young.exists(),
+        "a temporary younger than 60 s survives (create-then-lock window)"
+    );
+    assert!(
+        live_path.exists(),
+        "a locked temporary survives whatever its age"
+    );
     assert_eq!(cache.records().unwrap().len(), 1);
     assert_cache_invariants(&f);
 
@@ -464,7 +611,10 @@ fn sweep_removes_the_dead_and_keeps_the_live() {
     let dead = live_path.clone();
     drop(live); // closing releases the flock, as a dying process does
     sweep(&cache);
-    assert!(!dead.exists(), "after its owner died, the old temporary is removed");
+    assert!(
+        !dead.exists(),
+        "after its owner died, the old temporary is removed"
+    );
     assert!(young.exists());
 }
 
@@ -477,14 +627,24 @@ fn admit_sweeps_first() {
     let cache = Cache::new(&f.store, 1 << 20);
     let lock = f.store.lock().unwrap();
     let mut ex = FsExecutor { store: &f.store };
-    cache.admit(&lock, &mut ex, verified(&cache, &blob(5, 1)), 1).unwrap();
-    let orphan = f.dir.join("cache/SHA-256").join(hex_name(&digest_of(b"orphan")));
+    cache
+        .admit(&lock, &mut ex, verified(&cache, &blob(5, 1)), 1)
+        .unwrap();
+    let orphan = f
+        .dir
+        .join("cache/SHA-256")
+        .join(hex_name(&digest_of(b"orphan")));
     fs::write(&orphan, b"orphan").unwrap();
     let old = f.dir.join("cache/tmp/old");
     fs::write(&old, b"o").unwrap();
     backdate(&old, 300);
-    cache.admit(&lock, &mut ex, verified(&cache, &blob(5, 2)), 2).unwrap();
-    assert!(!orphan.exists() && !old.exists(), "dead files survived an admit");
+    cache
+        .admit(&lock, &mut ex, verified(&cache, &blob(5, 2)), 2)
+        .unwrap();
+    assert!(
+        !orphan.exists() && !old.exists(),
+        "dead files survived an admit"
+    );
 }
 
 // ----------------------------------------------------------------- ES-24 ----
@@ -510,9 +670,19 @@ fn cache_paths_and_modes_are_explicit() {
     let _ = tmp.file();
     drop(other);
     drop(tmp);
-    assert!(f.dir.join("cache/tmp").read_dir().unwrap().next().is_none(), "dropping an unpersisted TmpFile deletes it");
+    assert!(
+        f.dir.join("cache/tmp").read_dir().unwrap().next().is_none(),
+        "dropping an unpersisted TmpFile deletes it"
+    );
     let lock = f.store.lock().unwrap();
-    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 1).unwrap();
+    cache
+        .admit(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            verified(&cache, &content),
+            1,
+        )
+        .unwrap();
     drop(lock);
     let rel = Cache::relative_path(&digest_of(&content));
     assert_eq!(
@@ -539,10 +709,14 @@ fn cache_paths_and_modes_are_explicit() {
 fn services_file_write_is_atomic_at_every_kill_point() {
     use ext::services::{write_file, ServiceUri};
     let uris = |n: std::ops::Range<usize>| -> Vec<ServiceUri> {
-        n.map(|i| ServiceUri::parse(&format!("https://h{i}.example/")).unwrap()).collect()
+        n.map(|i| ServiceUri::parse(&format!("https://h{i}.example/")).unwrap())
+            .collect()
     };
     let (old, new) = (uris(0..3), uris(0..5));
-    let (old_b, new_b) = (ext::services::render_file(&old), ext::services::render_file(&new));
+    let (old_b, new_b) = (
+        ext::services::render_file(&old),
+        ext::services::render_file(&new),
+    );
     let run = |at: usize| {
         let f = fixture();
         let lock = f.store.lock().unwrap();
@@ -550,25 +724,47 @@ fn services_file_write_is_atomic_at_every_kill_point() {
         let mut ex = Crash::new(&f.store, at);
         let _ = write_file(&f.store, &lock, &mut ex, &new);
         let got = fs::read(f.dir.join("services")).unwrap();
-        assert!(got == old_b || got == new_b, "killed at {at}: a mixed services file {got:?}");
+        assert!(
+            got == old_b || got == new_b,
+            "killed at {at}: a mixed services file {got:?}"
+        );
         let log = ex.log.clone();
         drop(ex);
         (f, lock, log)
     };
     let listing = |d: &Path| -> Vec<String> {
-        let mut v: Vec<String> = fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut v: Vec<String> = fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         v.sort();
         v
     };
     let (f0, _l, full) = run(usize::MAX);
     let baseline = listing(&f0.dir);
-    assert!(full.len() >= 2 && full[0] == "write" && *full.last().unwrap() == "rename" && full.iter().all(|k| ["write", "fsync", "rename"].contains(k)), "{full:?}");
+    assert!(
+        full.len() >= 2
+            && full[0] == "write"
+            && *full.last().unwrap() == "rename"
+            && full
+                .iter()
+                .all(|k| ["write", "fsync", "rename"].contains(k)),
+        "{full:?}"
+    );
     for k in 0..full.len() {
         let (f, lock, log) = run(k);
         assert_eq!(log, full[..k]);
-        assert_eq!(fs::read(f.dir.join("services")).unwrap(), old_b, "killed before effect {k}: not yet renamed, so the old bytes");
+        assert_eq!(
+            fs::read(f.dir.join("services")).unwrap(),
+            old_b,
+            "killed before effect {k}: not yet renamed, so the old bytes"
+        );
         write_file(&f.store, &lock, &mut FsExecutor { store: &f.store }, &new).unwrap();
         assert_eq!(fs::read(f.dir.join("services")).unwrap(), new_b);
-        assert_eq!(listing(&f.dir), baseline, "a temporary survived the next write");
+        assert_eq!(
+            listing(&f.dir),
+            baseline,
+            "a temporary survived the next write"
+        );
     }
 }

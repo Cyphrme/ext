@@ -26,7 +26,12 @@ impl Latch {
             if stop.load(Ordering::Relaxed) {
                 return false;
             }
-            g = self.0 .1.wait_timeout(g, Duration::from_millis(20)).unwrap().0;
+            g = self
+                .0
+                 .1
+                .wait_timeout(g, Duration::from_millis(20))
+                .unwrap()
+                .0;
         }
         true
     }
@@ -134,7 +139,11 @@ impl Fb {
     }
 
     /// As `start`, on a chosen port, so two addresses can share one port.
-    pub fn start_on(ip: &str, port: u16, handler: impl Fn(&Req) -> Resp + Send + Sync + 'static) -> Fb {
+    pub fn start_on(
+        ip: &str,
+        port: u16,
+        handler: impl Fn(&Req) -> Resp + Send + Sync + 'static,
+    ) -> Fb {
         let l = TcpListener::bind((ip, port)).expect("bind loopback FB");
         let addr = l.local_addr().unwrap();
         let log: Arc<Mutex<Vec<Req>>> = Arc::default();
@@ -245,7 +254,9 @@ fn respond(c: &mut TcpStream, r: &Resp, stop: &AtomicBool) -> std::io::Result<()
         head.extend_from_slice(b"\r\n");
     }
     match &r.body {
-        Body::Bytes(b) => head.extend_from_slice(format!("Content-Length: {}\r\n", b.len()).as_bytes()),
+        Body::Bytes(b) => {
+            head.extend_from_slice(format!("Content-Length: {}\r\n", b.len()).as_bytes())
+        }
         Body::Chunked(..) => head.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
         Body::Lie { claimed, .. } => {
             head.extend_from_slice(format!("Content-Length: {claimed}\r\n").as_bytes())

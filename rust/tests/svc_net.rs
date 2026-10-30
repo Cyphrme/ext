@@ -43,28 +43,55 @@ impl Resolver for Shared {
                 .cloned()
                 .ok_or_else(|| std::io::Error::other(format!("no such name {host}")))?,
         };
-        Ok(ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect())
+        Ok(ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect())
     }
 }
 
-fn client(allow_local: bool, table: AddrTable, names: &[(&str, &[&str])]) -> (Client, Arc<Scripted>) {
+fn client(
+    allow_local: bool,
+    table: AddrTable,
+    names: &[(&str, &[&str])],
+) -> (Client, Arc<Scripted>) {
     let r = Arc::new(Scripted {
         map: names
             .iter()
-            .map(|(n, ips)| (n.to_string(), ips.iter().map(|i| i.parse().unwrap()).collect()))
+            .map(|(n, ips)| {
+                (
+                    n.to_string(),
+                    ips.iter().map(|i| i.parse().unwrap()).collect(),
+                )
+            })
             .collect(),
         calls: Mutex::default(),
     });
-    let cfg = HttpsConfig { allow_http: true, allow_local };
+    let cfg = HttpsConfig {
+        allow_http: true,
+        allow_local,
+    };
     (Client::new(cfg, Box::new(Shared(r.clone())), table), r)
 }
 
 fn local_client() -> Client {
-    client(true, AddrTable { allow: vec![], deny: vec![] }, &[]).0
+    client(
+        true,
+        AddrTable {
+            allow: vec![],
+            deny: vec![],
+        },
+        &[],
+    )
+    .0
 }
 
 fn limits() -> Limits {
-    Limits { max_size: 1 << 20, idle: Duration::from_secs(5), total: Duration::from_secs(10) }
+    Limits {
+        max_size: 1 << 20,
+        idle: Duration::from_secs(5),
+        total: Duration::from_secs(10),
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,7 +153,11 @@ fn every_final_status_classifies_per_the_table() {
             return Resp::ok(&b2);
         }
         let resp = Resp::status(n);
-        if (300..400).contains(&n) { resp.header("Location", b"/ok") } else { resp }
+        if (300..400).contains(&n) {
+            resp.header("Location", b"/ok")
+        } else {
+            resp
+        }
     });
     let c = local_client();
     for n in 200..=599u16 {
@@ -149,17 +180,43 @@ fn interim_gzip_and_empty_bodies() {
     let b = blob(64, 1);
     let c = local_client();
     let b2 = b.clone();
-    let fb = Fb::start("127.0.0.2", move |_| Resp { interim: true, ..Resp::ok(&b2) });
-    assert_eq!(fetch(&c, &fb.base(), &b, &limits()).0, Got::Hit(b.clone()), "1xx then 200");
+    let fb = Fb::start("127.0.0.2", move |_| Resp {
+        interim: true,
+        ..Resp::ok(&b2)
+    });
+    assert_eq!(
+        fetch(&c, &fb.base(), &b, &limits()).0,
+        Got::Hit(b.clone()),
+        "1xx then 200"
+    );
     let b2 = b.clone();
-    let fb = Fb::start("127.0.0.2", move |_| Resp::ok(&b2).header("Content-Encoding", b"gzip"));
-    assert!(is_err(&fetch(&c, &fb.base(), &b, &limits()).0), "gzip is Error");
+    let fb = Fb::start("127.0.0.2", move |_| {
+        Resp::ok(&b2).header("Content-Encoding", b"gzip")
+    });
+    assert!(
+        is_err(&fetch(&c, &fb.base(), &b, &limits()).0),
+        "gzip is Error"
+    );
     let b2 = b.clone();
-    let fb = Fb::start("127.0.0.2", move |_| Resp::ok(&b2).header("Content-Encoding", b"identity"));
-    assert_eq!(fetch(&c, &fb.base(), &b, &limits()).0, Got::Hit(b.clone()), "identity is fine");
+    let fb = Fb::start("127.0.0.2", move |_| {
+        Resp::ok(&b2).header("Content-Encoding", b"identity")
+    });
+    assert_eq!(
+        fetch(&c, &fb.base(), &b, &limits()).0,
+        Got::Hit(b.clone()),
+        "identity is fine"
+    );
     let fb = Fb::start("127.0.0.2", |_| Resp::ok(b""));
-    assert_eq!(fetch(&c, &fb.base(), b"", &limits()).0, Got::Hit(vec![]), "the empty blob is a blob");
-    assert_eq!(fetch(&c, &fb.base(), &b, &limits()).0, Got::Hit(vec![]), "an empty candidate is returned, the loop calls it Mismatch");
+    assert_eq!(
+        fetch(&c, &fb.base(), b"", &limits()).0,
+        Got::Hit(vec![]),
+        "the empty blob is a blob"
+    );
+    assert_eq!(
+        fetch(&c, &fb.base(), &b, &limits()).0,
+        Got::Hit(vec![]),
+        "an empty candidate is returned, the loop calls it Mismatch"
+    );
 }
 
 // ----------------------------------------------------------------- ES-9 ----
@@ -217,35 +274,80 @@ fn hex(h: &str) -> Vec<u8> {
 #[test]
 fn the_size_cap_is_enforced_by_the_client() {
     const CAP: usize = 64 << 10;
-    let l = Limits { max_size: CAP as u64, idle: Duration::from_secs(2), total: Duration::from_secs(6) };
+    let l = Limits {
+        max_size: CAP as u64,
+        idle: Duration::from_secs(2),
+        total: Duration::from_secs(6),
+    };
     let c = local_client();
     let exact = blob(CAP, 1);
     let over = blob(CAP + 1, 1);
-    let serve = |b: Vec<u8>, body: fn(Vec<u8>) -> Body| Fb::start("127.0.0.2", move |_| Resp::status(200).body(body(b.clone())));
+    let serve = |b: Vec<u8>, body: fn(Vec<u8>) -> Body| {
+        Fb::start("127.0.0.2", move |_| {
+            Resp::status(200).body(body(b.clone()))
+        })
+    };
     let fb = serve(exact.clone(), Body::Bytes);
     let (g, _, len) = fetch_sink(&c, &fb.base(), &exact, &l);
-    assert_eq!((g, len), (Got::Hit(exact.clone()), CAP as u64), "exactly the cap");
+    assert_eq!(
+        (g, len),
+        (Got::Hit(exact.clone()), CAP as u64),
+        "exactly the cap"
+    );
     let fb = serve(over.clone(), Body::Bytes);
     let (g, _, len) = fetch_sink(&c, &fb.base(), &over, &l);
-    assert!(is_err(&g) && len <= CAP as u64, "cap+1 with honest Content-Length (sink {len})");
+    assert!(
+        is_err(&g) && len <= CAP as u64,
+        "cap+1 with honest Content-Length (sink {len})"
+    );
     let fb = serve(over.clone(), |b| Body::Chunked(b, 4096));
     let (g, _, len) = fetch_sink(&c, &fb.base(), &over, &l);
-    assert!(is_err(&g) && len <= CAP as u64, "cap+1 without Content-Length (sink {len})");
-    let fb = Fb::start("127.0.0.2", move |_| Resp::status(200).body(Body::Lie { claimed: CAP as u64 + 1, sent: vec![1; 10] }));
+    assert!(
+        is_err(&g) && len <= CAP as u64,
+        "cap+1 without Content-Length (sink {len})"
+    );
+    let fb = Fb::start("127.0.0.2", move |_| {
+        Resp::status(200).body(Body::Lie {
+            claimed: CAP as u64 + 1,
+            sent: vec![1; 10],
+        })
+    });
     let (g, _, len) = fetch_sink(&c, &fb.base(), &exact, &l);
-    assert!(is_err(&g) && len <= CAP as u64, "claim above the cap, short body");
-    let fb = Fb::start("127.0.0.2", move |_| Resp::status(200).body(Body::Lie { claimed: 100, sent: vec![1; 10] }));
-    assert!(is_err(&fetch(&c, &fb.base(), &exact, &l).0), "honest length within the cap, body closes early");
+    assert!(
+        is_err(&g) && len <= CAP as u64,
+        "claim above the cap, short body"
+    );
+    let fb = Fb::start("127.0.0.2", move |_| {
+        Resp::status(200).body(Body::Lie {
+            claimed: 100,
+            sent: vec![1; 10],
+        })
+    });
+    assert!(
+        is_err(&fetch(&c, &fb.base(), &exact, &l).0),
+        "honest length within the cap, body closes early"
+    );
     let fb = Fb::start("127.0.0.2", |_| Resp::status(200).body(Body::Endless));
     let (got, took, len) = fetch_sink(&c, &fb.base(), &exact, &l);
-    assert!(is_err(&got) && len <= CAP as u64, "endless body (sink {len})");
-    assert!(took < Duration::from_secs(2), "the cap, not the {:?} total timeout, ended it", l.total);
+    assert!(
+        is_err(&got) && len <= CAP as u64,
+        "endless body (sink {len})"
+    );
+    assert!(
+        took < Duration::from_secs(2),
+        "the cap, not the {:?} total timeout, ended it",
+        l.total
+    );
 }
 
 // ---------------------------------------------------------------- ES-13 ----
 
 fn timeout_limits() -> Limits {
-    Limits { max_size: 1 << 20, idle: Duration::from_millis(300), total: Duration::from_millis(1500) }
+    Limits {
+        max_size: 1 << 20,
+        idle: Duration::from_millis(300),
+        total: Duration::from_millis(1500),
+    }
 }
 
 /// ES-13, real short timeouts, 500 ms slack. A silent server ends at the idle
@@ -270,12 +372,19 @@ fn idle_and_total_timeouts_hold_and_span_hops() {
     within(t, 250, 300, "hang");
 
     let never = Latch::default();
-    let fb = Fb::start("127.0.0.2", move |_| Resp::status(200).body(Body::HoldThen(never.clone(), vec![])));
+    let fb = Fb::start("127.0.0.2", move |_| {
+        Resp::status(200).body(Body::HoldThen(never.clone(), vec![]))
+    });
     let (g, t) = fetch(&c, &fb.base(), b"x", &l);
     assert!(is_err(&g));
     within(t, 250, 300, "stall after the status line");
 
-    let fb = Fb::start("127.0.0.2", |_| Resp::status(200).body(Body::Drip { byte: b'a', every: Duration::from_millis(100) }));
+    let fb = Fb::start("127.0.0.2", |_| {
+        Resp::status(200).body(Body::Drip {
+            byte: b'a',
+            every: Duration::from_millis(100),
+        })
+    });
     let (g, t) = fetch(&c, &fb.base(), b"x", &l);
     assert!(is_err(&g));
     within(t, 1400, 1500, "drip");
@@ -283,12 +392,19 @@ fn idle_and_total_timeouts_hold_and_span_hops() {
     // The chain has its own limits: each hop (400 ms) is well inside the idle
     // timeout, and only the sum (six requests, 2400 ms) exceeds the total, so
     // a timer that restarts per hop never fires and the fetch wrongly succeeds.
-    let l = Limits { idle: Duration::from_millis(1000), ..l };
+    let l = Limits {
+        idle: Duration::from_millis(1000),
+        ..l
+    };
     let b = blob(8, 1);
     let fb = Fb::start("127.0.0.2", move |r| {
         std::thread::sleep(Duration::from_millis(400));
         let host = r.header("host").unwrap().to_string();
-        match r.target.strip_prefix("/h").and_then(|n| n.parse::<u32>().ok()) {
+        match r
+            .target
+            .strip_prefix("/h")
+            .and_then(|n| n.parse::<u32>().ok())
+        {
             Some(5) => Resp::ok(&b),
             Some(n) => Resp::redirect(302, &format!("http://{host}/h{}", n + 1)),
             None => Resp::redirect(302, &format!("http://{host}/h1")),
@@ -307,9 +423,19 @@ fn chain(n: u32, b: &[u8]) -> Fb {
     let b = b.to_vec();
     Fb::start("127.0.0.2", move |r| {
         let host = r.header("host").unwrap().to_string();
-        let i = r.target.strip_prefix("/h").and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
-        if i >= n { return Resp::ok(&b); }
-        let next = if i % 2 == 0 { format!("http://{host}/h{}", i + 1) } else { format!("/h{}", i + 1) };
+        let i = r
+            .target
+            .strip_prefix("/h")
+            .and_then(|x| x.parse::<u32>().ok())
+            .unwrap_or(0);
+        if i >= n {
+            return Resp::ok(&b);
+        }
+        let next = if i % 2 == 0 {
+            format!("http://{host}/h{}", i + 1)
+        } else {
+            format!("/h{}", i + 1)
+        };
         Resp::redirect([301, 302, 303, 307, 308][i as usize % 5], &next)
     })
 }
@@ -327,13 +453,19 @@ fn at_most_five_redirect_hops() {
             assert_eq!(got, Got::Hit(b.clone()), "{n} hops");
         } else {
             assert!(is_err(&got), "{n} hops must be Error");
-            assert!(fb.requests().len() <= 6, "no hop past the limit was requested");
+            assert!(
+                fb.requests().len() <= 6,
+                "no hop past the limit was requested"
+            );
         }
     }
     let fb = Fb::start("127.0.0.2", |_| Resp::redirect(302, "/loop"));
     let (got, _) = fetch(&c, &fb.base(), &b, &limits());
     assert!(is_err(&got));
-    assert!(fb.requests().len() <= 6, "a self-loop is cut at the hop limit");
+    assert!(
+        fb.requests().len() <= 6,
+        "a self-loop is cut at the hop limit"
+    );
 }
 
 /// ES-14: a Location must satisfy the services grammar for its scheme and
@@ -357,7 +489,10 @@ fn unacceptable_redirect_targets_are_errors_and_are_not_followed() {
         let (got, _) = fetch(&c, &fb.base(), &b, &limits());
         assert!(is_err(&got), "{loc}");
     }
-    assert!(ok.requests().is_empty(), "none of those targets was contacted");
+    assert!(
+        ok.requests().is_empty(),
+        "none of those targets was contacted"
+    );
     // A query string in a Location is allowed (presigned and CDN redirects).
     let target = format!("http://{ok_host}/x?sig=1");
     let fb = Fb::start("127.0.0.2", move |_| Resp::redirect(302, &target));
@@ -381,7 +516,10 @@ fn resolver_and_allow_list_are_wired_on_every_hop() {
     let port = public.addr.port();
     let pb = b.clone();
     let local = Fb::start_on("127.0.0.3", port, move |_| Resp::ok(&pb));
-    let table = || AddrTable { allow: vec![("127.0.0.2".parse().unwrap(), 32)], deny: vec![] };
+    let table = || AddrTable {
+        allow: vec![("127.0.0.2".parse().unwrap(), 32)],
+        deny: vec![],
+    };
     let names: &[(&str, &[&str])] = &[
         ("pub.test", &["127.0.0.2"]),
         ("pub2.test", &["127.0.0.2"]),
@@ -392,34 +530,82 @@ fn resolver_and_allow_list_are_wired_on_every_hop() {
     let uri = |h: &str| format!("http://{h}:{port}/");
     let calls = |r: &Scripted| r.calls.lock().unwrap().len();
 
-    assert_eq!(fetch(&c, &uri("pub.test"), &b, &limits()).0, Got::Hit(b.clone()));
+    assert_eq!(
+        fetch(&c, &uri("pub.test"), &b, &limits()).0,
+        Got::Hit(b.clone())
+    );
     assert_eq!(calls(&r), 1, "one resolver call for one hop");
     assert!(is_err(&fetch(&c, &uri("loc.test"), &b, &limits()).0));
-    assert!(is_err(&fetch(&c, &uri("127.0.0.3"), &b, &limits()).0), "a literal reaches the hook too");
-    assert!(r.calls.lock().unwrap().iter().any(|(h, _)| h == "127.0.0.3"));
-    assert_eq!(fetch(&c, &uri("both.test"), &b, &limits()).0, Got::Hit(b.clone()), "only the allowed address is used");
-    assert!(local.requests().is_empty(), "the local FB saw nothing so far");
-    assert_eq!(fetch(&c, &uri("127.0.0.2"), &b, &limits()).0, Got::Hit(b.clone()));
+    assert!(
+        is_err(&fetch(&c, &uri("127.0.0.3"), &b, &limits()).0),
+        "a literal reaches the hook too"
+    );
+    assert!(r
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(h, _)| h == "127.0.0.3"));
+    assert_eq!(
+        fetch(&c, &uri("both.test"), &b, &limits()).0,
+        Got::Hit(b.clone()),
+        "only the allowed address is used"
+    );
+    assert!(
+        local.requests().is_empty(),
+        "the local FB saw nothing so far"
+    );
+    assert_eq!(
+        fetch(&c, &uri("127.0.0.2"), &b, &limits()).0,
+        Got::Hit(b.clone())
+    );
 
     // Hop wiring: a redirect from the public FB to a disallowed name, then literal.
-    for target in [format!("http://loc.test:{port}/x"), format!("http://127.0.0.3:{port}/x")] {
+    for target in [
+        format!("http://loc.test:{port}/x"),
+        format!("http://127.0.0.3:{port}/x"),
+    ] {
         let redirector = Fb::start("127.0.0.2", move |_| Resp::redirect(302, &target));
-        let (got, _) = fetch(&c, &format!("http://pub.test:{}/", redirector.addr.port()), &b, &limits());
+        let (got, _) = fetch(
+            &c,
+            &format!("http://pub.test:{}/", redirector.addr.port()),
+            &b,
+            &limits(),
+        );
         assert!(is_err(&got), "redirect into disallowed space");
     }
-    assert!(local.requests().is_empty(), "no hop ever reached the disallowed address");
+    assert!(
+        local.requests().is_empty(),
+        "no hop ever reached the disallowed address"
+    );
 
     // One resolver call per hop: pub.test -> pub2.test is two hops.
     let target = format!("http://pub2.test:{port}/x");
     let redirector = Fb::start("127.0.0.2", move |_| Resp::redirect(302, &target));
     let before = calls(&r);
-    assert_eq!(fetch(&c, &format!("http://pub.test:{}/", redirector.addr.port()), &b, &limits()).0, Got::Hit(b.clone()));
-    assert_eq!(calls(&r) - before, 2, "resolver consulted exactly once per hop");
+    assert_eq!(
+        fetch(
+            &c,
+            &format!("http://pub.test:{}/", redirector.addr.port()),
+            &b,
+            &limits()
+        )
+        .0,
+        Got::Hit(b.clone())
+    );
+    assert_eq!(
+        calls(&r) - before,
+        2,
+        "resolver consulted exactly once per hop"
+    );
 
     // Control: with AllowLocal the same name connects, so the refusals above
     // were the allow-list and not a broken setup.
     let (c2, _) = client(true, table(), names);
-    assert_eq!(fetch(&c2, &uri("loc.test"), &b, &limits()).0, Got::Hit(b.clone()));
+    assert_eq!(
+        fetch(&c2, &uri("loc.test"), &b, &limits()).0,
+        Got::Hit(b.clone())
+    );
     assert_eq!(local.requests().len(), 1);
 }
 
@@ -451,8 +637,14 @@ fn requests_are_plain_gets_with_the_five_headers() {
     for (line, want_target) in [
         (format!("http://{hostport}"), format!("/SHA-256:{dig}")),
         (format!("http://{hostport}///"), format!("/SHA-256:{dig}")),
-        (format!("http://{hostport}/t/{{digest}}"), format!("/t/{dig}")),
-        (format!("http://{hostport}/q?a={{alg}}&h={{hex}}"), format!("/q?a=SHA-256&h={hexd}")),
+        (
+            format!("http://{hostport}/t/{{digest}}"),
+            format!("/t/{dig}"),
+        ),
+        (
+            format!("http://{hostport}/q?a={{alg}}&h={{hex}}"),
+            format!("/q?a=SHA-256&h={hexd}"),
+        ),
     ] {
         let n0 = fb.requests().len();
         // Each request redirects once, so the target of interest is the first.
@@ -462,15 +654,31 @@ fn requests_are_plain_gets_with_the_five_headers() {
         assert_eq!(reqs[n0].target, want_target, "{line}");
         for r in &reqs[n0..] {
             assert_eq!(r.method, "GET");
-            let allowed = ["host", "user-agent", "accept", "accept-encoding", "connection"];
+            let allowed = [
+                "host",
+                "user-agent",
+                "accept",
+                "accept-encoding",
+                "connection",
+            ];
             for (k, _) in &r.headers {
-                assert!(allowed.contains(&k.to_ascii_lowercase().as_str()), "header {k} is not allowed");
+                assert!(
+                    allowed.contains(&k.to_ascii_lowercase().as_str()),
+                    "header {k} is not allowed"
+                );
             }
             assert_eq!(r.header("accept-encoding"), Some("identity"));
             assert_eq!(r.header("accept"), Some("application/octet-stream"));
             assert!(r.header("user-agent").unwrap_or("").starts_with("ext/"));
-            assert!(r.header("cookie").is_none(), "no cookies are sent, even after Set-Cookie");
+            assert!(
+                r.header("cookie").is_none(),
+                "no cookies are sent, even after Set-Cookie"
+            );
         }
-        assert_eq!(reqs.len() - n0, 2, "one redirect, one final request, no probes");
+        assert_eq!(
+            reqs.len() - n0,
+            2,
+            "one redirect, one final request, no probes"
+        );
     }
 }

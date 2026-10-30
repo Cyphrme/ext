@@ -54,7 +54,10 @@ fn leaf(ca: &Ca, san: &str, expired: bool) -> Leaf {
     }
     let issuer = Issuer::from_params(&ca.params, &ca.key);
     let cert = p.signed_by(&key, &issuer).unwrap();
-    Leaf { chain: vec![cert.der().clone()], key: PrivatePkcs8KeyDer::from(key.serialize_der()) }
+    Leaf {
+        chain: vec![cert.der().clone()],
+        key: PrivatePkcs8KeyDer::from(key.serialize_der()),
+    }
 }
 
 struct TlsFb {
@@ -100,7 +103,8 @@ fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
                 return;
             }
             let Ok(tcp) = conn else { continue };
-            let (cfg, blob, served, stop) = (cfg.clone(), blob.clone(), served2.clone(), stop2.clone());
+            let (cfg, blob, served, stop) =
+                (cfg.clone(), blob.clone(), served2.clone(), stop2.clone());
             std::thread::spawn(move || {
                 if matches!(blob, Mode::Stall) {
                     while !stop.load(Ordering::Relaxed) {
@@ -123,7 +127,11 @@ fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
                         let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
                     }
                     Mode::Blob(b) => {
-                        let _ = write!(s, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", b.len());
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                            b.len()
+                        );
                         let _ = s.write_all(b);
                     }
                     Mode::Stall => {}
@@ -171,8 +179,20 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
     let env = env_for(&fb, "");
     let keylog = env.base.join("keylog");
     let trusted = write_ca(&env, "good.pem", &good.pem);
-    let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted), ("SSLKEYLOGFILE", keylog.to_str().unwrap())]);
-    assert_eq!((o.code, &o.stdout), (0, &b), "valid chain, matching SAN: {}", o.stderr);
+    let o = cat_with(
+        &env,
+        &b,
+        &[
+            ("SSL_CERT_FILE", &trusted),
+            ("SSLKEYLOGFILE", keylog.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        (o.code, &o.stdout),
+        (0, &b),
+        "valid chain, matching SAN: {}",
+        o.stderr
+    );
     assert_eq!(fb.served.load(Ordering::SeqCst), 1);
     assert!(!keylog.exists(), "SSLKEYLOGFILE must be ignored");
 
@@ -181,9 +201,17 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
     let env = env_for(&fb, "");
     let untrusted = write_ca(&env, "other.pem", &other.pem);
     let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &untrusted)]);
-    assert_eq!(o.code, 5, "a chain from a CA the roots do not name: {}", o.stderr);
+    assert_eq!(
+        o.code, 5,
+        "a chain from a CA the roots do not name: {}",
+        o.stderr
+    );
     assert!(o.stdout.is_empty());
-    assert_eq!(fb.served.load(Ordering::SeqCst), 1, "no request was made over the refused session");
+    assert_eq!(
+        fb.served.load(Ordering::SeqCst),
+        1,
+        "no request was made over the refused session"
+    );
 
     for (what, l) in [
         ("wrong name", leaf(&good, "127.0.0.9", false)),
@@ -195,7 +223,11 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
         let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
         assert_eq!(o.code, 5, "{what}: {}", o.stderr);
         assert!(o.stdout.is_empty(), "{what}");
-        assert_eq!(fb.served.load(Ordering::SeqCst), 0, "{what}: no request over a session that failed validation");
+        assert_eq!(
+            fb.served.load(Ordering::SeqCst),
+            0,
+            "{what}: no request over a session that failed validation"
+        );
     }
 }
 
@@ -210,19 +242,31 @@ fn a_bad_ssl_cert_file_is_an_error_naming_the_cause() {
     let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Blob(b.clone()));
     let env = env_for(&fb, "");
     let pem = write_ca(&env, "ok.pem", &good.pem);
-    assert_eq!(cat_with(&env, &b, &[("SSL_CERT_FILE", &pem)]).code, 0, "control: the good file works");
+    assert_eq!(
+        cat_with(&env, &b, &[("SSL_CERT_FILE", &pem)]).code,
+        0,
+        "control: the good file works"
+    );
     // A fresh store: the control cached the blob, and a cache hit (ES-1)
     // would answer without loading any root.
     let env = env_for(&fb, "");
     let garbled = env.base.join("garbled.pem");
-    fs::write(&garbled, b"-----BEGIN CERTIFICATE-----\nnot base64 !!\n-----END CERTIFICATE-----\n").unwrap();
+    fs::write(
+        &garbled,
+        b"-----BEGIN CERTIFICATE-----\nnot base64 !!\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
     let empty = env.base.join("empty.pem");
     fs::write(&empty, b"").unwrap();
     let missing = env.base.join("missing.pem");
     for p in [&garbled, &empty, &missing] {
         let o = cat_with(&env, &b, &[("SSL_CERT_FILE", p.to_str().unwrap())]);
         assert_eq!(o.code, 5, "{}: {}", p.display(), o.stderr);
-        assert!(o.stderr.contains(p.to_str().unwrap()), "the cause names the path: {}", o.stderr);
+        assert!(
+            o.stderr.contains(p.to_str().unwrap()),
+            "the cause names the path: {}",
+            o.stderr
+        );
         assert!(o.stdout.is_empty());
     }
 }
@@ -239,8 +283,16 @@ fn a_stalled_handshake_is_cut_off() {
     let trusted = write_ca(&env, "good.pem", &good.pem);
     let o = cat_with(&env, &blob(10, 1), &[("SSL_CERT_FILE", &trusted)]);
     assert_eq!(o.code, 5, "{}", o.stderr);
-    assert!(o.elapsed >= Duration::from_millis(250) && o.elapsed < Duration::from_millis(300 + 500), "{:?}", o.elapsed);
-    assert!(o.stderr.contains(&format!("https://{}/", fb.addr)), "{}", o.stderr);
+    assert!(
+        o.elapsed >= Duration::from_millis(250) && o.elapsed < Duration::from_millis(300 + 500),
+        "{:?}",
+        o.elapsed
+    );
+    assert!(
+        o.stderr.contains(&format!("https://{}/", fb.addr)),
+        "{}",
+        o.stderr
+    );
 }
 
 /// ES-17: proxy variables (any case) are not read. With every proxy variable
@@ -253,10 +305,17 @@ fn proxy_variables_are_ignored() {
     let proxy = TcpListener::bind("127.0.0.2:0").unwrap();
     proxy.set_nonblocking(true).unwrap();
     let url = format!("http://{}", proxy.local_addr().unwrap());
-    let vars: Vec<(&str, &str)> = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"]
-        .into_iter()
-        .map(|k| (k, url.as_str()))
-        .collect();
+    let vars: Vec<(&str, &str)> = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .into_iter()
+    .map(|k| (k, url.as_str()))
+    .collect();
     let connections = || (0..50).filter(|_| proxy.accept().is_ok()).count();
 
     let good = ca("trusted");
@@ -266,7 +325,12 @@ fn proxy_variables_are_ignored() {
     let mut v = vars.clone();
     v.push(("SSL_CERT_FILE", &trusted));
     let o = cat_with(&env, &b, &v);
-    assert_eq!((o.code, &o.stdout), (0, &b), "https fetch direct, not via a proxy: {}", o.stderr);
+    assert_eq!(
+        (o.code, &o.stdout),
+        (0, &b),
+        "https fetch direct, not via a proxy: {}",
+        o.stderr
+    );
 
     let plain = Fb::blob("127.0.0.2", &b);
     let env = Env::new();
@@ -274,7 +338,11 @@ fn proxy_variables_are_ignored() {
     env.services(&[plain.base()]);
     let o = cat_with(&env, &b, &vars);
     assert_eq!((o.code, &o.stdout), (0, &b), "{}", o.stderr);
-    assert_eq!(plain.requests().len(), 1, "the service itself saw the request");
+    assert_eq!(
+        plain.requests().len(),
+        1,
+        "the service itself saw the request"
+    );
     assert_eq!(connections(), 0, "the proxy listener was never contacted");
 }
 
@@ -288,14 +356,25 @@ fn an_https_to_http_redirect_needs_allow_http() {
     let b = blob(64, 4);
     let plain = Fb::blob("127.0.0.2", &b);
     let good = ca("trusted");
-    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Redirect(format!("{}x", plain.base())));
+    let fb = tls_fb(
+        leaf(&good, "127.0.0.2", false),
+        Mode::Redirect(format!("{}x", plain.base())),
+    );
     let env = env_for(&fb, "");
     let trusted = write_ca(&env, "good.pem", &good.pem);
     let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
     assert_eq!(o.code, 5, "downgrade without AllowHTTP: {}", o.stderr);
-    assert!(plain.requests().is_empty(), "the http server must not be contacted");
+    assert!(
+        plain.requests().is_empty(),
+        "the http server must not be contacted"
+    );
     env.config_raw("{ AllowLocal: true, AllowHTTP: true }");
     let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
-    assert_eq!((o.code, &o.stdout), (0, &b), "control, AllowHTTP on: {}", o.stderr);
+    assert_eq!(
+        (o.code, &o.stdout),
+        (0, &b),
+        "control, AllowHTTP on: {}",
+        o.stderr
+    );
     assert_eq!(plain.requests().len(), 1);
 }

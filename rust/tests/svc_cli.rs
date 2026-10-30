@@ -53,17 +53,31 @@ fn a_local_answer_means_no_service_is_contacted() {
     let c_value = label(&c).split(':').next().unwrap().to_string();
     let fb = Fb::start("127.0.0.2", {
         let (b, c) = (b.clone(), c.clone());
-        move |r| if r.target.contains(&c_value) { Resp::ok(&c) } else { Resp::ok(&b) }
+        move |r| {
+            if r.target.contains(&c_value) {
+                Resp::ok(&c)
+            } else {
+                Resp::ok(&b)
+            }
+        }
     });
     let env = setup(&[&fb]);
     env.index_file("a", &b);
     let o = env.ext(&["cat", &label(&b)]);
     assert_eq!((o.code, &o.stdout), (0, &b), "index answers: {}", o.stderr);
     assert_eq!(env.ext(&["resolve", &label(&b)]).code, 0);
-    assert!(fb.requests().is_empty(), "the index answered; no service may be contacted");
+    assert!(
+        fb.requests().is_empty(),
+        "the index answered; no service may be contacted"
+    );
 
     let o = env.ext(&["cat", &label(&c)]);
-    assert_eq!((o.code, &o.stdout), (0, &c), "service answers: {}", o.stderr);
+    assert_eq!(
+        (o.code, &o.stdout),
+        (0, &c),
+        "service answers: {}",
+        o.stderr
+    );
     assert_eq!(fb.requests().len(), 1);
     let o = env.ext(&["cat", &label(&c)]);
     assert_eq!((o.code, &o.stdout), (0, &c));
@@ -75,7 +89,11 @@ fn a_local_answer_means_no_service_is_contacted() {
     let o = env.ext(&["cat", &label(&c)]);
     assert_eq!((o.code, &o.stdout), (0, &c), "{}", o.stderr);
     assert_eq!(fb.requests().len(), 2, "a stale record is a miss");
-    assert_eq!(fs::read(&file).unwrap(), c, "and the cache holds the verified blob again");
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        c,
+        "and the cache holds the verified blob again"
+    );
 }
 
 /// ES-2. A digest that is truncated, unlabeled, of an unknown algorithm or of
@@ -100,8 +118,15 @@ fn non_fetchable_digests_never_reach_a_service() {
         assert_eq!(o.code, 4, "{arg}: {}", o.stderr);
         assert!(o.stdout.is_empty());
     }
-    assert!(fb.requests().is_empty(), "no service saw a non-fetchable digest");
-    assert_eq!(env.ext(&["cat", &full]).code, 0, "control: a full digest does reach the service");
+    assert!(
+        fb.requests().is_empty(),
+        "no service saw a non-fetchable digest"
+    );
+    assert_eq!(
+        env.ext(&["cat", &full]).code,
+        0,
+        "control: a full digest does reach the service"
+    );
     assert_eq!(fb.requests().len(), 1);
 }
 
@@ -119,8 +144,16 @@ fn offline_contacts_nobody_and_still_answers_locally() {
         assert_eq!(o.code, 1, "{cmd}: {}", o.stderr);
     }
     assert!(fb.requests().is_empty());
-    assert_eq!(env.ext(&["cat", &label(&b)]).code, 0, "control: online reaches the service");
-    assert_eq!(env.ext(&["cat", "--offline", &label(&b)]).stdout, b, "offline hit from the cache");
+    assert_eq!(
+        env.ext(&["cat", &label(&b)]).code,
+        0,
+        "control: online reaches the service"
+    );
+    assert_eq!(
+        env.ext(&["cat", "--offline", &label(&b)]).stdout,
+        b,
+        "offline hit from the cache"
+    );
     assert_eq!(fb.requests().len(), 1);
 
     let env = Env::new();
@@ -128,8 +161,16 @@ fn offline_contacts_nobody_and_still_answers_locally() {
     env.services(&["http://no-such-host.invalid/".to_string()]);
     let miss = label(&blob(5, 9));
     let online = env.ext(&["cat", &miss]);
-    assert_eq!(online.code, 5, "online: the unresolvable service is an Error: {}", online.stderr);
-    assert_eq!(env.ext(&["cat", "--offline", &miss]).code, 1, "offline: nobody is consulted");
+    assert_eq!(
+        online.code, 5,
+        "online: the unresolvable service is an Error: {}",
+        online.stderr
+    );
+    assert_eq!(
+        env.ext(&["cat", "--offline", &miss]).code,
+        1,
+        "offline: nobody is consulted"
+    );
 }
 
 /// ES-15 with the shipped table, through the binary: a service on loopback is
@@ -145,9 +186,16 @@ fn loopback_services_need_allow_local() {
     env.services(&[fb.base()]);
     let o = env.ext(&["cat", &label(&b)]);
     assert_eq!(o.code, 5, "{}", o.stderr);
-    assert!(fb.requests().is_empty(), "F4: a connection to a non-global address");
+    assert!(
+        fb.requests().is_empty(),
+        "F4: a connection to a non-global address"
+    );
     env.config("");
-    assert_eq!(env.ext(&["cat", &label(&b)]).stdout, b, "control: AllowLocal reaches the same server");
+    assert_eq!(
+        env.ext(&["cat", &label(&b)]).stdout,
+        b,
+        "control: AllowLocal reaches the same server"
+    );
 }
 
 // ----------------------------------------------------------------- ES-7 ----
@@ -172,12 +220,20 @@ fn exit_codes_follow_the_decision_list() {
             let o = env.ext(&[cmd, &l]);
             assert_eq!(o.code, want, "{cmd} [{name}]: {}", o.stderr);
             if name == "500,hit" {
-                assert!(o.stderr.contains("ERROR"), "a failure before the hit is still reported: {}", o.stderr);
+                assert!(
+                    o.stderr.contains("ERROR"),
+                    "a failure before the hit is still reported: {}",
+                    o.stderr
+                );
             }
         }
     }
     // A stale index record beats a service failure (2 before 5), but not a hit.
-    for (fbs, want) in [(vec![status_fb(404)], 2), (vec![status_fb(500)], 2), (vec![honest(&b)], 0)] {
+    for (fbs, want) in [
+        (vec![status_fb(404)], 2),
+        (vec![status_fb(500)], 2),
+        (vec![honest(&b)], 0),
+    ] {
         let env = setup(&fbs.iter().collect::<Vec<_>>());
         let p = env.index_file("a", &b);
         let mut bad = b.clone();
@@ -186,7 +242,11 @@ fn exit_codes_follow_the_decision_list() {
         let o = env.ext(&["cat", &l]);
         assert_eq!(o.code, want, "stale index: {}", o.stderr);
         if want == 2 {
-            assert!(o.stderr.contains(p.to_str().unwrap()), "the failed index record is reported: {}", o.stderr);
+            assert!(
+                o.stderr.contains(p.to_str().unwrap()),
+                "the failed index record is reported: {}",
+                o.stderr
+            );
             assert!(o.stdout.is_empty());
         }
     }
@@ -203,18 +263,31 @@ fn exit_codes_follow_the_decision_list() {
 fn a_lying_service_is_skipped_and_leaves_no_trace() {
     let b = blob(64, 6);
     for (name, bad) in mutations(&b) {
-        let liar = Fb::start("127.0.0.2", { let bad = bad.clone(); move |_| Resp::ok(&bad) });
+        let liar = Fb::start("127.0.0.2", {
+            let bad = bad.clone();
+            move |_| Resp::ok(&bad)
+        });
         let good = honest(&b);
         let env = setup(&[&liar, &good]);
         let o = env.ext(&["cat", &label(&b)]);
         assert_eq!((o.code, &o.stdout), (0, &b), "{name}: {}", o.stderr);
         assert!(
-            o.stderr.lines().any(|l| l == format!("SERVICE {} MISMATCH", liar.base())),
-            "{name}: stderr was {:?}", o.stderr
+            o.stderr
+                .lines()
+                .any(|l| l == format!("SERVICE {} MISMATCH", liar.base())),
+            "{name}: stderr was {:?}",
+            o.stderr
         );
-        assert_eq!(env.cache_files(), [Path::new(&cached_name(&b)).to_path_buf()], "{name}");
+        assert_eq!(
+            env.cache_files(),
+            [Path::new(&cached_name(&b)).to_path_buf()],
+            "{name}"
+        );
         assert_eq!(env.records().len(), 1, "{name}");
-        assert!(env.tmp_files().is_empty(), "{name}: temporary files left behind");
+        assert!(
+            env.tmp_files().is_empty(),
+            "{name}: temporary files left behind"
+        );
         assert_eq!(good.requests().len(), 1);
     }
 }
@@ -239,29 +312,57 @@ fn cat_hashes_every_blob_it_returns() {
     flipped[100] ^= 1;
     fs::write(&p, &flipped).unwrap();
     let o = env.ext(&["cat", &label(&b)]);
-    assert_eq!((o.code, &o.stdout), (0, &b), "index file corrupt, cache answers: {}", o.stderr);
+    assert_eq!(
+        (o.code, &o.stdout),
+        (0, &b),
+        "index file corrupt, cache answers: {}",
+        o.stderr
+    );
     assert_eq!(fb.requests().len(), 1);
 
     fs::write(&cache_file, &flipped).unwrap(); // same size, wrong bytes
     let o = env.ext(&["cat", "--offline", &label(&b)]);
-    assert_eq!(o.code, 2, "both local copies fail verification; the index failure decides: {}", o.stderr);
+    assert_eq!(
+        o.code, 2,
+        "both local copies fail verification; the index failure decides: {}",
+        o.stderr
+    );
     assert!(o.stdout.is_empty());
-    assert!(env.records().is_empty() && !cache_file.exists(), "the corrupt cache record and file were evicted");
+    assert!(
+        env.records().is_empty() && !cache_file.exists(),
+        "the corrupt cache record and file were evicted"
+    );
     fs::write(&cache_file, &flipped).unwrap(); // an orphan: the refetch must replace it
     let o = env.ext(&["cat", &label(&b)]);
-    assert_eq!((o.code, &o.stdout), (0, &b), "corrupt copies skipped, the service answers: {}", o.stderr);
+    assert_eq!(
+        (o.code, &o.stdout),
+        (0, &b),
+        "corrupt copies skipped, the service answers: {}",
+        o.stderr
+    );
     assert_eq!(fb.requests().len(), 2, "refetched exactly once");
-    assert_eq!(fs::read(&cache_file).unwrap(), b, "the corrupt cache file was replaced by the verified blob");
+    assert_eq!(
+        fs::read(&cache_file).unwrap(),
+        b,
+        "the corrupt cache file was replaced by the verified blob"
+    );
 
     // A reader that goes away after one byte.
     let big = blob(1 << 20, 8);
     let env = setup(&[]);
     env.index_file("big", &big);
-    let mut child = env.command(&["cat", "--offline", &label(&big)], &[]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut child = env
+        .command(&["cat", "--offline", &label(&big)], &[])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut one = [0u8; 1];
     std::io::Read::read_exact(child.stdout.as_mut().unwrap(), &mut one).unwrap();
     drop(child.stdout.take());
-    assert!(child.wait().unwrap().success(), "a closed pipe is the consumer's choice");
+    assert!(
+        child.wait().unwrap().success(),
+        "a closed pipe is the consumer's choice"
+    );
 }
 
 // ----------------------------------------------------------------- ES-16 ----
@@ -278,17 +379,32 @@ fn http_needs_allow_http() {
     env.config_raw("{ AllowLocal: true }");
     let o = env.ext(&["-r", &fb.base()]);
     assert_eq!(o.code, 4, "{}", o.stderr);
-    assert_eq!(env.services_bytes(), None, "a refused registration changes nothing");
+    assert_eq!(
+        env.services_bytes(),
+        None,
+        "a refused registration changes nothing"
+    );
     env.services(&[fb.base()]);
     let o = env.ext(&["cat", &label(&b)]);
-    assert_eq!(o.code, 5, "an http entry without AllowHTTP is an Error: {}", o.stderr);
-    assert!(o.stderr.contains(&fb.base()), "naming the service: {}", o.stderr);
+    assert_eq!(
+        o.code, 5,
+        "an http entry without AllowHTTP is an Error: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains(&fb.base()),
+        "naming the service: {}",
+        o.stderr
+    );
     assert!(fb.requests().is_empty());
 
     env.config("");
     let _ = fs::remove_file(env.store.join("services"));
     assert_eq!(env.ext(&["-r", &fb.base()]).code, 0);
-    assert_eq!(env.services_bytes().unwrap(), format!("{}\n", fb.base()).into_bytes());
+    assert_eq!(
+        env.services_bytes().unwrap(),
+        format!("{}\n", fb.base()).into_bytes()
+    );
     assert_eq!(env.ext(&["cat", &label(&b)]).stdout, b);
 }
 
@@ -316,7 +432,11 @@ fn service_registration_is_idempotent_ordered_and_classified_by_prefix() {
     assert_eq!(env.ext(&["-r", "HTTPS://A.Example/"]).code, 0);
     assert_eq!(sv().unwrap(), one, "normalisation makes it the same line");
     assert_eq!(env.ext(&["-r", b]).code, 0);
-    assert_eq!(sv().unwrap(), format!("{a}\n{b}\n").into_bytes(), "registration order");
+    assert_eq!(
+        sv().unwrap(),
+        format!("{a}\n{b}\n").into_bytes(),
+        "registration order"
+    );
 
     // A path containing `://` is a path.
     let weird = env.work.join("a:").join("b");
@@ -325,18 +445,33 @@ fn service_registration_is_idempotent_ordered_and_classified_by_prefix() {
     let arg = format!("{}/a://b", env.work.display());
     let o = env.ext(&["-r", &arg]);
     assert_eq!(o.code, 0, "{}", o.stderr);
-    assert_eq!(sv(), before, "path operations leave the services file alone");
+    assert_eq!(
+        sv(),
+        before,
+        "path operations leave the services file alone"
+    );
     let reg = fs::read(env.store.join("registry")).unwrap();
-    assert!(String::from_utf8_lossy(&reg).contains("a:/b"), "the path was registered");
+    assert!(
+        String::from_utf8_lossy(&reg).contains("a:/b"),
+        "the path was registered"
+    );
     assert_eq!(env.ext(&["-r", "https://c.example/"]).code, 0);
-    assert_eq!(fs::read(env.store.join("registry")).unwrap(), reg, "service operations leave the registry alone");
+    assert_eq!(
+        fs::read(env.store.join("registry")).unwrap(),
+        reg,
+        "service operations leave the registry alone"
+    );
     assert_eq!(env.ext(&["-u", "https://c.example/"]).code, 0);
     assert_eq!(sv(), before, "register then unregister restores the bytes");
     let o = env.ext(&["-u", "https://nope.example/"]);
     assert_eq!(o.code, 4, "{}", o.stderr);
     assert_eq!(sv(), before);
     assert_eq!(env.ext(&["-u", a]).code, 0);
-    assert_eq!(sv().unwrap(), format!("{b}\n").into_bytes(), "only the named line goes");
+    assert_eq!(
+        sv().unwrap(),
+        format!("{b}\n").into_bytes(),
+        "only the named line goes"
+    );
 
     let full: Vec<String> = (0..64).map(|i| format!("https://h{i}.example/")).collect();
     env.services(&full);
@@ -356,23 +491,51 @@ fn the_services_file_is_parsed_lazily_and_checked_for_ownership() {
     let b = blob(60, 2);
     let fb = honest(&b);
     let env = setup(&[&fb]);
-    assert_eq!(env.ext(&["cat", &label(&b)]).code, 0, "admit through the service");
+    assert_eq!(
+        env.ext(&["cat", &label(&b)]).code,
+        0,
+        "admit through the service"
+    );
     let other = label(&blob(60, 3));
     env.services(&[fb.base(), "https://u@bad.example/".to_string()]);
-    assert_eq!(env.ext(&["cat", &label(&b)]).stdout, b, "a cache hit never reads the services file");
-    assert_eq!(env.ext(&["cat", "--offline", &other]).code, 1, "--offline never reads it");
+    assert_eq!(
+        env.ext(&["cat", &label(&b)]).stdout,
+        b,
+        "a cache hit never reads the services file"
+    );
+    assert_eq!(
+        env.ext(&["cat", "--offline", &other]).code,
+        1,
+        "--offline never reads it"
+    );
     assert_eq!(env.ext(&["resolve", &label(&b)]).code, 0);
     let o = env.ext(&["cat", &other]);
-    assert_eq!(o.code, 4, "a lookup that needs the file fails: {}", o.stderr);
-    assert!(o.stderr.contains("services:2:"), "format is services:<line>: <reason>: {}", o.stderr);
+    assert_eq!(
+        o.code, 4,
+        "a lookup that needs the file fails: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("services:2:"),
+        "format is services:<line>: <reason>: {}",
+        o.stderr
+    );
 
     env.services(&[fb.base()]);
     assert_eq!(env.ext(&["-u", &fb.base()]).code, 0);
-    assert_eq!(env.ext(&["cat", "--offline", &label(&b)]).stdout, b, "cached blobs outlive their service");
+    assert_eq!(
+        env.ext(&["cat", "--offline", &label(&b)]).stdout,
+        b,
+        "cached blobs outlive their service"
+    );
 
     if !skip_if_root("group-writable file check") {
         env.services(&[fb.base()]);
-        fs::set_permissions(env.store.join("services"), fs::Permissions::from_mode(0o660)).unwrap();
+        fs::set_permissions(
+            env.store.join("services"),
+            fs::Permissions::from_mode(0o660),
+        )
+        .unwrap();
         let o = env.ext(&["-r", "https://x.example/"]);
         assert_eq!(o.code, 4, "{}", o.stderr);
     }
@@ -384,7 +547,9 @@ fn the_services_file_is_parsed_lazily_and_checked_for_ownership() {
 /// request, no credentials. Violator: retrying with Authorization.
 #[test]
 fn a_401_is_an_error_and_no_credentials_are_sent() {
-    let fb = Fb::start("127.0.0.2", |_| Resp::status(401).header("WWW-Authenticate", b"Basic realm=\"x\", Bearer"));
+    let fb = Fb::start("127.0.0.2", |_| {
+        Resp::status(401).header("WWW-Authenticate", b"Basic realm=\"x\", Bearer")
+    });
     let env = setup(&[&fb]);
     let o = env.ext(&["cat", &label(b"x")]);
     assert_eq!(o.code, 5, "{}", o.stderr);
@@ -415,19 +580,35 @@ fn untrusted_text_on_stderr_is_escaped() {
     assert_eq!(o.code, 2, "{}", o.stderr);
     assert!(ok(&o.stderr), "raw control bytes on stderr: {:?}", o.stderr);
     for want in ["\\x1b", "\\x0d", "\\x5c"] {
-        assert!(o.stderr.contains(want), "{want} missing from {:?}", o.stderr);
+        assert!(
+            o.stderr.contains(want),
+            "{want} missing from {:?}",
+            o.stderr
+        );
     }
 
     // Bytes the HTTP parser lets through: HTAB, 0x80..0xFF (incl. a C1 byte
     // and U+202E) and a backslash. Control bytes like ESC never get this far,
     // so the file-name half above covers them.
     let reason = b"t\tab\x9b\xff\xe2\x80\xae\\x41 end".to_vec();
-    let fb = Fb::start("127.0.0.2", move |_| Resp::status(500).reason(&reason).header("X-Msg", b"v\t\xff"));
+    let fb = Fb::start("127.0.0.2", move |_| {
+        Resp::status(500)
+            .reason(&reason)
+            .header("X-Msg", b"v\t\xff")
+    });
     let env = setup(&[&fb]);
     let o = env.ext(&["cat", &label(&b)]);
     assert_eq!(o.code, 5, "{}", o.stderr);
-    assert!(ok(&o.stderr), "service text reached the terminal unescaped: {:?}", o.stderr);
-    assert!(!o.stderr.contains("\\x41"), "a raw backslash in service text must print as \\x5c: {:?}", o.stderr);
+    assert!(
+        ok(&o.stderr),
+        "service text reached the terminal unescaped: {:?}",
+        o.stderr
+    );
+    assert!(
+        !o.stderr.contains("\\x41"),
+        "a raw backslash in service text must print as \\x5c: {:?}",
+        o.stderr
+    );
     assert!(o.stderr.contains(&fb.base()));
 }
 
@@ -454,26 +635,52 @@ fn cache_files_are_private_and_named_only_by_digest() {
         }
     });
     let env = setup(&[&fb]);
-    let before: Vec<_> = fs::read_dir(&env.base).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let before: Vec<_> = fs::read_dir(&env.base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     let mut c = std::process::Command::new("sh");
-    c.arg("-c").arg("umask 0; exec \"$0\" \"$@\"").arg(env!("CARGO_BIN_EXE_ext")).arg("--d").arg(&env.store).args(["cat", &label(&b)]);
+    c.arg("-c")
+        .arg("umask 0; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_ext"))
+        .arg("--d")
+        .arg(&env.store)
+        .args(["cat", &label(&b)]);
     let o = run(c, Duration::from_secs(30));
     assert_eq!((o.code, &o.stdout), (0, &b), "{}", o.stderr);
-    assert_eq!(env.cache_files(), [Path::new(&cached_name(&b)).to_path_buf()]);
+    assert_eq!(
+        env.cache_files(),
+        [Path::new(&cached_name(&b)).to_path_buf()]
+    );
     assert_eq!(mode(&env.store.join("cache").join(cached_name(&b))), 0o600);
     for d in ["cache", "cache/SHA-256", "cache/tmp"] {
         assert_eq!(mode(&env.store.join(d)), 0o700, "{d}");
     }
-    let after: Vec<_> = fs::read_dir(&env.base).unwrap().map(|e| e.unwrap().file_name()).collect();
+    let after: Vec<_> = fs::read_dir(&env.base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     assert_eq!(before, after, "nothing was created beside the store");
 
     // The in-flight file while the fetch is held open.
     let latch = Latch::default();
-    let hold = Fb::start("127.0.0.2", { let l = latch.clone(); move |_| Resp::status(200).body(Body::HoldThen(l.clone(), vec![])) });
+    let hold = Fb::start("127.0.0.2", {
+        let l = latch.clone();
+        move |_| Resp::status(200).body(Body::HoldThen(l.clone(), vec![]))
+    });
     let env = setup(&[&hold]);
     let mut c = std::process::Command::new("sh");
-    c.arg("-c").arg("umask 0; exec \"$0\" \"$@\"").arg(env!("CARGO_BIN_EXE_ext")).arg("--d").arg(&env.store).args(["cat", &label(&b)]);
-    let child = c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    c.arg("-c")
+        .arg("umask 0; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_ext"))
+        .arg("--d")
+        .arg(&env.store)
+        .args(["cat", &label(&b)]);
+    let child = c
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
     let t0 = Instant::now();
     while hold.requests().is_empty() && t0.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(20));
@@ -514,13 +721,18 @@ fn an_admission_that_cannot_happen_is_exit_5_not_1() {
         assert_eq!(o.code, 5, "{name} against a busy lock: {}", o.stderr);
         assert!(
             o.elapsed >= Duration::from_millis(4500) && o.elapsed < Duration::from_secs(7),
-            "{name}: the 5 s busy timeout was not honoured: {:?}", o.elapsed
+            "{name}: the 5 s busy timeout was not honoured: {:?}",
+            o.elapsed
         );
         assert!(o.stdout.is_empty(), "{name}: nothing delivered");
         assert!(!o.stderr.is_empty());
     }
     assert!(env.tmp_files().is_empty(), "no temporary left");
-    assert_eq!(env.ext(&["cat", &label(&b)]).code, 0, "control: with the lock free the same lookup works");
+    assert_eq!(
+        env.ext(&["cat", &label(&b)]).code,
+        0,
+        "control: with the lock free the same lookup works"
+    );
 
     if skip_if_root("read-only store") {
         return;
@@ -539,11 +751,19 @@ fn an_admission_that_cannot_happen_is_exit_5_not_1() {
     for d in ["", "cache", "cache/tmp", "cache/SHA-256"] {
         fs::set_permissions(env.store.join(d), fs::Permissions::from_mode(0o700)).unwrap();
     }
-    for (name, o) in [("cat, service hit", &svc), ("cat, index hit", &idx), ("resolve, service hit", &res)] {
+    for (name, o) in [
+        ("cat, service hit", &svc),
+        ("cat, index hit", &idx),
+        ("resolve, service hit", &res),
+    ] {
         assert_eq!(o.code, 5, "{name}: {}", o.stderr);
         assert!(o.stdout.is_empty(), "{name}: nothing may be delivered");
     }
-    assert_eq!(local.code, 0, "an index hit under resolve needs no write: {}", local.stderr);
+    assert_eq!(
+        local.code, 0,
+        "an index hit under resolve needs no write: {}",
+        local.stderr
+    );
 }
 
 // ---------------------------------------------------------------- ES-27 ----
@@ -581,20 +801,39 @@ fn the_cache_is_invisible_to_list_and_scans() {
     let fb = honest(&b);
     let env = setup(&[&fb]);
     env.index_file("w", b"work");
-    assert_eq!(env.ext(&["-r", env.base.to_str().unwrap()]).code, 0, "register the directory holding the store");
+    assert_eq!(
+        env.ext(&["-r", env.base.to_str().unwrap()]).code,
+        0,
+        "register the directory holding the store"
+    );
     let list0 = env.ext(&["list"]).stdout;
     assert_eq!(env.ext(&["cat", &label(&b)]).code, 0, "admit a blob");
     for f in env.cache_files() {
-        fs::set_permissions(env.store.join("cache").join(f), fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(
+            env.store.join("cache").join(f),
+            fs::Permissions::from_mode(0),
+        )
+        .unwrap();
     }
-    assert_eq!(env.ext(&["list"]).stdout, list0, "list is unchanged by the cache");
+    assert_eq!(
+        env.ext(&["list"]).stdout,
+        list0,
+        "list is unchanged by the cache"
+    );
     for cmd in ["check", "rebuild"] {
         let o = env.ext(&[cmd]);
         assert_eq!(o.code, 0, "{cmd}: {}", o.stderr);
-        assert!(!String::from_utf8_lossy(&o.stdout).contains("cache"), "{cmd} reported a cache path");
+        assert!(
+            !String::from_utf8_lossy(&o.stdout).contains("cache"),
+            "{cmd} reported a cache path"
+        );
     }
     for f in env.cache_files() {
-        fs::set_permissions(env.store.join("cache").join(f), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(
+            env.store.join("cache").join(f),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
     }
 }
 
@@ -609,17 +848,35 @@ fn the_cache_is_invisible_to_list_and_scans() {
 fn the_lock_is_not_held_while_waiting_on_a_service() {
     let b = blob(64, 8);
     let latch = Latch::default();
-    let fb = Fb::start("127.0.0.2", { let (l, b) = (latch.clone(), b.clone()); move |_| Resp::status(200).body(Body::HoldThen(l.clone(), b.clone())) });
+    let fb = Fb::start("127.0.0.2", {
+        let (l, b) = (latch.clone(), b.clone());
+        move |_| Resp::status(200).body(Body::HoldThen(l.clone(), b.clone()))
+    });
     let env = setup(&[&fb]);
-    let child = env.command(&["cat", &label(&b)], &[]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let child = env
+        .command(&["cat", &label(&b)], &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
     let t0 = Instant::now();
     while fb.requests().is_empty() && t0.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fb.requests().len(), 1, "the fetch is in flight");
-    let reg = env.ext_env(&["-r", env.work.to_str().unwrap()], &[], Duration::from_secs(5));
+    let reg = env.ext_env(
+        &["-r", env.work.to_str().unwrap()],
+        &[],
+        Duration::from_secs(5),
+    );
     let chk = env.ext_env(&["check"], &[], Duration::from_secs(5));
-    assert_eq!((reg.code, chk.code), (0, 0), "{} {}", reg.stderr, chk.stderr);
+    assert_eq!(
+        (reg.code, chk.code),
+        (0, 0),
+        "{} {}",
+        reg.stderr,
+        chk.stderr
+    );
     latch.fire();
     let out = child.wait_with_output().unwrap();
     assert_eq!((out.status.code(), &out.stdout), (Some(0), &b));
@@ -627,7 +884,9 @@ fn the_lock_is_not_held_while_waiting_on_a_service() {
     let fb = honest(&b);
     let env = setup(&[&fb]);
     let outs: Vec<Out> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..4).map(|_| s.spawn(|| env.ext(&["cat", &label(&b)]))).collect();
+        let hs: Vec<_> = (0..4)
+            .map(|_| s.spawn(|| env.ext(&["cat", &label(&b)])))
+            .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     for o in &outs {
@@ -649,7 +908,9 @@ fn config_limits_govern_the_fetch() {
     let ok = blob(64, 1);
     let over = blob(65, 1);
     let env = Env::new();
-    env.config("ServiceMaxSize: 64, CacheCapacity: 1024, ServiceIdleTimeout: 300, ServiceTimeout: 1500");
+    env.config(
+        "ServiceMaxSize: 64, CacheCapacity: 1024, ServiceIdleTimeout: 300, ServiceTimeout: 1500",
+    );
     let fb = honest(&ok);
     env.services(&[fb.base()]);
     assert_eq!(env.ext(&["cat", &label(&ok)]).stdout, ok, "exactly the cap");
@@ -664,7 +925,11 @@ fn config_limits_govern_the_fetch() {
     // hit (ES-1) would answer without contacting the hanging service.
     let o = env.ext_env(&["cat", &label(&over)], &[], Duration::from_secs(8));
     assert_eq!(o.code, 5, "{}", o.stderr);
-    assert!(o.elapsed < Duration::from_secs(3), "idle timeout of 300 ms ended it after {:?}", o.elapsed);
+    assert!(
+        o.elapsed < Duration::from_secs(3),
+        "idle timeout of 300 ms ended it after {:?}",
+        o.elapsed
+    );
     assert!(o.stderr.contains(&hang.base()), "{}", o.stderr);
 }
 
@@ -674,18 +939,33 @@ fn config_limits_govern_the_fetch() {
 /// Violators: ignoring either key and using the default.
 #[test]
 fn service_timeout_and_cache_capacity_reach_the_binary() {
-    let drip = Fb::start("127.0.0.2", |_| Resp::status(200).body(Body::Drip { byte: b'a', every: Duration::from_millis(100) }));
+    let drip = Fb::start("127.0.0.2", |_| {
+        Resp::status(200).body(Body::Drip {
+            byte: b'a',
+            every: Duration::from_millis(100),
+        })
+    });
     let env = Env::new();
     env.config("ServiceTimeout: 1500, ServiceIdleTimeout: 30000");
     env.services(&[drip.base()]);
     let o = env.ext_env(&["cat", &label(b"x")], &[], Duration::from_secs(10));
     assert_eq!(o.code, 5, "{}", o.stderr);
-    assert!(o.elapsed >= Duration::from_millis(1400) && o.elapsed < Duration::from_millis(2500), "{:?}", o.elapsed);
+    assert!(
+        o.elapsed >= Duration::from_millis(1400) && o.elapsed < Duration::from_millis(2500),
+        "{:?}",
+        o.elapsed
+    );
 
     let (a, b) = (blob(60, 1), blob(60, 2));
     let (a_val, b2) = (label(&a).split(':').next().unwrap().to_string(), b.clone());
     let a2 = a.clone();
-    let fb = Fb::start("127.0.0.2", move |r| if r.target.contains(&a_val) { Resp::ok(&a2) } else { Resp::ok(&b2) });
+    let fb = Fb::start("127.0.0.2", move |r| {
+        if r.target.contains(&a_val) {
+            Resp::ok(&a2)
+        } else {
+            Resp::ok(&b2)
+        }
+    });
     let env = Env::new();
     env.config("CacheCapacity: 100, ServiceMaxSize: 64");
     env.services(&[fb.base()]);
@@ -693,7 +973,11 @@ fn service_timeout_and_cache_capacity_reach_the_binary() {
         let o = env.ext(&["cat", &label(blob)]);
         assert_eq!((o.code, &o.stdout), (0, blob), "{}", o.stderr);
     }
-    assert_eq!(env.cache_files(), [Path::new(&cached_name(&b)).to_path_buf()], "the older blob was evicted to honour CacheCapacity");
+    assert_eq!(
+        env.cache_files(),
+        [Path::new(&cached_name(&b)).to_path_buf()],
+        "the older blob was evicted to honour CacheCapacity"
+    );
     assert_eq!(env.records().len(), 1);
 }
 
@@ -703,6 +987,9 @@ fn service_timeout_and_cache_capacity_reach_the_binary() {
 fn service_max_size_may_not_exceed_cache_capacity() {
     let e = ext::config::parse(b"{ CacheCapacity: 10, ServiceMaxSize: 11 }").expect_err("11 > 10");
     let msg = e.to_string();
-    assert!(msg.contains("CacheCapacity") && msg.contains("ServiceMaxSize"), "{msg}");
+    assert!(
+        msg.contains("CacheCapacity") && msg.contains("ServiceMaxSize"),
+        "{msg}"
+    );
     assert!(ext::config::parse(b"{ CacheCapacity: 10, ServiceMaxSize: 10 }").is_ok());
 }

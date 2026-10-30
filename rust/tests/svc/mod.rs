@@ -32,7 +32,9 @@ pub fn sha256_hex(data: &[u8]) -> String {
 }
 
 pub fn digest_of(data: &[u8]) -> Digest {
-    let raw = data_encoding::HEXUPPER.decode(sha256_hex(data).as_bytes()).unwrap();
+    let raw = data_encoding::HEXUPPER
+        .decode(sha256_hex(data).as_bytes())
+        .unwrap();
     Digest::from_bytes(Alg::Sha256, &raw).unwrap()
 }
 
@@ -47,7 +49,9 @@ pub fn label(data: &[u8]) -> String {
 
 /// A deterministic blob of `n` bytes that is not all one value.
 pub fn blob(n: usize, seed: u8) -> Vec<u8> {
-    (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    (0..n)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
 }
 
 /// The plan's mutation list. Each result differs from `b`.
@@ -84,7 +88,9 @@ pub struct Out {
 /// code -1 so the assertion that follows names the failure.
 pub fn run(mut cmd: Command, limit: Duration) -> Out {
     let t0 = Instant::now();
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn ext");
     let (mut so, mut se) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
     let t_out = std::thread::spawn(move || {
@@ -126,8 +132,18 @@ pub struct Env {
 }
 
 const SCRUB: &[&str] = &[
-    "EXTANT_DIR", "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY",
-    "all_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "HOSTALIASES",
+    "EXTANT_DIR",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HOSTALIASES",
 ];
 
 impl Env {
@@ -138,7 +154,12 @@ impl Env {
         Store::init_bare(&store).unwrap();
         let work = base.join("work");
         fs::create_dir(&work).unwrap();
-        Env { _tmp: t, base, store, work }
+        Env {
+            _tmp: t,
+            base,
+            store,
+            work,
+        }
     }
 
     /// Runs `ext --d <store> args...` with proxies, trust and resolver
@@ -148,7 +169,10 @@ impl Env {
         for k in SCRUB {
             c.env_remove(k);
         }
-        c.envs(env.iter().copied()).arg("--d").arg(&self.store).args(args);
+        c.envs(env.iter().copied())
+            .arg("--d")
+            .arg(&self.store)
+            .args(args);
         c
     }
 
@@ -169,7 +193,10 @@ impl Env {
     /// Writes the store config. `AllowHTTP` and `AllowLocal` are on because
     /// the FBs speak plain http on loopback; `extra` adds more keys.
     pub fn config(&self, extra: &str) {
-        self.put("config", format!("{{ AllowHTTP: true, AllowLocal: true, {extra} }}").as_bytes());
+        self.put(
+            "config",
+            format!("{{ AllowHTTP: true, AllowLocal: true, {extra} }}").as_bytes(),
+        );
     }
 
     pub fn config_raw(&self, text: &str) {
@@ -195,7 +222,11 @@ impl Env {
         let p = self.work.join(name);
         fs::write(&p, content).unwrap();
         let o = self.ext(&["-r", self.work.to_str().unwrap()]);
-        assert_eq!(o.code, 0, "fixture: registering the work tree: {}", o.stderr);
+        assert_eq!(
+            o.code, 0,
+            "fixture: registering the work tree: {}",
+            o.stderr
+        );
         p
     }
 

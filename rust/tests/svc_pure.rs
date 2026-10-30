@@ -11,7 +11,7 @@ use ext::cache::{TmpFile, Verified};
 use ext::digest::Alg;
 use ext::https::{permitted, redirect_scheme_allowed, AddrTable};
 use ext::lookup::{self, Attempt, Backend, Fetched, Limits, Outcome};
-use ext::services::{self, FileError, Fetchable, Scheme, ServiceUri, MAX_SERVICES};
+use ext::services::{self, Fetchable, FileError, Scheme, ServiceUri, MAX_SERVICES};
 use proptest::prelude::*;
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -45,7 +45,11 @@ fn host() -> impl Strategy<Value = String> {
             .prop_map(|(a, b, c, d)| Ipv4Addr::new(a, b, c, d).to_string()),
         (any::<u128>(), any::<bool>()).prop_map(|(n, up)| {
             let s = format!("[{}]", Ipv6Addr::from(n));
-            if up { s.to_uppercase() } else { s }
+            if up {
+                s.to_uppercase()
+            } else {
+                s
+            }
         }),
     ]
 }
@@ -60,7 +64,12 @@ fn valid_line() -> impl Strategy<Value = Gen> {
         (1u32..=65535).prop_map(|p| format!(":{p}")),
     ];
     let base_path = ("/", PCHAR).prop_map(|(a, b)| format!("{a}{b}"));
-    let tmpl_path = ("/", "[A-Za-z0-9/?=&.-]{0,8}", prop_oneof![Just("{digest}"), Just("{hex}")], "(\\{alg\\}|[a-z/?=&]){0,6}")
+    let tmpl_path = (
+        "/",
+        "[A-Za-z0-9/?=&.-]{0,8}",
+        prop_oneof![Just("{digest}"), Just("{hex}")],
+        "(\\{alg\\}|[a-z/?=&]){0,6}",
+    )
         .prop_map(|(a, b, c, d)| format!("{a}{b}{c}{d}"));
     let path = prop_oneof![Just(String::new()), base_path, tmpl_path];
     (scheme, host(), port, path).prop_map(|(s, h, p, path)| Gen {
@@ -88,7 +97,10 @@ proptest! {
 fn single_point_mutations_of_a_valid_line_are_rejected() {
     let long = format!("https://h/{}", "a".repeat(2049 - 10));
     let at_cap = format!("https://h/{}", "a".repeat(2048 - 10));
-    assert!(ServiceUri::parse(&at_cap).is_ok(), "2048 bytes is within the cap");
+    assert!(
+        ServiceUri::parse(&at_cap).is_ok(),
+        "2048 bytes is within the cap"
+    );
     let bad: Vec<(&str, String)> = vec![
         ("userinfo", "https://u:p@example.com/p".into()),
         ("space", "https://exa mple.com/p".into()),
@@ -109,8 +121,14 @@ fn single_point_mutations_of_a_valid_line_are_rejected() {
         ("empty port", "https://example.com:/".into()),
         ("fragment", "https://example.com/p#f".into()),
         ("query in base", "https://example.com/p?x=1".into()),
-        ("unknown placeholder", "https://example.com/{x}/{digest}".into()),
-        ("template without digest or hex", "https://example.com/?a={alg}".into()),
+        (
+            "unknown placeholder",
+            "https://example.com/{x}/{digest}".into(),
+        ),
+        (
+            "template without digest or hex",
+            "https://example.com/?a={alg}".into(),
+        ),
         ("unbalanced brace", "https://example.com/{digest".into()),
         ("missing slashes", "https:example.com/".into()),
         ("ftp", "ftp://example.com/".into()),
@@ -124,7 +142,10 @@ fn single_point_mutations_of_a_valid_line_are_rejected() {
         ("comment", "# https://example.com/".into()),
     ];
     for (name, line) in bad {
-        assert!(ServiceUri::parse(&line).is_err(), "{name}: {line:?} must be rejected");
+        assert!(
+            ServiceUri::parse(&line).is_err(),
+            "{name}: {line:?} must be rejected"
+        );
     }
 }
 
@@ -139,10 +160,14 @@ fn oracle(line: &str) -> bool {
         return false;
     }
     let split = Regex::new(r"(?i)\A(https?)://([^/?#]*)(.*)\z").unwrap();
-    let Some(c) = split.captures(line) else { return false };
+    let Some(c) = split.captures(line) else {
+        return false;
+    };
     let (auth, rest) = (&c[2], &c[3]);
     let (host, port) = if let Some(b) = auth.strip_prefix('[') {
-        let Some((inner, tail)) = b.split_once(']') else { return false };
+        let Some((inner, tail)) = b.split_once(']') else {
+            return false;
+        };
         if inner.parse::<Ipv6Addr>().is_err() {
             return false;
         }
@@ -165,7 +190,9 @@ fn oracle(line: &str) -> bool {
         }
     }
     let base = re(format!("(?:/|{pchar})*"));
-    let tmpl = re(format!(r"(?:/|\?|{pchar}|\{{alg\}}|\{{digest\}}|\{{hex\}})*"));
+    let tmpl = re(format!(
+        r"(?:/|\?|{pchar}|\{{alg\}}|\{{digest\}}|\{{hex\}})*"
+    ));
     let has_id = rest.contains("{digest}") || rest.contains("{hex}");
     base.is_match(rest) || (has_id && tmpl.is_match(rest))
 }
@@ -251,20 +278,29 @@ proptest! {
 fn file_level_rules() {
     let n = |i: usize| format!("https://h{i}.example/\n");
     let sixty_four: String = (0..MAX_SERVICES).map(n).collect();
-    assert_eq!(services::parse_file(sixty_four.as_bytes()).unwrap().len(), MAX_SERVICES);
+    assert_eq!(
+        services::parse_file(sixty_four.as_bytes()).unwrap().len(),
+        MAX_SERVICES
+    );
     let sixty_five = format!("{sixty_four}{}", n(64));
     assert!(matches!(
         services::parse_file(sixty_five.as_bytes()),
         Err(FileError::Line { line: 65, .. })
     ));
-    assert!(matches!(
-        services::parse_file(b"https://a.example/"),
-        Err(FileError::Line { line: 1, .. })
-    ), "missing final LF");
-    assert!(matches!(
-        services::parse_file(b"https://a.example/\r\n"),
-        Err(FileError::Line { line: 1, .. })
-    ), "CRLF");
+    assert!(
+        matches!(
+            services::parse_file(b"https://a.example/"),
+            Err(FileError::Line { line: 1, .. })
+        ),
+        "missing final LF"
+    );
+    assert!(
+        matches!(
+            services::parse_file(b"https://a.example/\r\n"),
+            Err(FileError::Line { line: 1, .. })
+        ),
+        "CRLF"
+    );
     let two = services::parse_file(b"https://h\nhttps://h/\n").unwrap();
     assert_eq!(two.len(), 2, "https://h and https://h/ are different lines");
     assert_eq!(services::parse_file(b"").unwrap(), vec![]);
@@ -324,21 +360,74 @@ proptest! {
 fn permitted_known_answers() {
     let t = AddrTable::iana();
     let denied = [
-        "4000::1", "8000::1", "::2", "ff02::1", "ff0e::1", "224.0.0.1", "239.255.255.255",
-        "::ffff:224.0.0.1", "::ffff:10.0.0.1", "::ffff:127.0.0.1", "0.0.0.0", "0.1.2.3",
-        "10.0.0.0", "10.255.255.255", "172.16.0.0", "172.31.255.255", "100.64.0.0",
-        "100.127.255.255", "127.0.0.1", "127.255.255.255", "169.254.0.1", "192.0.0.1",
-        "192.0.2.1", "192.168.0.1", "198.18.0.1", "198.19.255.255", "198.51.100.1",
-        "203.0.113.1", "240.0.0.1", "255.255.255.255", "::", "::1", "fc00::1", "fdff::1",
-        "fe80::1", "fec0::1", "2001:db8::1", "2001:0::1", "2001:2::1", "2002:0a00:0001::1",
-        "64:ff9b::808:808", "100::1",
+        "4000::1",
+        "8000::1",
+        "::2",
+        "ff02::1",
+        "ff0e::1",
+        "224.0.0.1",
+        "239.255.255.255",
+        "::ffff:224.0.0.1",
+        "::ffff:10.0.0.1",
+        "::ffff:127.0.0.1",
+        "0.0.0.0",
+        "0.1.2.3",
+        "10.0.0.0",
+        "10.255.255.255",
+        "172.16.0.0",
+        "172.31.255.255",
+        "100.64.0.0",
+        "100.127.255.255",
+        "127.0.0.1",
+        "127.255.255.255",
+        "169.254.0.1",
+        "192.0.0.1",
+        "192.0.2.1",
+        "192.168.0.1",
+        "198.18.0.1",
+        "198.19.255.255",
+        "198.51.100.1",
+        "203.0.113.1",
+        "240.0.0.1",
+        "255.255.255.255",
+        "::",
+        "::1",
+        "fc00::1",
+        "fdff::1",
+        "fe80::1",
+        "fec0::1",
+        "2001:db8::1",
+        "2001:0::1",
+        "2001:2::1",
+        "2002:0a00:0001::1",
+        "64:ff9b::808:808",
+        "100::1",
     ];
     let allowed = [
-        "8.8.8.8", "1.1.1.1", "9.255.255.255", "11.0.0.0", "126.255.255.255", "128.0.0.1",
-        "172.15.255.255", "172.32.0.0", "100.63.255.255", "100.128.0.0", "169.253.255.255",
-        "169.255.0.0", "192.0.1.1", "192.0.3.1", "198.17.255.255", "198.20.0.0",
-        "203.0.112.255", "203.0.114.0", "223.255.255.255", "2606:4700::1111",
-        "2001:4860:4860::8888", "2a00:1450::1", "::ffff:8.8.8.8", "2002:0808:0808::1",
+        "8.8.8.8",
+        "1.1.1.1",
+        "9.255.255.255",
+        "11.0.0.0",
+        "126.255.255.255",
+        "128.0.0.1",
+        "172.15.255.255",
+        "172.32.0.0",
+        "100.63.255.255",
+        "100.128.0.0",
+        "169.253.255.255",
+        "169.255.0.0",
+        "192.0.1.1",
+        "192.0.3.1",
+        "198.17.255.255",
+        "198.20.0.0",
+        "203.0.112.255",
+        "203.0.114.0",
+        "223.255.255.255",
+        "2606:4700::1111",
+        "2001:4860:4860::8888",
+        "2a00:1450::1",
+        "::ffff:8.8.8.8",
+        "2002:0808:0808::1",
     ];
     for s in denied {
         assert!(!permitted(s.parse().unwrap(), &t), "{s} must be denied");
@@ -403,7 +492,10 @@ proptest! {
 /// canonicalisation. Violator: a hard-coded table that ignores the argument.
 #[test]
 fn permitted_uses_the_table_it_is_given() {
-    let t = AddrTable { allow: vec![("127.0.0.2".parse().unwrap(), 32)], deny: vec![] };
+    let t = AddrTable {
+        allow: vec![("127.0.0.2".parse().unwrap(), 32)],
+        deny: vec![],
+    };
     assert!(permitted("127.0.0.2".parse().unwrap(), &t));
     assert!(permitted("::ffff:127.0.0.2".parse().unwrap(), &t));
     assert!(!permitted("127.0.0.3".parse().unwrap(), &t));
@@ -467,7 +559,9 @@ impl Read for LogSource {
         let n = buf.len().min(self.step).min(self.data.len() - self.pos);
         buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
         self.pos += n;
-        self.log.borrow_mut().push(if n == 0 { Ev::Eof } else { Ev::Read(n) });
+        self.log
+            .borrow_mut()
+            .push(if n == 0 { Ev::Eof } else { Ev::Read(n) });
         Ok(n)
     }
 }
@@ -574,7 +668,11 @@ fn script() -> impl Strategy<Value = Script> {
 }
 
 fn limits() -> Limits {
-    Limits { max_size: 1 << 20, idle: Duration::from_secs(1), total: Duration::from_secs(5) }
+    Limits {
+        max_size: 1 << 20,
+        idle: Duration::from_secs(1),
+        total: Duration::from_secs(5),
+    }
 }
 
 proptest! {
@@ -654,12 +752,18 @@ fn exit_code_follows_the_decision_list() {
             for write_failed in [false, true] {
                 let hit = l.iter().any(|o| *o == Hit);
                 let bad = l.iter().any(|o| matches!(o, Error(_) | Mismatch));
-                let want = if hit && !write_failed { 0 }
-                    else if index_failed { 2 }
-                    else if bad || write_failed { 5 }
-                    else { 1 };
+                let want = if hit && !write_failed {
+                    0
+                } else if index_failed {
+                    2
+                } else if bad || write_failed {
+                    5
+                } else {
+                    1
+                };
                 assert_eq!(
-                    lookup::exit_code(&l, index_failed, write_failed), want,
+                    lookup::exit_code(&l, index_failed, write_failed),
+                    want,
                     "{l:?} index_failed={index_failed} write_failed={write_failed}"
                 );
             }
