@@ -395,16 +395,18 @@ impl<'a> Cache<'a> {
             }),
             delete: victims.clone(),
         })?;
-        // After the commit a kill leaves orphans, which the next sweep takes.
+        // Past the commit an unlink that fails or is killed leaves an
+        // orphan, which the next sweep takes (ES-26): not an error.
         for d in &victims {
-            ex.step(&Effect::Unlink {
+            let _ = ex.step(&Effect::Unlink {
                 path: self.store.path().join(Self::relative_path(d)),
-            })?;
+            });
         }
         Ok(())
     }
 
-    /// Deletes the record (commit), then unlinks the file.
+    /// Deletes the record (commit), then unlinks the file; a failed unlink
+    /// leaves an orphan for the next sweep (ES-26).
     pub fn evict(
         &self,
         lock: &WriteLock,
@@ -416,9 +418,9 @@ impl<'a> Cache<'a> {
             insert: None,
             delete: vec![d.clone()],
         })?;
-        ex.step(&Effect::Unlink {
+        let _ = ex.step(&Effect::Unlink {
             path: self.store.path().join(Self::relative_path(d)),
-        })?;
+        });
         Ok(())
     }
 
@@ -446,7 +448,7 @@ impl<'a> Cache<'a> {
         // device is left for its owner to look at.
         if let Ok(md) = path.symlink_metadata() {
             if md.file_type().is_file() || md.file_type().is_symlink() {
-                ex.step(&Effect::Unlink { path })?;
+                let _ = ex.step(&Effect::Unlink { path });
             }
         }
         drop(lock);
