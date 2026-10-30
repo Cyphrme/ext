@@ -1149,3 +1149,91 @@ fn an_index_missing_its_table_is_a_store_error() {
         assert!(o.stdout.is_empty());
     }
 }
+
+/// A store the effective user cannot write, whose `index.db` is replaced by
+/// `make` (a rusqlite connection to the fresh file, closed afterwards, so no
+/// WAL survives), asked for an indexed digest.
+fn read_only_resolve(make: impl FnOnce(&rusqlite::Connection), extra: impl FnOnce(&Path)) -> Out {
+    let env = setup(&[]);
+    let db = env.store.join("index.db");
+    for f in ["index.db", "index.db-wal", "index.db-shm"] {
+        let _ = fs::remove_file(env.store.join(f));
+    }
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        make(&c);
+    }
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o600)).unwrap();
+    extra(&env.store);
+    fs::set_permissions(&env.store, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = env.ext(&["resolve", &label(b"anything")]);
+    fs::set_permissions(&env.store, fs::Permissions::from_mode(0o700)).unwrap();
+    o
+}
+
+/// ES-25 on a read-only store. An index never written (version 0, no tables)
+/// reads as empty: exit 1, not an error; an initialised index that lost its
+/// `files` table, and one of an unknown version, are loud errors, never
+/// "absent". Violators: treating version 0 as a schema mismatch, treating
+/// every index as never-written (a missing table then reads as empty), and
+/// accepting an unknown version.
+#[test]
+fn read_only_index_states_are_told_apart() {
+    if skip_if_root("read-only store") {
+        return;
+    }
+    let o = read_only_resolve(|_| {}, |_| {});
+    assert_eq!(
+        o.code, 1,
+        "never-written index reads as empty: {}",
+        o.stderr
+    );
+    let o = read_only_resolve(
+        |c| c.pragma_update(None, "user_version", 1).unwrap(),
+        |_| {},
+    );
+    assert_eq!(o.code, 5, "initialised but no files table: {}", o.stderr);
+    let o = read_only_resolve(
+        |c| c.pragma_update(None, "user_version", 99).unwrap(),
+        |_| {},
+    );
+    assert!(
+        o.code != 0 && o.code != 1,
+        "unknown version must be loud: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("99"),
+        "name the version found: {}",
+        o.stderr
+    );
+}
+
+/// ES-25. An empty `index.db-wal` holds no committed rows, so it must not turn
+/// the read-only fallback into an error: with a WAL-mode database and no
+/// `-shm` (which a read-only directory cannot gain), the index is still read
+/// and an indexed digest is found. Violator: treating a zero-length WAL as
+/// content to be lost.
+#[test]
+fn an_empty_wal_does_not_make_a_read_only_store_unreadable() {
+    if skip_if_root("read-only store") {
+        return;
+    }
+    let b = blob(10, 2);
+    let env = setup(&[]);
+    let p = env.index_file("f", &b);
+    for f in ["index.db-wal", "index.db-shm"] {
+        let _ = fs::remove_file(env.store.join(f));
+    }
+    fs::write(env.store.join("index.db-wal"), b"").unwrap();
+    fs::set_permissions(
+        env.store.join("index.db-wal"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    fs::set_permissions(&env.store, fs::Permissions::from_mode(0o500)).unwrap();
+    let o = env.ext(&["resolve", &label(&b)]);
+    fs::set_permissions(&env.store, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(String::from_utf8_lossy(&o.stdout).contains(p.to_str().unwrap()));
+}
