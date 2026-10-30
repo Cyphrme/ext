@@ -49,6 +49,14 @@ pub struct Found {
     pub hit: Option<Verified>,
 }
 
+/// A walk ended early because a sink could not be made, with what the
+/// services before it did, which ES-6 still requires reported.
+#[derive(Debug)]
+pub struct Stopped {
+    pub attempts: Vec<Attempt>,
+    pub error: io::Error,
+}
+
 /// Tries `services` one at a time in order (ES-3); `tmp` supplies one sink per
 /// attempted fetch. A sink that cannot be made ends the walk with the error:
 /// the blob may exist, so going on to report a miss would be wrong (ES-25).
@@ -57,40 +65,40 @@ pub fn run(
     d: &Fetchable,
     limits: &Limits,
     tmp: &mut dyn FnMut() -> io::Result<TmpFile>,
-) -> io::Result<Found> {
+) -> Result<Found, Stopped> {
     let mut attempts = Vec::new();
+    let mut hit = None;
     for (name, backend) in services {
-        let mut record = |outcome| {
-            attempts.push(Attempt {
-                service: name.clone(),
-                outcome,
-            })
+        let outcome = if !backend.addresses(d.digest().alg()) {
+            Outcome::Skipped
+        } else {
+            let sink = match tmp() {
+                Ok(sink) => sink,
+                Err(error) => return Err(Stopped { attempts, error }),
+            };
+            match backend.fetch(d, limits, sink) {
+                Fetched::Missing => Outcome::Missing,
+                Fetched::Error(e) => Outcome::Error(e),
+                Fetched::Hit(candidate) => match Verified::check(candidate, d) {
+                    Ok(v) => {
+                        hit = Some(v);
+                        Outcome::Hit
+                    }
+                    // The candidate's bytes go with it: dropping the sink deletes them.
+                    Err(VerifyError::Mismatch) => Outcome::Mismatch,
+                    Err(e @ VerifyError::Io(_)) => Outcome::Error(e.to_string()),
+                },
+            }
         };
-        if !backend.addresses(d.digest().alg()) {
-            record(Outcome::Skipped);
-            continue;
-        }
-        match backend.fetch(d, limits, tmp()?) {
-            Fetched::Missing => record(Outcome::Missing),
-            Fetched::Error(e) => record(Outcome::Error(e)),
-            Fetched::Hit(candidate) => match Verified::check(candidate, d) {
-                Ok(v) => {
-                    record(Outcome::Hit);
-                    return Ok(Found {
-                        attempts,
-                        hit: Some(v),
-                    });
-                }
-                // The candidate's bytes go with it: dropping the sink deletes them.
-                Err(VerifyError::Mismatch) => record(Outcome::Mismatch),
-                Err(e @ VerifyError::Io(_)) => record(Outcome::Error(e.to_string())),
-            },
+        attempts.push(Attempt {
+            service: name.clone(),
+            outcome,
+        });
+        if hit.is_some() {
+            break;
         }
     }
-    Ok(Found {
-        attempts,
-        hit: None,
-    })
+    Ok(Found { attempts, hit })
 }
 
 /// ES-7. `write_failed`: a private copy or cache admission that was needed

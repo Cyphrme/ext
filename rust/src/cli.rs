@@ -10,7 +10,7 @@ use crate::digest::{Enc, Query};
 use crate::escape::{display, escape, terminal};
 use crate::https::{AddrTable, Client, HttpsConfig, SystemResolver};
 use crate::index::Index;
-use crate::lookup::{self, Attempt, Backend, EmitError, Limits, Outcome};
+use crate::lookup::{self, Attempt, Backend, EmitError, Found, Limits, Outcome, Stopped};
 use crate::registry::RegPath;
 use crate::scan::{self, Opts, Report, ReportKind, Summary};
 use crate::services::{self, Fetchable, FileError, Scheme, ServiceUri, MAX_SERVICES};
@@ -677,8 +677,8 @@ struct Fetch {
     write_failed: bool,
 }
 
-/// The services layer (ES-3 to ES-7). Each failure is reported on stderr as
-/// it is recorded; `Missing` is silent.
+/// The services layer (ES-3 to ES-7). Once the walk ends, each failure is
+/// reported on stderr in service order; `Missing` is silent.
 fn fetch(store: &Store, cfg: &Config, cache: &Cache, d: &Fetchable) -> Result<Fetch, CliError> {
     let list = read_services(store)?;
     if list.is_empty() {
@@ -707,41 +707,42 @@ fn fetch(store: &Store, cfg: &Config, cache: &Cache, d: &Fetchable) -> Result<Fe
         idle: Duration::from_millis(cfg.service_idle_timeout_ms),
         total: Duration::from_millis(cfg.service_timeout_ms),
     };
-    match lookup::run(&services, d, &limits, &mut || cache.create_tmp()) {
-        Ok(found) => {
-            for Attempt { service, outcome } in &found.attempts {
-                match outcome {
-                    Outcome::Error(e) => {
-                        eprintln!(
-                            "SERVICE {} ERROR {}",
-                            terminal(service.as_bytes()),
-                            terminal(e.as_bytes())
-                        )
-                    }
-                    Outcome::Mismatch => {
-                        eprintln!("SERVICE {} MISMATCH", terminal(service.as_bytes()))
-                    }
-                    Outcome::Hit | Outcome::Missing | Outcome::Skipped => {}
-                }
-            }
-            Ok(Fetch {
-                outcomes: found.attempts.into_iter().map(|a| a.outcome).collect(),
-                hit: found.hit,
-                write_failed: false,
-            })
-        }
-        Err(e) => {
-            eprintln!(
-                "ext: error: cannot create a file for the fetch in cache/tmp (the blob may exist): {}",
-                terminal(e.to_string().as_bytes())
-            );
-            Ok(Fetch {
-                outcomes: Vec::new(),
+    let (found, stopped) = match lookup::run(&services, d, &limits, &mut || cache.create_tmp()) {
+        Ok(found) => (found, None),
+        Err(Stopped { attempts, error }) => (
+            Found {
+                attempts,
                 hit: None,
-                write_failed: true,
-            })
+            },
+            Some(error),
+        ),
+    };
+    for Attempt { service, outcome } in &found.attempts {
+        match outcome {
+            Outcome::Error(e) => {
+                eprintln!(
+                    "SERVICE {} ERROR {}",
+                    terminal(service.as_bytes()),
+                    terminal(e.as_bytes())
+                )
+            }
+            Outcome::Mismatch => {
+                eprintln!("SERVICE {} MISMATCH", terminal(service.as_bytes()))
+            }
+            Outcome::Hit | Outcome::Missing | Outcome::Skipped => {}
         }
     }
+    if let Some(e) = &stopped {
+        eprintln!(
+            "ext: error: cannot create a file for the fetch in cache/tmp (the blob may exist): {}",
+            terminal(e.to_string().as_bytes())
+        );
+    }
+    Ok(Fetch {
+        outcomes: found.attempts.into_iter().map(|a| a.outcome).collect(),
+        hit: found.hit,
+        write_failed: stopped.is_some(),
+    })
 }
 
 fn read_services(store: &Store) -> Result<Vec<ServiceUri>, CliError> {
