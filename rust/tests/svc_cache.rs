@@ -951,3 +951,28 @@ fn create_tmp_fails_early_when_a_cache_directory_cannot_be_made() {
         "the SHA-256 directory could not be made yet a tmp file was handed out"
     );
 }
+
+/// ES-30, exactly at the age floor: "younger than 60 s" survives and "older"
+/// goes, so a temporary of age exactly 60 s is not older and stays, and one
+/// nanosecond later it is removed. Sweep takes `now`, so the boundary is
+/// hit exactly (the mtime is read back from the file system). Violator:
+/// `age >= 60 s`, which removes a file the spec says may not yet go.
+#[test]
+fn sweep_age_floor_is_strict() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    drop(cache.create_tmp().unwrap()); // lays out cache/tmp
+    let p = f.dir.join("cache/tmp/aged");
+    fs::write(&p, b"x").unwrap();
+    let mtime = fs::metadata(&p).unwrap().modified().unwrap();
+    let sweep = |now: SystemTime| {
+        let lock = f.store.lock().unwrap();
+        cache
+            .sweep(&lock, &mut FsExecutor { store: &f.store }, now)
+            .unwrap();
+    };
+    sweep(mtime + Duration::from_secs(60));
+    assert!(p.exists(), "exactly 60 s old is not older than 60 s");
+    sweep(mtime + Duration::from_secs(60) + Duration::from_nanos(1));
+    assert!(!p.exists(), "60 s and 1 ns old is older");
+}
