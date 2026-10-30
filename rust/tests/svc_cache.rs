@@ -782,3 +782,114 @@ fn services_file_write_is_atomic_at_every_kill_point() {
         );
     }
 }
+
+// ----------------------------------------------- surviving-mutant relations ----
+
+/// ES-30. A fresh store has no `cache/` yet; sweeping it is a no-op, not an
+/// error (every first admit sweeps first). Violator: treating an absent
+/// directory as a read failure.
+#[test]
+fn sweeping_a_store_with_no_cache_yet_is_a_no_op() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let lock = f.store.lock().unwrap();
+    cache
+        .sweep(
+            &lock,
+            &mut FsExecutor { store: &f.store },
+            SystemTime::now(),
+        )
+        .expect("nothing to sweep is not a failure");
+}
+
+/// ES-25 and ES-26. Eviction is the commit then the unlink, and a kill between
+/// them leaves an orphan; running the eviction again (or evicting a blob whose
+/// file is already gone) must still succeed and leave no record. Evict itself
+/// must remove both record and file. Violators: evict doing nothing; an
+/// absent file treated as a failure.
+#[test]
+fn evict_removes_record_and_file_and_tolerates_a_missing_file() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let content = blob(30, 1);
+    let d = digest_of(&content);
+    let file = f.dir.join(Cache::relative_path(&d));
+    let admit = |c: &[u8]| {
+        let lock = f.store.lock().unwrap();
+        let v = verified(&cache, c);
+        cache
+            .admit(&lock, &mut FsExecutor { store: &f.store }, v, 1)
+            .unwrap();
+    };
+    admit(&content);
+    let lock = f.store.lock().unwrap();
+    let mut ex = Crash::new(&f.store, usize::MAX);
+    cache.evict(&lock, &mut ex, &d).unwrap();
+    assert_eq!(ex.log, ["commit", "unlink"]);
+    drop(lock);
+    assert!(cache.records().unwrap().is_empty() && !file.exists());
+
+    admit(&content);
+    fs::remove_file(&file).unwrap(); // the file vanished (an earlier kill, a sweep)
+    let lock = f.store.lock().unwrap();
+    cache
+        .evict(&lock, &mut FsExecutor { store: &f.store }, &d)
+        .expect("evicting a blob whose file is already gone");
+    assert!(cache.records().unwrap().is_empty());
+}
+
+/// ES-29. Admit, evict and sweep act only under the lock of their own store: a
+/// lock taken on another store excludes nothing here, so each refuses and
+/// performs no effect. Violator: not checking whose lock it is.
+#[test]
+fn a_lock_from_another_store_authorises_nothing() {
+    let (a, b) = (fixture(), fixture());
+    let cache = Cache::new(&a.store, 1 << 20);
+    let foreign = b.store.lock().unwrap();
+    let content = blob(20, 1);
+    let mut ex = Crash::new(&a.store, usize::MAX);
+    assert!(cache
+        .admit(&foreign, &mut ex, verified(&cache, &content), 1)
+        .is_err());
+    assert!(cache
+        .evict(&foreign, &mut ex, &digest_of(&content))
+        .is_err());
+    assert!(cache.sweep(&foreign, &mut ex, SystemTime::now()).is_err());
+    assert!(
+        ex.log.is_empty(),
+        "effects ran under a foreign lock: {:?}",
+        ex.log
+    );
+    assert!(cache.records().unwrap().is_empty());
+}
+
+/// ES-26/ES-27. A newly admitted record's atime is its own clock, whatever
+/// the other records hold; only re-admission of the same digest keeps the
+/// larger of old and new. Violator: seeding the new atime from another
+/// record.
+#[test]
+fn a_new_record_takes_its_own_clock() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let (a, b) = (blob(10, 1), blob(10, 2));
+    let admit = |c: &[u8], now: i64| {
+        let lock = f.store.lock().unwrap();
+        let v = verified(&cache, c);
+        cache
+            .admit(&lock, &mut FsExecutor { store: &f.store }, v, now)
+            .unwrap();
+    };
+    admit(&a, 900);
+    admit(&b, 100);
+    admit(&a, 50);
+    let mut got: Vec<(Digest, i64)> = cache
+        .records()
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.digest, r.atime_ns))
+        .collect();
+    got.sort();
+    let mut want = vec![(digest_of(&a), 900), (digest_of(&b), 100)];
+    want.sort();
+    assert_eq!(got, want);
+}

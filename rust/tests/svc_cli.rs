@@ -1066,3 +1066,32 @@ fn a_read_only_store_reads_its_uncheckpointed_wal() {
     found_or_loud(&no_shm, "WAL without -shm");
     drop(holder);
 }
+
+/// ES-14. A relative `Location` is resolved against the current URL with its
+/// dot segments removed, as a reference resolver would: `/x/y/../z/./w` is
+/// `/x/z/w`, and `p/q/../../r` from the root is `/r`. Violator: a broken dot
+/// segment remover (wrong segment boundaries, which can loop forever; the
+/// run is killed at its limit and reported as a failure).
+#[test]
+fn relative_redirects_resolve_dot_segments() {
+    let b = blob(40, 6);
+    for (first, landing) in [
+        ("/x/y/../z/./w", "/x/z/w"),
+        ("p/q/../../r", "/r"),
+        ("/a/b/c/../../d", "/a/d"),
+    ] {
+        let (b2, first2, landing2) = (b.clone(), first.to_string(), landing.to_string());
+        let fb = Fb::start("127.0.0.2", move |r| {
+            if r.target == landing2 {
+                Resp::ok(&b2)
+            } else if r.target.starts_with("/SHA-256:") {
+                Resp::redirect(302, &first2)
+            } else {
+                Resp::status(404)
+            }
+        });
+        let env = setup(&[&fb]);
+        let o = env.ext_env(&["cat", &label(&b)], &[], Duration::from_secs(10));
+        assert_eq!((o.code, &o.stdout), (0, &b), "{first}: {}", o.stderr);
+    }
+}
