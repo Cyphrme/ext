@@ -296,9 +296,7 @@ impl HttpsBackend<'_> {
                         .map_err(|_| "a Location that is not ASCII".to_string())?;
                     let (next_scheme, next) = resolve_reference(&url, loc)
                         .map_err(|e| format!("redirect to {loc}: {e}"))?;
-                    if !redirect_scheme_allowed(scheme, next_scheme, cfg.allow_http)
-                        || (next_scheme == Scheme::Http && !cfg.allow_http)
-                    {
+                    if !redirect_scheme_allowed(scheme, next_scheme, cfg.allow_http) {
                         return Err(format!("redirect to {next} needs AllowHTTP"));
                     }
                     url = next;
