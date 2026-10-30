@@ -1,5 +1,6 @@
 //! The TLS path of the shipped binary (ES-17). The binary trusts the platform
-//! store, and `SSL_CERT_FILE` is the one variable that may change it, so a
+//! store, and `SSL_CERT_FILE` and `SSL_CERT_DIR` are the only variables that may
+//! change it, so a
 //! throwaway CA made at test time (rcgen) can be trusted by the real `ext`
 //! with no test-only seam in the binary. Servers are rustls over loopback.
 //!
@@ -78,6 +79,8 @@ fn leaf_san(ca: &Ca, san: SanType, expired: bool) -> Leaf {
 
 struct TlsFb {
     addr: std::net::SocketAddr,
+    /// Every listening address, woken on drop so each accept loop sees `stop`.
+    wake: Vec<std::net::SocketAddr>,
     served: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
 }
@@ -85,7 +88,9 @@ struct TlsFb {
 impl Drop for TlsFb {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = std::net::TcpStream::connect(self.addr);
+        for a in &self.wake {
+            let _ = std::net::TcpStream::connect(a);
+        }
     }
 }
 
@@ -108,9 +113,29 @@ fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
 }
 
 fn tls_fb_at(bind: &str, l: Leaf, mode: Mode) -> TlsFb {
+    tls_fb_on(vec![TcpListener::bind((bind, 0)).unwrap()], l, mode)
+}
+
+/// Serves on 127.0.0.1 and [::1] at one port, so a name that resolves to
+/// either loopback family (or both, in either order) reaches the server.
+/// Where IPv6 loopback does not exist, 127.0.0.1 alone is served.
+fn tls_fb_loopback(l: Leaf, mode: Mode) -> TlsFb {
+    for _ in 0..50 {
+        let v4 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = v4.local_addr().unwrap().port();
+        match TcpListener::bind(("::1", port)) {
+            Ok(v6) => return tls_fb_on(vec![v4, v6], l, mode),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(_) => return tls_fb_on(vec![v4], l, mode),
+        }
+    }
+    panic!("no port free on both loopback families");
+}
+
+fn tls_fb_on(listeners: Vec<TcpListener>, l: Leaf, mode: Mode) -> TlsFb {
     let blob = mode;
-    let listener = TcpListener::bind((bind, 0)).unwrap();
-    let addr = listener.local_addr().unwrap();
+    let wake: Vec<_> = listeners.iter().map(|x| x.local_addr().unwrap()).collect();
+    let addr = wake[0];
     let served = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let cfg = Arc::new(
@@ -121,80 +146,88 @@ fn tls_fb_at(bind: &str, l: Leaf, mode: Mode) -> TlsFb {
             .with_single_cert(l.chain, l.key.into())
             .unwrap(),
     );
-    let (served2, stop2) = (served.clone(), stop.clone());
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            if stop2.load(Ordering::Relaxed) {
-                return;
-            }
-            let Ok(tcp) = conn else { continue };
-            let (cfg, blob, served, stop) =
-                (cfg.clone(), blob.clone(), served2.clone(), stop2.clone());
-            std::thread::spawn(move || {
-                if matches!(blob, Mode::Stall) {
-                    while !stop.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
+    for listener in listeners {
+        let (blob, cfg) = (blob.clone(), cfg.clone());
+        let (served2, stop2) = (served.clone(), stop.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if stop2.load(Ordering::Relaxed) {
                     return;
                 }
-                let mut s = StreamOwned::new(ServerConnection::new(cfg).unwrap(), tcp);
-                let mut head = vec![];
-                let mut b = [0u8; 1];
-                while !head.ends_with(b"\r\n\r\n") {
-                    if !matches!(s.read(&mut b), Ok(1)) {
-                        return; // the client refused the handshake
+                let Ok(tcp) = conn else { continue };
+                let (cfg, blob, served, stop) =
+                    (cfg.clone(), blob.clone(), served2.clone(), stop2.clone());
+                std::thread::spawn(move || {
+                    if matches!(blob, Mode::Stall) {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        return;
                     }
-                    head.push(b[0]);
-                }
-                served.fetch_add(1, Ordering::SeqCst);
-                let target = String::from_utf8_lossy(&head)
-                    .split(' ')
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
-                match &blob {
-                    Mode::Hop(_) | Mode::HopChunked(_) if target.starts_with("/SHA") => {
-                        let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n");
+                    let mut s = StreamOwned::new(ServerConnection::new(cfg).unwrap(), tcp);
+                    let mut head = vec![];
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if !matches!(s.read(&mut b), Ok(1)) {
+                            return; // the client refused the handshake
+                        }
+                        head.push(b[0]);
                     }
-                    Mode::Hop(b) => {
-                        let _ = write!(
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let target = String::from_utf8_lossy(&head)
+                        .split(' ')
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    match &blob {
+                        Mode::Hop(_) | Mode::HopChunked(_) if target.starts_with("/SHA") => {
+                            let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n");
+                        }
+                        Mode::Hop(b) => {
+                            let _ = write!(
                             s,
                             "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                             b.len()
                         );
-                        let _ = s.write_all(b);
-                    }
-                    Mode::HopChunked(b) => {
-                        let _ = write!(
+                            let _ = s.write_all(b);
+                        }
+                        Mode::HopChunked(b) => {
+                            let _ = write!(
                             s,
                             "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
                         );
-                        for ch in b.chunks(7) {
-                            let _ = write!(s, "{:x}\r\n", ch.len());
-                            let _ = s.write_all(ch);
-                            let _ = write!(s, "\r\n");
+                            for ch in b.chunks(7) {
+                                let _ = write!(s, "{:x}\r\n", ch.len());
+                                let _ = s.write_all(ch);
+                                let _ = write!(s, "\r\n");
+                            }
+                            let _ = write!(s, "0\r\n\r\n");
                         }
-                        let _ = write!(s, "0\r\n\r\n");
-                    }
-                    Mode::Redirect(to) => {
-                        let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
-                    }
-                    Mode::Blob(b) => {
-                        let _ = write!(
+                        Mode::Redirect(to) => {
+                            let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
+                        }
+                        Mode::Blob(b) => {
+                            let _ = write!(
                             s,
                             "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                             b.len()
                         );
-                        let _ = s.write_all(b);
+                            let _ = s.write_all(b);
+                        }
+                        Mode::Stall => {}
                     }
-                    Mode::Stall => {}
-                }
-                s.conn.send_close_notify();
-                let _ = s.flush();
-            });
-        }
-    });
-    TlsFb { addr, served, stop }
+                    s.conn.send_close_notify();
+                    let _ = s.flush();
+                });
+            }
+        });
+    }
+    TlsFb {
+        addr,
+        wake,
+        served,
+        stop,
+    }
 }
 
 fn env_for(fb: &TlsFb, extra: &str) -> Env {
@@ -465,9 +498,8 @@ fn an_https_to_https_redirect_needs_no_allow_http() {
 /// verification skipped or done against the resolved IP, `SSL_CERT_DIR` not
 /// honoured, chunked bodies or the redirect hop mishandled over TLS.
 ///
-/// `localhost` resolves here to `::1` before `127.0.0.1`; the server binds
-/// `127.0.0.1`, so the fetch also exercises falling through the refused
-/// first address.
+/// The server listens on both loopback families at one port, so the test does
+/// not depend on which address `localhost` resolves to or in what order.
 #[test]
 fn a_named_host_behind_an_intermediate_and_a_redirect_is_fetched_and_admitted() {
     let b = blob(300, 7);
@@ -478,7 +510,7 @@ fn a_named_host_behind_an_intermediate_and_a_redirect_is_fetched_and_admitted() 
         l.chain.push(mid_der.clone());
         l
     };
-    let start = |l: Leaf| tls_fb_at("127.0.0.1", l, Mode::HopChunked(b.clone()));
+    let start = |l: Leaf| tls_fb_loopback(l, Mode::HopChunked(b.clone()));
     let env_at = |fb: &TlsFb, root_pem: &str| {
         let env = Env::new();
         env.config_raw("{ AllowLocal: true }");
