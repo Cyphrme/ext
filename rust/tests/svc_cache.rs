@@ -46,7 +46,7 @@ fn fixture() -> Fixture {
 /// A candidate in `cache/tmp/` that verified against its own digest.
 fn verified(cache: &Cache, content: &[u8]) -> Verified {
     let mut tmp = cache.create_tmp().expect("tmp file");
-    tmp.file.write_all(content).unwrap();
+    tmp.file().write_all(content).unwrap();
     Verified::check(tmp, &fetchable(content)).expect("honest content verifies")
 }
 
@@ -260,7 +260,7 @@ proptest! {
     /// is the only thing ordering them), backward touch clocks and
     /// re-admission. Violators: eviction by insertion order, ignoring the
     /// digest tie-break, over-evicting, evicting the blob just admitted,
-    /// counting `tmp/` in the sum.
+    /// ignoring the capacity.
     #[test]
     fn resident_set_equals_the_reference_model(
         sizes in prop::collection::vec(1usize..40, 4),
@@ -369,7 +369,9 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
         } else {
             assert_eq!(got, None, "{name}");
             assert!(cache.records().unwrap().is_empty(), "{name}: record evicted");
-            if name != "directory" {
+            if name == "directory" {
+                assert!(file.is_dir(), "{name}: the directory is left in place");
+            } else {
                 assert!(fs::symlink_metadata(&file).is_err(), "{name}: file evicted");
             }
             if aside_existed {
@@ -381,7 +383,7 @@ fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
 
 // ----------------------------------------------------------------- ES-27 ----
 
-/// ES-27. `atime := max(now, atime)`, and a touch against a busy lock is
+/// ES-27. `atime := max(now, atime)` for touch and re-admission, and a touch against a busy lock is
 /// skipped immediately. Violators: `atime := now` (a backward clock lowers
 /// it), blocking acquisition, failing the lookup on a busy lock.
 #[test]
@@ -398,6 +400,15 @@ fn touch_is_monotone_and_never_waits() {
     assert_eq!(atime(), 900);
     cache.touch(&d, 100).unwrap();
     assert_eq!(atime(), 900, "a touch never lowers atime");
+    // Touching a digest that is not resident is a no-op, not an error.
+    let before = cache.records().unwrap();
+    assert!(cache.touch(&digest_of(b"absent"), 7_000).is_ok());
+    assert_eq!(cache.records().unwrap(), before);
+    // Re-admission keeps atime := max(old, now), even with a backward clock.
+    let lock = f.store.lock().unwrap();
+    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 100).unwrap();
+    drop(lock);
+    assert_eq!(atime(), 900, "re-admission with an older clock does not lower atime");
     let skipped = while_locked(&f.store, || cache.touch(&d, 5_000).unwrap());
     assert!(!skipped, "busy lock: skipped, reported");
     assert_eq!(atime(), 900);
@@ -426,8 +437,11 @@ fn sweep_removes_the_dead_and_keeps_the_live() {
     let tmp = f.dir.join("cache/tmp");
     let orphan = f.dir.join("cache/SHA-256").join(hex_name(&digest_of(b"orphan")));
     fs::write(&orphan, b"orphan").unwrap();
-    let live = cache.create_tmp().unwrap(); // locked for its fetch's life
-    backdate(&live.path, 300);
+    // Locked by another open file description, as a running fetch's file is.
+    let live_path = tmp.join("live");
+    let live = fs::File::create(&live_path).unwrap();
+    rustix::fs::flock(&live, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+    backdate(&live_path, 300);
     let young = tmp.join("young");
     let old = tmp.join("old");
     fs::write(&young, b"y").unwrap();
@@ -442,13 +456,13 @@ fn sweep_removes_the_dead_and_keeps_the_live() {
     assert!(!orphan.exists(), "orphan file removed");
     assert!(!old.exists(), "unlocked stale temporary removed");
     assert!(young.exists(), "a temporary younger than 60 s survives (create-then-lock window)");
-    assert!(live.path.exists(), "a locked temporary survives whatever its age");
+    assert!(live_path.exists(), "a locked temporary survives whatever its age");
     assert_eq!(cache.records().unwrap().len(), 1);
     assert_cache_invariants(&f);
 
     // The fetch dies (its lock goes with it); once old enough the file is dead.
-    let dead = live.path.clone();
-    drop(live);
+    let dead = live_path.clone();
+    drop(live); // closing releases the flock, as a dying process does
     sweep(&cache);
     assert!(!dead.exists(), "after its owner died, the old temporary is removed");
     assert!(young.exists());
@@ -484,10 +498,19 @@ fn cache_paths_and_modes_are_explicit() {
     let f = fixture();
     let cache = Cache::new(&f.store, 1 << 20);
     let content = b"abc".to_vec();
-    let tmp = cache.create_tmp().unwrap();
+    let mut tmp = cache.create_tmp().unwrap();
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&tmp.path), 0o600, "in-flight file");
+    assert_eq!(mode(tmp.path()), 0o600, "in-flight file");
+    // The in-flight file is flocked for its fetch's life (ES-30 relies on it).
+    let other = fs::File::open(tmp.path()).unwrap();
+    assert!(
+        rustix::fs::flock(&other, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err(),
+        "create_tmp must return a locked file"
+    );
+    let _ = tmp.file();
+    drop(other);
     drop(tmp);
+    assert!(f.dir.join("cache/tmp").read_dir().unwrap().next().is_none(), "dropping an unpersisted TmpFile deletes it");
     let lock = f.store.lock().unwrap();
     cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 1).unwrap();
     drop(lock);
@@ -500,5 +523,52 @@ fn cache_paths_and_modes_are_explicit() {
     assert_eq!(mode(&final_path), 0o600);
     for d in ["cache", "cache/SHA-256", "cache/tmp"] {
         assert_eq!(mode(&f.dir.join(d)), 0o700, "{d}");
+    }
+}
+
+// ------------------------------------------------------- ES-22, F10 ----
+
+/// F10 for the services file, deterministically: `write_file` killed before
+/// each of its effects leaves exactly the old bytes or exactly the new ones,
+/// never a mixture, and the effects are a write to a store-local temporary
+/// followed (last) by a rename onto `services`. A killed process may leave a
+/// temporary (cleanup is dropped with everything else); the next write must
+/// succeed and leave none. Violators: truncate-then-write on the final name,
+/// renaming before the content is written, a temporary outside the store.
+#[test]
+fn services_file_write_is_atomic_at_every_kill_point() {
+    use ext::services::{write_file, ServiceUri};
+    let uris = |n: std::ops::Range<usize>| -> Vec<ServiceUri> {
+        n.map(|i| ServiceUri::parse(&format!("https://h{i}.example/")).unwrap()).collect()
+    };
+    let (old, new) = (uris(0..3), uris(0..5));
+    let (old_b, new_b) = (ext::services::render_file(&old), ext::services::render_file(&new));
+    let run = |at: usize| {
+        let f = fixture();
+        let lock = f.store.lock().unwrap();
+        write_file(&f.store, &lock, &mut FsExecutor { store: &f.store }, &old).unwrap();
+        let mut ex = Crash::new(&f.store, at);
+        let _ = write_file(&f.store, &lock, &mut ex, &new);
+        let got = fs::read(f.dir.join("services")).unwrap();
+        assert!(got == old_b || got == new_b, "killed at {at}: a mixed services file {got:?}");
+        let log = ex.log.clone();
+        drop(ex);
+        (f, lock, log)
+    };
+    let listing = |d: &Path| -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    };
+    let (f0, _l, full) = run(usize::MAX);
+    let baseline = listing(&f0.dir);
+    assert!(full.len() >= 2 && full[0] == "write" && *full.last().unwrap() == "rename" && full.iter().all(|k| ["write", "fsync", "rename"].contains(k)), "{full:?}");
+    for k in 0..full.len() {
+        let (f, lock, log) = run(k);
+        assert_eq!(log, full[..k]);
+        assert_eq!(fs::read(f.dir.join("services")).unwrap(), old_b, "killed before effect {k}: not yet renamed, so the old bytes");
+        write_file(&f.store, &lock, &mut FsExecutor { store: &f.store }, &new).unwrap();
+        assert_eq!(fs::read(f.dir.join("services")).unwrap(), new_b);
+        assert_eq!(listing(&f.dir), baseline, "a temporary survived the next write");
     }
 }

@@ -16,7 +16,6 @@ use proptest::prelude::*;
 use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 use svc::*;
@@ -25,7 +24,7 @@ fn tmp_with(content: &[u8]) -> TmpFile {
     let mut file = tempfile::tempfile().unwrap();
     file.write_all(content).unwrap();
     // A fetch leaves the cursor at the end; checking must not depend on it.
-    TmpFile { file, path: PathBuf::new() }
+    TmpFile::anonymous(file)
 }
 
 // ---------------------------------------------------------------- ES-21 ----
@@ -103,6 +102,10 @@ fn single_point_mutations_of_a_valid_line_are_rejected() {
         ("empty host", "https:///p".into()),
         ("port 0", "https://example.com:0/".into()),
         ("port 65536", "https://example.com:65536/".into()),
+        ("leading-zero port", "https://example.com:0080/".into()),
+        ("pct in host", "https://a%41b.example/".into()),
+        ("sub-delim in host", "https://a,b.example/".into()),
+        ("underscore in host", "https://a_b.example/".into()),
         ("empty port", "https://example.com:/".into()),
         ("fragment", "https://example.com/p#f".into()),
         ("query in base", "https://example.com/p?x=1".into()),
@@ -125,24 +128,23 @@ fn single_point_mutations_of_a_valid_line_are_rejected() {
     }
 }
 
-/// The grammar as an independent oracle, over ASCII. `None` where the spec
-/// text leaves the outcome open (leading-zero ports, pct-encoding or
-/// sub-delimiters in a host), so the test never judges the implementation on
-/// a point the grammar does not settle.
-fn oracle(line: &str) -> Option<bool> {
+/// The grammar as an independent oracle, over ASCII: host is non-empty and
+/// `dns-name = 1*(ALPHA / DIGIT / "-" / ".")` or a bracketed IPv6 address;
+/// the port is `%x31-39 0*4DIGIT` in 1..=65535 (no leading zero).
+fn oracle(line: &str) -> bool {
     use regex::Regex;
     let pchar = r"(?:[A-Za-z0-9._~!$&'()*+,;=:@-]|%[0-9A-Fa-f]{2})";
     let re = |s: String| Regex::new(&format!(r"\A(?:{s})\z")).unwrap();
-    if line.len() > 2048 || !line.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b' ') {
-        return Some(false);
+    if line.len() > 2048 || !line.bytes().all(|b| (0x21..0x7f).contains(&b)) {
+        return false;
     }
     let split = Regex::new(r"(?i)\A(https?)://([^/?#]*)(.*)\z").unwrap();
-    let Some(c) = split.captures(line) else { return Some(false) };
+    let Some(c) = split.captures(line) else { return false };
     let (auth, rest) = (&c[2], &c[3]);
     let (host, port) = if let Some(b) = auth.strip_prefix('[') {
-        let (inner, tail) = b.split_once(']')?;
+        let Some((inner, tail)) = b.split_once(']') else { return false };
         if inner.parse::<Ipv6Addr>().is_err() {
-            return Some(false);
+            return false;
         }
         (format!("[{inner}]"), tail.to_string())
     } else {
@@ -151,31 +153,21 @@ fn oracle(line: &str) -> Option<bool> {
             None => (auth.to_string(), String::new()),
         }
     };
-    if auth.starts_with('[') {
-        if !port.is_empty() && !re(r":[0-9]{1,5}".into()).is_match(&port) {
-            return Some(false);
-        }
-    } else {
-        if host.contains(['%', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=']) {
-            return None;
-        }
-        if !re(r"[A-Za-z0-9._~-]+".into()).is_match(&host) {
-            return Some(false);
-        }
+    if !auth.starts_with('[') && !re(r"[A-Za-z0-9.-]+".into()).is_match(&host) {
+        return false;
+    }
+    if !port.is_empty() && !re(r":[1-9][0-9]{0,4}".into()).is_match(&port) {
+        return false;
     }
     if let Some(p) = port.strip_prefix(':') {
-        if p.len() > 1 && p.starts_with('0') {
-            return None;
-        }
-        match p.parse::<u32>() {
-            Ok(n) if (1..=65535).contains(&n) => {}
-            _ => return Some(false),
+        if p.parse::<u32>().map_or(true, |n| n > 65535) {
+            return false;
         }
     }
     let base = re(format!("(?:/|{pchar})*"));
     let tmpl = re(format!(r"(?:/|\?|{pchar}|\{{alg\}}|\{{digest\}}|\{{hex\}})*"));
     let has_id = rest.contains("{digest}") || rest.contains("{hex}");
-    Some(base.is_match(rest) || (has_id && tmpl.is_match(rest)))
+    base.is_match(rest) || (has_id && tmpl.is_match(rest))
 }
 
 proptest! {
@@ -184,7 +176,7 @@ proptest! {
     /// everything.
     #[test]
     fn the_oracle_accepts_every_generated_line(g in valid_line()) {
-        prop_assert_ne!(oracle(&g.line), Some(false), "{}", g.line);
+        prop_assert!(oracle(&g.line), "{}", g.line);
     }
 
     /// ES-21 differential. Near-valid lines (a generated valid line with up to
@@ -204,9 +196,7 @@ proptest! {
             match kind { 0 => chars[i] = c, 1 => { chars.remove(i); } _ => chars.insert(i, c) }
         }
         let line: String = chars.into_iter().collect();
-        if let Some(want) = oracle(&line) {
-            prop_assert_eq!(ServiceUri::parse(&line).is_ok(), want, "line {:?}", line);
-        }
+        prop_assert_eq!(ServiceUri::parse(&line).is_ok(), oracle(&line), "line {:?}", line);
     }
 
     /// ES-21: arbitrary text never panics the parser.
@@ -394,13 +384,16 @@ proptest! {
         prop_assert!(!permitted(IpAddr::V4(v4(a)), &AddrTable::iana()), "{} is in a special block", v4(a));
     }
 
-    /// ES-15: IPv6 outside 2000::/3 is denied (the rule is an allow-list, so no
-    /// registry row has to name it). v4-mapped space is canonicalised first
-    /// and is excluded here. Violator: a deny-list of registry rows only.
+    /// ES-15: IPv6 outside 2000::/3 is denied for every top-three-bit prefix
+    /// other than 001 (the rule is an allow-list, so no registry row has to
+    /// name it). v4-mapped space is canonicalised first and excluded here.
+    /// Violator: a deny-list of registry rows only.
     #[test]
-    fn ipv6_outside_2000_slash_3_is_denied(n in any::<u128>()) {
-        let n = n & !(0b111u128 << 125) | (u128::from(n >> 125 == 0b001) * 0b110 << 125);
-        let a = Ipv6Addr::from(n);
+    fn ipv6_outside_2000_slash_3_is_denied(
+        top in prop::sample::select(vec![0u128, 2, 3, 4, 5, 6, 7]),
+        low in any::<u128>(),
+    ) {
+        let a = Ipv6Addr::from(top << 125 | low >> 3);
         prop_assume!(a.to_ipv4_mapped().is_none());
         prop_assert!(!permitted(IpAddr::V6(a), &AddrTable::iana()), "{a}");
     }
@@ -565,8 +558,8 @@ impl Backend for Stub {
             Script::Missing => return Fetched::Missing,
             Script::Error => return Fetched::Error("scripted".into()),
         };
-        sink.file.write_all(&body).unwrap();
-        sink.file.seek(SeekFrom::End(0)).unwrap();
+        sink.file().write_all(&body).unwrap();
+        sink.file().seek(SeekFrom::End(0)).unwrap();
         Fetched::Hit(sink)
     }
 }

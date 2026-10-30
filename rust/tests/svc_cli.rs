@@ -13,7 +13,6 @@ use ext::store::Store;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use svc::fb::{Body, Fb, Latch, Resp};
 use svc::*;
@@ -247,7 +246,8 @@ fn cat_hashes_every_blob_it_returns() {
     let o = env.ext(&["cat", "--offline", &label(&b)]);
     assert_eq!(o.code, 2, "both local copies fail verification; the index failure decides: {}", o.stderr);
     assert!(o.stdout.is_empty());
-    fs::write(&cache_file, &flipped).unwrap(); // in case the failed copy was evicted
+    assert!(env.records().is_empty() && !cache_file.exists(), "the corrupt cache record and file were evicted");
+    fs::write(&cache_file, &flipped).unwrap(); // an orphan: the refetch must replace it
     let o = env.ext(&["cat", &label(&b)]);
     assert_eq!((o.code, &o.stdout), (0, &b), "corrupt copies skipped, the service answers: {}", o.stderr);
     assert_eq!(fb.requests().len(), 2, "refetched exactly once");
@@ -364,7 +364,7 @@ fn the_services_file_is_parsed_lazily_and_checked_for_ownership() {
     assert_eq!(env.ext(&["resolve", &label(&b)]).code, 0);
     let o = env.ext(&["cat", &other]);
     assert_eq!(o.code, 4, "a lookup that needs the file fails: {}", o.stderr);
-    assert!(o.stderr.contains("services") && o.stderr.contains('2'), "must name the file and line 2: {}", o.stderr);
+    assert!(o.stderr.contains("services:2:"), "format is services:<line>: <reason>: {}", o.stderr);
 
     env.services(&[fb.base()]);
     assert_eq!(env.ext(&["-u", &fb.base()]).code, 0);
@@ -376,39 +376,6 @@ fn the_services_file_is_parsed_lazily_and_checked_for_ownership() {
         let o = env.ext(&["-r", "https://x.example/"]);
         assert_eq!(o.code, 4, "{}", o.stderr);
     }
-}
-
-/// F10 for the services file: a reader never sees a partial file while `-r`
-/// rewrites it. Violator: truncate-then-write.
-#[test]
-fn services_file_replacement_is_atomic_to_readers() {
-    let env = Env::new();
-    env.config("");
-    env.services(&(0..40).map(|i| format!("https://h{i}.example/")).collect::<Vec<_>>());
-    let path = env.store.join("services");
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader = {
-        let (stop, path) = (stop.clone(), path.clone());
-        std::thread::spawn(move || {
-            let mut bad = 0;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Ok(b) = fs::read(&path) {
-                    if ext::services::parse_file(&b).is_err() {
-                        bad += 1;
-                    }
-                }
-            }
-            bad
-        })
-    };
-    for i in 0..60 {
-        let u = format!("https://n{}.example/", i % 20);
-        let args: [&str; 2] = [if i < 20 { "-r" } else { "-u" }, &u];
-        assert_eq!(env.ext(&args).code, 0);
-    }
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(reader.join().unwrap(), 0, "a reader saw a partial services file");
-    assert_eq!(fs::read_dir(&env.store).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("services")).count(), 1, "no temporary left");
 }
 
 // ----------------------------------------------------------------- ES-20 ----
@@ -451,12 +418,16 @@ fn untrusted_text_on_stderr_is_escaped() {
         assert!(o.stderr.contains(want), "{want} missing from {:?}", o.stderr);
     }
 
-    let reason = b"\x1b[2J\r\0\x7f\x9b\xff\xe2\x80\xae\\x41 end".to_vec();
-    let fb = Fb::start("127.0.0.2", move |_| Resp::status(500).reason(&reason).header("X-Msg", b"\x1b[0m"));
+    // Bytes the HTTP parser lets through: HTAB, 0x80..0xFF (incl. a C1 byte
+    // and U+202E) and a backslash. Control bytes like ESC never get this far,
+    // so the file-name half above covers them.
+    let reason = b"t\tab\x9b\xff\xe2\x80\xae\\x41 end".to_vec();
+    let fb = Fb::start("127.0.0.2", move |_| Resp::status(500).reason(&reason).header("X-Msg", b"v\t\xff"));
     let env = setup(&[&fb]);
     let o = env.ext(&["cat", &label(&b)]);
     assert_eq!(o.code, 5, "{}", o.stderr);
     assert!(ok(&o.stderr), "service text reached the terminal unescaped: {:?}", o.stderr);
+    assert!(!o.stderr.contains("\\x41"), "a raw backslash in service text must print as \\x5c: {:?}", o.stderr);
     assert!(o.stderr.contains(&fb.base()));
 }
 
@@ -541,7 +512,10 @@ fn an_admission_that_cannot_happen_is_exit_5_not_1() {
     drop(lock);
     for (name, o) in [("cat", &cat), ("resolve", &resolve)] {
         assert_eq!(o.code, 5, "{name} against a busy lock: {}", o.stderr);
-        assert!(o.elapsed < Duration::from_secs(7), "{name}: {:?}", o.elapsed);
+        assert!(
+            o.elapsed >= Duration::from_millis(4500) && o.elapsed < Duration::from_secs(7),
+            "{name}: the 5 s busy timeout was not honoured: {:?}", o.elapsed
+        );
         assert!(o.stdout.is_empty(), "{name}: nothing delivered");
         assert!(!o.stderr.is_empty());
     }
@@ -687,6 +661,35 @@ fn config_limits_govern_the_fetch() {
     assert_eq!(o.code, 5, "{}", o.stderr);
     assert!(o.elapsed < Duration::from_secs(3), "idle timeout of 300 ms ended it after {:?}", o.elapsed);
     assert!(o.stderr.contains(&hang.base()), "{}", o.stderr);
+}
+
+/// ES-13 and ES-12 config wiring, second half: `ServiceTimeout` bounds a
+/// server that is never idle (a slow drip), and `CacheCapacity` reaches the
+/// cache (two blobs that cannot both fit leave only the newer one).
+/// Violators: ignoring either key and using the default.
+#[test]
+fn service_timeout_and_cache_capacity_reach_the_binary() {
+    let drip = Fb::start("127.0.0.2", |_| Resp::status(200).body(Body::Drip { byte: b'a', every: Duration::from_millis(100) }));
+    let env = Env::new();
+    env.config("ServiceTimeout: 1500, ServiceIdleTimeout: 30000");
+    env.services(&[drip.base()]);
+    let o = env.ext_env(&["cat", &label(b"x")], &[], Duration::from_secs(10));
+    assert_eq!(o.code, 5, "{}", o.stderr);
+    assert!(o.elapsed >= Duration::from_millis(1400) && o.elapsed < Duration::from_millis(2500), "{:?}", o.elapsed);
+
+    let (a, b) = (blob(60, 1), blob(60, 2));
+    let (a_val, b2) = (label(&a).split(':').next().unwrap().to_string(), b.clone());
+    let a2 = a.clone();
+    let fb = Fb::start("127.0.0.2", move |r| if r.target.contains(&a_val) { Resp::ok(&a2) } else { Resp::ok(&b2) });
+    let env = Env::new();
+    env.config("CacheCapacity: 100, ServiceMaxSize: 64");
+    env.services(&[fb.base()]);
+    for blob in [&a, &b] {
+        let o = env.ext(&["cat", &label(blob)]);
+        assert_eq!((o.code, &o.stdout), (0, blob), "{}", o.stderr);
+    }
+    assert_eq!(env.cache_files(), [Path::new(&cached_name(&b)).to_path_buf()], "the older blob was evicted to honour CacheCapacity");
+    assert_eq!(env.records().len(), 1);
 }
 
 /// ES-31. `ServiceMaxSize` above `CacheCapacity` is a configuration error

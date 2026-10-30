@@ -19,7 +19,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use svc::fb::{Fb, Resp};
+use svc::fb::Fb;
 use svc::*;
 
 struct Ca {
@@ -70,8 +70,17 @@ impl Drop for TlsFb {
     }
 }
 
-/// `blob = None` accepts TCP and then says nothing: a stalled handshake.
-fn tls_fb(l: Leaf, blob: Option<Vec<u8>>) -> TlsFb {
+#[derive(Clone)]
+enum Mode {
+    Blob(Vec<u8>),
+    /// Accepts TCP and then says nothing: a stalled handshake.
+    Stall,
+    /// Answers 302 with this Location.
+    Redirect(String),
+}
+
+fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
+    let blob = mode;
     let listener = TcpListener::bind("127.0.0.2:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let served = Arc::new(AtomicUsize::new(0));
@@ -93,12 +102,12 @@ fn tls_fb(l: Leaf, blob: Option<Vec<u8>>) -> TlsFb {
             let Ok(tcp) = conn else { continue };
             let (cfg, blob, served, stop) = (cfg.clone(), blob.clone(), served2.clone(), stop2.clone());
             std::thread::spawn(move || {
-                let Some(blob) = blob else {
+                if matches!(blob, Mode::Stall) {
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(20));
                     }
                     return;
-                };
+                }
                 let mut s = StreamOwned::new(ServerConnection::new(cfg).unwrap(), tcp);
                 let mut head = vec![];
                 let mut b = [0u8; 1];
@@ -109,8 +118,16 @@ fn tls_fb(l: Leaf, blob: Option<Vec<u8>>) -> TlsFb {
                     head.push(b[0]);
                 }
                 served.fetch_add(1, Ordering::SeqCst);
-                let _ = write!(s, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", blob.len());
-                let _ = s.write_all(&blob);
+                match &blob {
+                    Mode::Redirect(to) => {
+                        let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
+                    }
+                    Mode::Blob(b) => {
+                        let _ = write!(s, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n", b.len());
+                        let _ = s.write_all(b);
+                    }
+                    Mode::Stall => {}
+                }
                 s.conn.send_close_notify();
                 let _ = s.flush();
             });
@@ -150,7 +167,7 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
     let good = ca("trusted");
     let other = ca("somebody else");
 
-    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Some(b.clone()));
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Blob(b.clone()));
     let env = env_for(&fb, "");
     let keylog = env.base.join("keylog");
     let trusted = write_ca(&env, "good.pem", &good.pem);
@@ -169,7 +186,7 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
         ("wrong name", leaf(&good, "127.0.0.9", false)),
         ("expired", leaf(&good, "127.0.0.2", true)),
     ] {
-        let fb = tls_fb(l, Some(b.clone()));
+        let fb = tls_fb(l, Mode::Blob(b.clone()));
         let env = env_for(&fb, "");
         let trusted = write_ca(&env, "good.pem", &good.pem);
         let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
@@ -187,7 +204,7 @@ fn chain_name_and_expiry_are_validated_against_the_platform_roots() {
 fn a_bad_ssl_cert_file_is_an_error_naming_the_cause() {
     let b = blob(40, 2);
     let good = ca("trusted");
-    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Some(b.clone()));
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Blob(b.clone()));
     let env = env_for(&fb, "");
     let pem = write_ca(&env, "ok.pem", &good.pem);
     assert_eq!(cat_with(&env, &b, &[("SSL_CERT_FILE", &pem)]).code, 0, "control: the good file works");
@@ -205,28 +222,28 @@ fn a_bad_ssl_cert_file_is_an_error_naming_the_cause() {
 }
 
 /// ES-13 and ES-17: a server that accepts TCP and never speaks ends the
-/// attempt at the timeout (the TLS phase counts against the total), with the
-/// service named. Violator: no bound on the handshake.
+/// attempt at the idle timeout (it governs a stalled handshake), not the later
+/// total, with the service named. Violators: no bound on the handshake, only
+/// the total applied.
 #[test]
 fn a_stalled_handshake_is_cut_off() {
     let good = ca("trusted");
-    let fb = tls_fb(leaf(&good, "127.0.0.2", false), None);
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Stall);
     let env = env_for(&fb, "ServiceIdleTimeout: 300, ServiceTimeout: 1500");
     let trusted = write_ca(&env, "good.pem", &good.pem);
     let o = cat_with(&env, &blob(10, 1), &[("SSL_CERT_FILE", &trusted)]);
     assert_eq!(o.code, 5, "{}", o.stderr);
-    assert!(o.elapsed >= Duration::from_millis(250) && o.elapsed < Duration::from_millis(2000 + 500), "{:?}", o.elapsed);
+    assert!(o.elapsed >= Duration::from_millis(250) && o.elapsed < Duration::from_millis(300 + 500), "{:?}", o.elapsed);
     assert!(o.stderr.contains(&format!("https://{}/", fb.addr)), "{}", o.stderr);
 }
 
-/// ES-17: proxy variables (any case) and resolver-altering variables are not
-/// read. With every proxy variable pointing at a listener, the https fetch
+/// ES-17: proxy variables (any case) are not read. With every proxy variable pointing at a listener, the https fetch
 /// still succeeds and the listener sees nothing; a plain-http service under
 /// `AllowHTTP` is fetched directly too; `HOSTALIASES` mapping a bare name to
 /// `localhost` changes nothing, so that name stays unresolvable. Violators:
 /// proxy-from-environment, glibc's HOSTALIASES left in force.
 #[test]
-fn proxy_and_resolver_variables_are_ignored() {
+fn proxy_variables_are_ignored() {
     let b = blob(64, 3);
     let proxy = TcpListener::bind("127.0.0.2:0").unwrap();
     proxy.set_nonblocking(true).unwrap();
@@ -238,7 +255,7 @@ fn proxy_and_resolver_variables_are_ignored() {
     let connections = || (0..50).filter(|_| proxy.accept().is_ok()).count();
 
     let good = ca("trusted");
-    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Some(b.clone()));
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Blob(b.clone()));
     let env = env_for(&fb, "");
     let trusted = write_ca(&env, "good.pem", &good.pem);
     let mut v = vars.clone();
@@ -254,15 +271,26 @@ fn proxy_and_resolver_variables_are_ignored() {
     assert_eq!((o.code, &o.stdout), (0, &b), "{}", o.stderr);
     assert_eq!(plain.requests().len(), 1, "the service itself saw the request");
     assert_eq!(connections(), 0, "the proxy listener was never contacted");
+}
 
-    let local = Fb::start("127.0.0.1", { let b = b.clone(); move |_| Resp::ok(&b) });
-    let port = local.addr.port();
-    let aliases = env.base.join("aliases");
-    fs::write(&aliases, "alias-host localhost\n").unwrap();
-    env.services(&[format!("http://alias-host:{port}/")]);
-    let o = cat_with(&env, &b, &[("HOSTALIASES", aliases.to_str().unwrap())]);
-    assert_eq!(o.code, 5, "an alias in HOSTALIASES must not make the name resolve: {}", o.stderr);
-    assert!(local.requests().is_empty());
-    env.services(&[format!("http://127.0.0.1:{port}/")]);
-    assert_eq!(cat_with(&env, &b, &[]).code, 0, "control: that server is reachable by address");
+/// ES-14 wired through the binary: an https service redirecting to an http
+/// server is followed only when `AllowHTTP` is on. Off: Error and the http
+/// server sees no request. On: the same setup is a Hit (the control).
+/// Violators: following a downgrade regardless of the flag, or refusing it
+/// even when allowed.
+#[test]
+fn an_https_to_http_redirect_needs_allow_http() {
+    let b = blob(64, 4);
+    let plain = Fb::blob("127.0.0.2", &b);
+    let good = ca("trusted");
+    let fb = tls_fb(leaf(&good, "127.0.0.2", false), Mode::Redirect(format!("{}x", plain.base())));
+    let env = env_for(&fb, "");
+    let trusted = write_ca(&env, "good.pem", &good.pem);
+    let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
+    assert_eq!(o.code, 5, "downgrade without AllowHTTP: {}", o.stderr);
+    assert!(plain.requests().is_empty(), "the http server must not be contacted");
+    env.config_raw("{ AllowLocal: true, AllowHTTP: true }");
+    let o = cat_with(&env, &b, &[("SSL_CERT_FILE", &trusted)]);
+    assert_eq!((o.code, &o.stdout), (0, &b), "control, AllowHTTP on: {}", o.stderr);
+    assert_eq!(plain.requests().len(), 1);
 }

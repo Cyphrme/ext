@@ -16,7 +16,6 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,22 +75,30 @@ enum Got {
 }
 
 fn fetch(c: &Client, uri: &str, want: &[u8], l: &Limits) -> (Got, Duration) {
+    let (g, t, _) = fetch_sink(c, uri, want, l);
+    (g, t)
+}
+
+/// As `fetch`, also returning the length of the sink file afterwards, read
+/// through a clone taken beforehand (what reached disk, whatever the outcome).
+fn fetch_sink(c: &Client, uri: &str, want: &[u8], l: &Limits) -> (Got, Duration, u64) {
     let b = c.backend(ServiceUri::parse(uri).unwrap());
-    let sink = TmpFile { file: tempfile::tempfile().unwrap(), path: PathBuf::new() };
+    let mut sink = TmpFile::anonymous(tempfile::tempfile().unwrap());
+    let probe = sink.file().try_clone().unwrap();
     let t = Instant::now();
     let r = b.fetch(&fetchable(want), l, sink);
     let took = t.elapsed();
     let got = match r {
         Fetched::Hit(mut t) => {
             let mut v = vec![];
-            t.file.seek(SeekFrom::Start(0)).unwrap();
-            t.file.read_to_end(&mut v).unwrap();
+            t.file().seek(SeekFrom::Start(0)).unwrap();
+            t.file().read_to_end(&mut v).unwrap();
             Got::Hit(v)
         }
         Fetched::Missing => Got::Missing,
         Fetched::Error(e) => Got::Error(e),
     };
-    (got, took)
+    (got, took, probe.metadata().unwrap().len())
 }
 
 fn is_err(g: &Got) -> bool {
@@ -182,7 +189,7 @@ proptest! {
         let c = local_client();
         let b = c.backend(ServiceUri::parse(&fb.base()).unwrap());
         let svc = [("svc".to_string(), &b as &dyn Backend)];
-        let mut mk = || Ok(TmpFile { file: tempfile::tempfile().unwrap(), path: PathBuf::new() });
+        let mut mk = || Ok(TmpFile::anonymous(tempfile::tempfile().unwrap()));
         let found = lookup::run(&svc, &fetchable(&good), &limits(), &mut mk).unwrap();
         let want = if served == good { Outcome::Hit } else { Outcome::Mismatch };
         prop_assert_eq!(&found.attempts[0].outcome, &want);
@@ -197,10 +204,13 @@ fn hex(h: &str) -> Vec<u8> {
 // ---------------------------------------------------------------- ES-12 ----
 
 /// ES-12 with a 64 KiB cap. Exactly the cap is accepted; one byte more is
-/// Error whether the length is claimed, chunked or absent; an endless body is
-/// cut by the cap long before the total timeout; a claimed length above the
-/// cap is Error even if the body is short. Violators: reading to EOF then
-/// checking (the endless case runs to the timeout), trusting Content-Length.
+/// Error whether the length is claimed, chunked or absent, and never more than
+/// the cap reaches the sink file; an endless body is cut by the cap long before
+/// the total timeout; a claimed length above the cap is Error even if the body
+/// is short; an honest length within the cap whose body closes early is a
+/// framing Error, not a short Hit. Violators: reading to EOF then checking
+/// (the endless case runs to the timeout), writing past the cap before
+/// failing (sink length), trusting Content-Length, accepting a truncated body.
 #[test]
 fn the_size_cap_is_enforced_by_the_client() {
     const CAP: usize = 64 << 10;
@@ -210,16 +220,22 @@ fn the_size_cap_is_enforced_by_the_client() {
     let over = blob(CAP + 1, 1);
     let serve = |b: Vec<u8>, body: fn(Vec<u8>) -> Body| Fb::start("127.0.0.2", move |_| Resp::status(200).body(body(b.clone())));
     let fb = serve(exact.clone(), Body::Bytes);
-    assert_eq!(fetch(&c, &fb.base(), &exact, &l).0, Got::Hit(exact.clone()), "exactly the cap");
+    let (g, _, len) = fetch_sink(&c, &fb.base(), &exact, &l);
+    assert_eq!((g, len), (Got::Hit(exact.clone()), CAP as u64), "exactly the cap");
     let fb = serve(over.clone(), Body::Bytes);
-    assert!(is_err(&fetch(&c, &fb.base(), &over, &l).0), "cap+1 with honest Content-Length");
+    let (g, _, len) = fetch_sink(&c, &fb.base(), &over, &l);
+    assert!(is_err(&g) && len <= CAP as u64, "cap+1 with honest Content-Length (sink {len})");
     let fb = serve(over.clone(), |b| Body::Chunked(b, 4096));
-    assert!(is_err(&fetch(&c, &fb.base(), &over, &l).0), "cap+1 without Content-Length");
+    let (g, _, len) = fetch_sink(&c, &fb.base(), &over, &l);
+    assert!(is_err(&g) && len <= CAP as u64, "cap+1 without Content-Length (sink {len})");
     let fb = Fb::start("127.0.0.2", move |_| Resp::status(200).body(Body::Lie { claimed: CAP as u64 + 1, sent: vec![1; 10] }));
-    assert!(is_err(&fetch(&c, &fb.base(), &exact, &l).0), "claim above the cap, short body");
+    let (g, _, len) = fetch_sink(&c, &fb.base(), &exact, &l);
+    assert!(is_err(&g) && len <= CAP as u64, "claim above the cap, short body");
+    let fb = Fb::start("127.0.0.2", move |_| Resp::status(200).body(Body::Lie { claimed: 100, sent: vec![1; 10] }));
+    assert!(is_err(&fetch(&c, &fb.base(), &exact, &l).0), "honest length within the cap, body closes early");
     let fb = Fb::start("127.0.0.2", |_| Resp::status(200).body(Body::Endless));
-    let (got, took) = fetch(&c, &fb.base(), &exact, &l);
-    assert!(is_err(&got));
+    let (got, took, len) = fetch_sink(&c, &fb.base(), &exact, &l);
+    assert!(is_err(&got) && len <= CAP as u64, "endless body (sink {len})");
     assert!(took < Duration::from_secs(2), "the cap, not the {:?} total timeout, ended it", l.total);
 }
 
@@ -261,12 +277,16 @@ fn idle_and_total_timeouts_hold_and_span_hops() {
     assert!(is_err(&g));
     within(t, 1400, 1500, "drip");
 
+    // The chain has its own limits: each hop (400 ms) is well inside the idle
+    // timeout, and only the sum (six requests, 2400 ms) exceeds the total, so
+    // a timer that restarts per hop never fires and the fetch wrongly succeeds.
+    let l = Limits { idle: Duration::from_millis(1000), ..l };
     let b = blob(8, 1);
     let fb = Fb::start("127.0.0.2", move |r| {
         std::thread::sleep(Duration::from_millis(400));
         let host = r.header("host").unwrap().to_string();
         match r.target.strip_prefix("/h").and_then(|n| n.parse::<u32>().ok()) {
-            Some(4) => Resp::ok(&b),
+            Some(5) => Resp::ok(&b),
             Some(n) => Resp::redirect(302, &format!("http://{host}/h{}", n + 1)),
             None => Resp::redirect(302, &format!("http://{host}/h1")),
         }
