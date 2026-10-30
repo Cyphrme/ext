@@ -133,6 +133,24 @@ fn offline_contacts_nobody_and_still_answers_locally() {
     assert_eq!(env.ext(&["cat", "--offline", &miss]).code, 1, "offline: nobody is consulted");
 }
 
+/// ES-15 with the shipped table, through the binary: a service on loopback is
+/// refused under the default `AllowLocal=false` (exit 5, nothing reached it)
+/// and used once `AllowLocal` is on. Violator: judging nothing, or judging the
+/// host text.
+#[test]
+fn loopback_services_need_allow_local() {
+    let b = blob(30, 6);
+    let fb = honest(&b);
+    let env = Env::new();
+    env.config_raw("{ AllowHTTP: true }");
+    env.services(&[fb.base()]);
+    let o = env.ext(&["cat", &label(&b)]);
+    assert_eq!(o.code, 5, "{}", o.stderr);
+    assert!(fb.requests().is_empty(), "F4: a connection to a non-global address");
+    env.config("");
+    assert_eq!(env.ext(&["cat", &label(&b)]).stdout, b, "control: AllowLocal reaches the same server");
+}
+
 // ----------------------------------------------------------------- ES-7 ----
 
 /// ES-7 end to end. The rows of the decision list through the binary, for

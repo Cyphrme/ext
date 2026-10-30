@@ -454,6 +454,25 @@ fn sweep_removes_the_dead_and_keeps_the_live() {
     assert!(young.exists());
 }
 
+/// ES-30: sweep runs at the start of every admit, so a dead temporary and an
+/// orphan are gone after an unrelated admit. Violator: sweep never invoked
+/// from admit.
+#[test]
+fn admit_sweeps_first() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let lock = f.store.lock().unwrap();
+    let mut ex = FsExecutor { store: &f.store };
+    cache.admit(&lock, &mut ex, verified(&cache, &blob(5, 1)), 1).unwrap();
+    let orphan = f.dir.join("cache/SHA-256").join(hex_name(&digest_of(b"orphan")));
+    fs::write(&orphan, b"orphan").unwrap();
+    let old = f.dir.join("cache/tmp/old");
+    fs::write(&old, b"o").unwrap();
+    backdate(&old, 300);
+    cache.admit(&lock, &mut ex, verified(&cache, &blob(5, 2)), 2).unwrap();
+    assert!(!orphan.exists() && !old.exists(), "dead files survived an admit");
+}
+
 // ----------------------------------------------------------------- ES-24 ----
 
 /// ES-24 under umask 0. Directories 0700, files 0600 with explicit modes, and
