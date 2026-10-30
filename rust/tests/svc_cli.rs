@@ -292,6 +292,46 @@ fn a_lying_service_is_skipped_and_leaves_no_trace() {
     }
 }
 
+/// ES-6: every `Mismatch` and `Error` "MUST" be reported as `SERVICE <uri>
+/// MISMATCH|ERROR` on stderr. When the sink for the next fetch cannot be made
+/// the walk ends (ES-25), but what earlier services already did stays
+/// reported. The first service lies and, in doing so, makes `cache/tmp`
+/// unwritable, so the second fetch's sink fails. Violator: dropping the
+/// attempts gathered so far when the walk ends with an error.
+#[test]
+fn a_walk_ended_by_a_sink_failure_still_reports_earlier_services() {
+    if skip_if_root("read-only cache/tmp") {
+        return;
+    }
+    let b = blob(64, 6);
+    let bad = mutations(&b).remove(0).1;
+    let env = Env::new();
+    env.config("");
+    fs::create_dir_all(env.store.join("cache/tmp")).unwrap();
+    let tmp = env.store.join("cache/tmp");
+    let liar = Fb::start("127.0.0.2", {
+        let tmp = tmp.clone();
+        move |_| {
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o500)).unwrap();
+            Resp::ok(&bad)
+        }
+    });
+    let good = honest(&b);
+    env.services(&[liar.base(), good.base()]);
+    let o = env.ext(&["cat", &label(&b)]);
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(liar.requests().len(), 1, "setup: the liar was asked");
+    assert!(good.requests().is_empty(), "setup: the walk ended early");
+    assert_eq!(o.code, 5, "{}", o.stderr);
+    assert!(
+        o.stderr
+            .lines()
+            .any(|l| l == format!("SERVICE {} MISMATCH", liar.base())),
+        "the first service's MISMATCH was lost: stderr was {:?}",
+        o.stderr
+    );
+}
+
 // ----------------------------------------------------------------- ES-11 ----
 
 /// ES-11. An indexed file changed in place (same size) is skipped and, with
