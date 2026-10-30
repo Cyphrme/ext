@@ -200,6 +200,17 @@ into unless registered (README, Technical Considerations: Recursion).
 - Why: those are anycast and protocol assignments no blob service uses, and
   denying too much is the safe direction.
 
+### Redirect Locations that only look like a scheme (differs: implementation choice)
+
+- Spec: ES-14, a `Location` "is resolved against the current URL" and must
+  satisfy the services grammar; it does not say what counts as a scheme.
+- Does: a `Location` is absolute only if the text before its first `:` is a
+  valid scheme (a letter, then letters, digits, `+`, `-`, `.`). Otherwise it is
+  a relative reference: `9:x` and `a_b:c` resolve to the paths `/9:x` and
+  `/a_b:c`. A valid scheme other than `http` or `https` is an Error.
+- Why: this is how the WHATWG URL parser reads such text, and RFC 3986 gives
+  the same reading since a scheme cannot start with a digit or contain `_`.
+
 ### `resolve` with a file name (follows: implementation choice)
 
 - Spec: ES-1 orders the layers and says nothing of names; README, Human
