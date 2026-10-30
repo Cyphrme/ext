@@ -237,11 +237,10 @@ fn a_stalled_handshake_is_cut_off() {
     assert!(o.stderr.contains(&format!("https://{}/", fb.addr)), "{}", o.stderr);
 }
 
-/// ES-17: proxy variables (any case) are not read. With every proxy variable pointing at a listener, the https fetch
-/// still succeeds and the listener sees nothing; a plain-http service under
-/// `AllowHTTP` is fetched directly too; `HOSTALIASES` mapping a bare name to
-/// `localhost` changes nothing, so that name stays unresolvable. Violators:
-/// proxy-from-environment, glibc's HOSTALIASES left in force.
+/// ES-17: proxy variables (any case) are not read. With every proxy variable
+/// pointing at a listener, the https fetch still succeeds and the listener
+/// sees nothing; a plain-http service under `AllowHTTP` is fetched directly
+/// too. Violator: proxy-from-environment.
 #[test]
 fn proxy_variables_are_ignored() {
     let b = blob(64, 3);
