@@ -1,8 +1,8 @@
 //! The TLS path of the shipped binary (ES-17). The binary trusts the platform
 //! store, and `SSL_CERT_FILE` and `SSL_CERT_DIR` are the only variables that may
-//! change it, so a
-//! throwaway CA made at test time (rcgen) can be trusted by the real `ext`
-//! with no test-only seam in the binary. Servers are rustls over loopback.
+//! change it, so a throwaway CA made at test time (rcgen) can be trusted by the
+//! real `ext` with no test-only seam in the binary. Servers are rustls over
+//! loopback.
 //!
 //! Run: `cargo test --test svc_tls`.
 
@@ -109,11 +109,7 @@ enum Mode {
 }
 
 fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
-    tls_fb_at("127.0.0.2", l, mode)
-}
-
-fn tls_fb_at(bind: &str, l: Leaf, mode: Mode) -> TlsFb {
-    tls_fb_on(vec![TcpListener::bind((bind, 0)).unwrap()], l, mode)
+    tls_fb_on(vec![TcpListener::bind(("127.0.0.2", 0)).unwrap()], l, mode)
 }
 
 /// Serves on 127.0.0.1 and [::1] at one port, so a name that resolves to
@@ -185,17 +181,17 @@ fn tls_fb_on(listeners: Vec<TcpListener>, l: Leaf, mode: Mode) -> TlsFb {
                         }
                         Mode::Hop(b) => {
                             let _ = write!(
-                            s,
-                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                            b.len()
-                        );
+                                s,
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                                b.len()
+                            );
                             let _ = s.write_all(b);
                         }
                         Mode::HopChunked(b) => {
                             let _ = write!(
-                            s,
-                            "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
-                        );
+                                s,
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
+                            );
                             for ch in b.chunks(7) {
                                 let _ = write!(s, "{:x}\r\n", ch.len());
                                 let _ = s.write_all(ch);
@@ -208,10 +204,10 @@ fn tls_fb_on(listeners: Vec<TcpListener>, l: Leaf, mode: Mode) -> TlsFb {
                         }
                         Mode::Blob(b) => {
                             let _ = write!(
-                            s,
-                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
-                            b.len()
-                        );
+                                s,
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                                b.len()
+                            );
                             let _ = s.write_all(b);
                         }
                         Mode::Stall => {}
