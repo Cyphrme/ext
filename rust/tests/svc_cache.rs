@@ -1,0 +1,485 @@
+//! The blob cache at library level: crash-state invariants through the step
+//! executor (ES-8, ES-25), eviction against a reference model (ES-26), the
+//! ES-10 record test, ES-27 touch, ES-30 sweep and ES-24 names and modes.
+//!
+//! Run: `cargo test --test svc_cache`. All tests here run under umask 0, so a
+//! file created with default modes shows up as world-writable.
+
+mod svc;
+
+use ext::cache::{Cache, Effect, FsExecutor, Record, StepExecutor, Verified};
+use ext::digest::{Digest, Enc};
+use ext::store::Store;
+use proptest::prelude::*;
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Once};
+use std::time::{Duration, SystemTime};
+use svc::*;
+
+fn umask0() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        rustix::process::umask(rustix::fs::Mode::empty());
+    });
+}
+
+struct Fixture {
+    _t: tempfile::TempDir,
+    dir: PathBuf,
+    store: Store,
+}
+
+fn fixture() -> Fixture {
+    umask0();
+    let t = tempfile::tempdir().unwrap();
+    // tempfile relies on the umask for the directory mode.
+    fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = fs::canonicalize(t.path()).unwrap().join("store");
+    let store = Store::init_bare(&dir).unwrap();
+    Fixture { _t: t, dir, store }
+}
+
+/// A candidate in `cache/tmp/` that verified against its own digest.
+fn verified(cache: &Cache, content: &[u8]) -> Verified {
+    let mut tmp = cache.create_tmp().expect("tmp file");
+    tmp.file.write_all(content).unwrap();
+    Verified::check(tmp, &fetchable(content)).expect("honest content verifies")
+}
+
+/// Drops effect `at` and everything after it, silently, including the
+/// implementation's own cleanup: a killed process. Logs what ran.
+struct Crash<'a> {
+    inner: FsExecutor<'a>,
+    at: usize,
+    seen: usize,
+    log: Vec<&'static str>,
+}
+
+impl<'a> Crash<'a> {
+    fn new(store: &'a Store, at: usize) -> Crash<'a> {
+        Crash { inner: FsExecutor { store }, at, seen: 0, log: vec![] }
+    }
+}
+
+fn kind(e: &Effect) -> &'static str {
+    match e {
+        Effect::Write { .. } => "write",
+        Effect::Fsync { .. } => "fsync",
+        Effect::Rename { .. } => "rename",
+        Effect::Commit { .. } => "commit",
+        Effect::Unlink { .. } => "unlink",
+    }
+}
+
+impl StepExecutor for Crash<'_> {
+    fn step(&mut self, e: &Effect) -> std::io::Result<()> {
+        self.seen += 1;
+        if self.seen > self.at {
+            return Ok(());
+        }
+        self.inner.step(e)?;
+        self.log.push(kind(e));
+        Ok(())
+    }
+}
+
+fn hex_name(d: &Digest) -> String {
+    d.encode(Enc::Hex)
+}
+
+/// F1, F2 and F10 on disk: every record has a regular file of its size whose
+/// independently computed hash is its name, and no final-named file anywhere
+/// has a name that differs from its hash. Orphans (file, no record) are legal.
+fn assert_cache_invariants(f: &Fixture) {
+    let store = Store::open(&f.dir).unwrap();
+    let cache = Cache::new(&store, u64::MAX);
+    for r in cache.records().unwrap() {
+        let p = f.dir.join("cache/SHA-256").join(hex_name(&r.digest));
+        let data = fs::read(&p).unwrap_or_else(|e| panic!("F1: record {} without file: {e}", hex_name(&r.digest)));
+        assert_eq!(data.len() as u64, r.size, "record size vs file size");
+        assert_eq!(sha256_hex(&data), hex_name(&r.digest), "F2: file does not hash to its name");
+    }
+    if let Ok(rd) = fs::read_dir(f.dir.join("cache/SHA-256")) {
+        for e in rd.flatten() {
+            let data = fs::read(e.path()).unwrap();
+            assert_eq!(sha256_hex(&data), e.file_name().to_string_lossy(), "F10: final name with other content");
+        }
+    }
+}
+
+// ----------------------------------------------------------- ES-8, ES-25 ----
+
+/// ES-8, ES-25, F1, F10. Admit is killed before each of its effects in turn:
+/// every intermediate state satisfies the invariants, the effects run in the
+/// required order, and a later uncrashed admit converges to one record.
+/// Violators: record inserted before the rename (red when killed between),
+/// rename before fsync (red on order), the final name written then verified.
+#[test]
+fn admit_killed_at_any_effect_leaves_a_consistent_cache() {
+    for content in [blob(0, 1), blob(1, 1), blob(4097, 2)] {
+        let order = ["fsync", "rename", "commit"];
+        let n = {
+            let f = fixture();
+            let cache = Cache::new(&f.store, 1 << 20);
+            let lock = f.store.lock().unwrap();
+            let mut ex = Crash::new(&f.store, usize::MAX);
+            cache.admit(&lock, &mut ex, verified(&cache, &content), 10).expect("admit");
+            assert_eq!(ex.log, order, "admit effects, in program order");
+            drop(lock);
+            assert_cache_invariants(&f);
+            assert_eq!(cache.records().unwrap().len(), 1);
+            ex.log.len()
+        };
+        for k in 0..n {
+            let f = fixture();
+            let cache = Cache::new(&f.store, 1 << 20);
+            let lock = f.store.lock().unwrap();
+            let mut ex = Crash::new(&f.store, k);
+            let _ = cache.admit(&lock, &mut ex, verified(&cache, &content), 10);
+            assert_eq!(ex.log, order[..k], "killed before effect {k}");
+            drop(lock);
+            assert_cache_invariants(&f);
+            // The next run (sweep is part of admit) must converge.
+            let lock = f.store.lock().unwrap();
+            let mut fs_ex = FsExecutor { store: &f.store };
+            cache.admit(&lock, &mut fs_ex, verified(&cache, &content), 11).expect("recovery admit");
+            drop(lock);
+            assert_cache_invariants(&f);
+            assert_eq!(cache.records().unwrap().len(), 1, "killed at {k}: one record after recovery");
+        }
+    }
+}
+
+/// ES-25 for eviction: record delete is committed before the file is
+/// unlinked, so a kill between leaves an orphan, never a dangling record.
+/// Violator: unlink first, then delete the record.
+#[test]
+fn eviction_killed_at_any_effect_never_leaves_a_dangling_record() {
+    let (a, b) = (blob(10, 1), blob(10, 2));
+    let probe = |at: usize| {
+        let f = fixture();
+        let cache = Cache::new(&f.store, 15); // room for one
+        let lock = f.store.lock().unwrap();
+        let mut fs_ex = FsExecutor { store: &f.store };
+        cache.admit(&lock, &mut fs_ex, verified(&cache, &a), 1).unwrap();
+        let mut ex = Crash::new(&f.store, at);
+        let _ = cache.admit(&lock, &mut ex, verified(&cache, &b), 2);
+        drop(lock);
+        assert_cache_invariants(&f);
+        (ex.log.clone(), cache.records().unwrap(), f)
+    };
+    let (full, recs, f) = probe(usize::MAX);
+    assert_eq!(full, ["fsync", "rename", "commit", "unlink"], "evicted file is unlinked after the commit");
+    assert_eq!(recs.iter().map(|r| r.digest.clone()).collect::<Vec<_>>(), [digest_of(&b)]);
+    assert!(!f.dir.join("cache/SHA-256").join(hex_name(&digest_of(&a))).exists());
+    for k in 0..full.len() {
+        probe(k);
+    }
+}
+
+// ----------------------------------------------------------------- ES-26 ----
+
+#[derive(Clone, Debug)]
+enum Op {
+    Admit(usize),
+    Touch(usize, u8), // now = running max minus this much, saturating
+}
+
+/// Replays `ops` against the cache and a reference model and compares the
+/// resident set after every operation. `sizes[i]` is the size of blob i.
+fn check_model(cap: u64, sizes: &[usize], ops: &[Op], ties: bool) {
+    let f = fixture();
+    let cache = Cache::new(&f.store, cap);
+    let blobs: Vec<Vec<u8>> = sizes.iter().enumerate().map(|(i, n)| blob(*n, 40 + i as u8)).collect();
+    let digests: Vec<Digest> = blobs.iter().map(|b| digest_of(b)).collect();
+    let mut model: BTreeMap<Digest, (u64, i64)> = BTreeMap::new();
+    let mut clock = 1_000i64;
+    for op in ops {
+        match op {
+            Op::Admit(i) => {
+                if !ties {
+                    clock += 1;
+                }
+                let lock = f.store.lock().unwrap();
+                let mut ex = FsExecutor { store: &f.store };
+                cache.admit(&lock, &mut ex, verified(&cache, &blobs[*i]), clock).unwrap();
+                drop(lock);
+                let e = model.entry(digests[*i].clone()).or_insert((sizes[*i] as u64, clock));
+                e.1 = e.1.max(clock);
+                // Reference eviction: oldest (atime, digest) first, never the new one.
+                while model.values().map(|v| v.0).sum::<u64>() > cap {
+                    let victim = model
+                        .iter()
+                        .filter(|(d, _)| **d != digests[*i])
+                        .min_by(|a, b| (a.1 .1, a.0).cmp(&(b.1 .1, b.0)))
+                        .map(|(d, _)| d.clone())
+                        .expect("a blob larger than the capacity cannot occur");
+                    model.remove(&victim);
+                }
+            }
+            Op::Touch(i, back) => {
+                let now = clock - i64::from(*back);
+                // Touching a digest that is not resident is not what this checks.
+                let _ = cache.touch(&digests[*i], now);
+                if let Some(e) = model.get_mut(&digests[*i]) {
+                    e.1 = e.1.max(now);
+                }
+            }
+        }
+        let mut got: Vec<Record> = cache.records().unwrap();
+        got.sort_by(|a, b| a.digest.cmp(&b.digest));
+        let want: Vec<Record> = model
+            .iter()
+            .map(|(d, (s, a))| Record { digest: d.clone(), size: *s, atime_ns: *a })
+            .collect();
+        assert_eq!(got, want, "after {op:?}");
+        assert!(got.iter().map(|r| r.size).sum::<u64>() <= cap);
+        assert_cache_invariants(&f);
+        let files = fs::read_dir(f.dir.join("cache/SHA-256")).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(files, got.len(), "files on disk equal records");
+    }
+}
+
+fn ops(ids: usize) -> impl Strategy<Value = Vec<Op>> {
+    prop::collection::vec(
+        prop_oneof![
+            3 => (0..ids).prop_map(Op::Admit),
+            2 => (0..ids, 0u8..40).prop_map(|(i, b)| Op::Touch(i, b)),
+        ],
+        1..24,
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+    /// ES-26 against a reference model, with forced equal atimes (the tie-break
+    /// is the only thing ordering them), backward touch clocks and
+    /// re-admission. Violators: eviction by insertion order, ignoring the
+    /// digest tie-break, over-evicting, evicting the blob just admitted,
+    /// counting `tmp/` in the sum.
+    #[test]
+    fn resident_set_equals_the_reference_model(
+        sizes in prop::collection::vec(1usize..40, 4),
+        ops in ops(4),
+        ties in any::<bool>(),
+    ) {
+        check_model(60, &sizes, &ops, ties);
+    }
+}
+
+/// ES-26 mandatory boundaries: capacity 1 byte, a blob exactly the capacity
+/// (it must push out everything else), and the empty blob (size 0 costs
+/// nothing and is never a victim that matters).
+#[test]
+fn eviction_boundaries() {
+    use Op::*;
+    check_model(1, &[1, 1, 1], &[Admit(0), Admit(1), Admit(0), Admit(2)], false);
+    check_model(50, &[10, 10, 50, 10], &[Admit(0), Admit(1), Admit(2), Admit(3)], false);
+    check_model(10, &[10, 10], &[Admit(0), Touch(0, 5), Admit(1), Admit(0)], true);
+}
+
+#[test]
+fn the_empty_blob_is_cacheable_and_free() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 5);
+    let lock = f.store.lock().unwrap();
+    let mut ex = FsExecutor { store: &f.store };
+    cache.admit(&lock, &mut ex, verified(&cache, b""), 1).unwrap();
+    cache.admit(&lock, &mut ex, verified(&cache, &blob(5, 3)), 2).unwrap();
+    drop(lock);
+    let sizes: Vec<u64> = cache.records().unwrap().iter().map(|r| r.size).collect();
+    assert_eq!(sizes.len(), 2, "a zero-size record does not count against the capacity: {sizes:?}");
+    assert_cache_invariants(&f);
+}
+
+// ----------------------------------------------------------------- ES-10 ----
+
+/// Runs `f` on another thread while this one holds the store lock, and fails
+/// if it does not finish in time: the shape of "must not wait on the lock".
+fn while_locked<T: Send>(store: &Store, f: impl FnOnce() -> T + Send) -> T {
+    let lock = store.lock().unwrap();
+    std::thread::scope(|s| {
+        let (tx, rx) = mpsc::channel();
+        s.spawn(move || tx.send(f()).ok());
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(v) => {
+                drop(lock);
+                v
+            }
+            Err(_) => {
+                drop(lock); // let the blocked thread finish so the scope can end
+                panic!("blocked on the store lock for 2 s");
+            }
+        }
+    })
+}
+
+/// ES-10 and ES-27. A cache record answers only through a regular file of the
+/// recorded size, opened without following symlinks; the rest is a miss that
+/// evicts when the lock is free. `resolve` does not hash. Violators: trusting
+/// the record blindly, following a symlink (and deleting its target),
+/// hashing on lookup (red on `same size, other bytes`), evicting without the
+/// lock, or waiting for a busy lock.
+#[test]
+fn cache_lookup_requires_a_regular_file_of_the_recorded_size() {
+    type Tamper = fn(&Path, &Path);
+    let cases: Vec<(&str, Tamper, bool)> = vec![
+        ("intact", |_, _| {}, true),
+        ("same size, other bytes", |p, _| fs::write(p, blob(100, 99)).unwrap(), true),
+        ("missing", |p, _| fs::remove_file(p).unwrap(), false),
+        ("wrong size", |p, _| fs::write(p, blob(99, 1)).unwrap(), false),
+        ("symlink to a right-size file", |p, aside| {
+            fs::write(aside, blob(100, 1)).unwrap();
+            fs::remove_file(p).unwrap();
+            symlink(aside, p).unwrap();
+        }, false),
+        ("directory", |p, _| {
+            fs::remove_file(p).unwrap();
+            fs::create_dir(p).unwrap();
+        }, false),
+    ];
+    for (name, tamper, hit) in cases {
+        let f = fixture();
+        let cache = Cache::new(&f.store, 1 << 20);
+        let content = blob(100, 1);
+        let d = digest_of(&content);
+        let lock = f.store.lock().unwrap();
+        let mut ex = FsExecutor { store: &f.store };
+        cache.admit(&lock, &mut ex, verified(&cache, &content), 1).unwrap();
+        drop(lock);
+        let file = f.dir.join("cache/SHA-256").join(hex_name(&d));
+        let aside = f.dir.join("aside");
+        tamper(&file, &aside);
+        let aside_existed = aside.exists();
+
+        // A busy lock: a miss, no eviction, no wait.
+        if !hit {
+            let got = while_locked(&f.store, || cache.lookup(&d, &mut FsExecutor { store: &f.store }).unwrap());
+            assert_eq!(got, None, "{name}: busy lock");
+            assert_eq!(cache.records().unwrap().len(), 1, "{name}: not evicted while the lock is busy");
+        }
+        let got = cache.lookup(&d, &mut FsExecutor { store: &f.store }).unwrap();
+        if hit {
+            assert_eq!(got.as_deref(), Some(file.as_path()), "{name}");
+            assert_eq!(cache.records().unwrap().len(), 1);
+        } else {
+            assert_eq!(got, None, "{name}");
+            assert!(cache.records().unwrap().is_empty(), "{name}: record evicted");
+            if name != "directory" {
+                assert!(fs::symlink_metadata(&file).is_err(), "{name}: file evicted");
+            }
+            if aside_existed {
+                assert!(aside.exists(), "{name}: a symlink's target is never touched");
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------- ES-27 ----
+
+/// ES-27. `atime := max(now, atime)`, and a touch against a busy lock is
+/// skipped immediately. Violators: `atime := now` (a backward clock lowers
+/// it), blocking acquisition, failing the lookup on a busy lock.
+#[test]
+fn touch_is_monotone_and_never_waits() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let content = blob(8, 1);
+    let d = digest_of(&content);
+    let lock = f.store.lock().unwrap();
+    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 500).unwrap();
+    drop(lock);
+    let atime = || cache.records().unwrap()[0].atime_ns;
+    assert!(cache.touch(&d, 900).unwrap());
+    assert_eq!(atime(), 900);
+    cache.touch(&d, 100).unwrap();
+    assert_eq!(atime(), 900, "a touch never lowers atime");
+    let skipped = while_locked(&f.store, || cache.touch(&d, 5_000).unwrap());
+    assert!(!skipped, "busy lock: skipped, reported");
+    assert_eq!(atime(), 900);
+}
+
+// ----------------------------------------------------------------- ES-30 ----
+
+fn backdate(p: &Path, secs: u64) {
+    let f = fs::OpenOptions::new().write(true).open(p).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(secs)).unwrap();
+}
+
+/// ES-30. Sweep removes orphans and unlocked temporaries older than 60 s, and
+/// keeps a young one and a live (locked) one even when its mtime is old: the
+/// flock protects it, not the age. Violators: deleting by age alone (the live
+/// backdated file disappears), deleting every temporary, never sweeping.
+#[test]
+fn sweep_removes_the_dead_and_keeps_the_live() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let keep = blob(20, 1);
+    let lock = f.store.lock().unwrap();
+    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &keep), 1).unwrap();
+    drop(lock);
+
+    let tmp = f.dir.join("cache/tmp");
+    let orphan = f.dir.join("cache/SHA-256").join(hex_name(&digest_of(b"orphan")));
+    fs::write(&orphan, b"orphan").unwrap();
+    let live = cache.create_tmp().unwrap(); // locked for its fetch's life
+    backdate(&live.path, 300);
+    let young = tmp.join("young");
+    let old = tmp.join("old");
+    fs::write(&young, b"y").unwrap();
+    fs::write(&old, b"o").unwrap();
+    backdate(&old, 300);
+
+    let sweep = |cache: &Cache| {
+        let lock = f.store.lock().unwrap();
+        cache.sweep(&lock, &mut FsExecutor { store: &f.store }, SystemTime::now()).unwrap();
+    };
+    sweep(&cache);
+    assert!(!orphan.exists(), "orphan file removed");
+    assert!(!old.exists(), "unlocked stale temporary removed");
+    assert!(young.exists(), "a temporary younger than 60 s survives (create-then-lock window)");
+    assert!(live.path.exists(), "a locked temporary survives whatever its age");
+    assert_eq!(cache.records().unwrap().len(), 1);
+    assert_cache_invariants(&f);
+
+    // The fetch dies (its lock goes with it); once old enough the file is dead.
+    let dead = live.path.clone();
+    drop(live);
+    sweep(&cache);
+    assert!(!dead.exists(), "after its owner died, the old temporary is removed");
+    assert!(young.exists());
+}
+
+// ----------------------------------------------------------------- ES-24 ----
+
+/// ES-24 under umask 0. Directories 0700, files 0600 with explicit modes, and
+/// the final name is a function of the digest alone, uppercase hex. Violators:
+/// default modes (0777/0666 under this umask), lowercase hex, any name from
+/// other data.
+#[test]
+fn cache_paths_and_modes_are_explicit() {
+    let f = fixture();
+    let cache = Cache::new(&f.store, 1 << 20);
+    let content = b"abc".to_vec();
+    let tmp = cache.create_tmp().unwrap();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&tmp.path), 0o600, "in-flight file");
+    drop(tmp);
+    let lock = f.store.lock().unwrap();
+    cache.admit(&lock, &mut FsExecutor { store: &f.store }, verified(&cache, &content), 1).unwrap();
+    drop(lock);
+    let rel = Cache::relative_path(&digest_of(&content));
+    assert_eq!(
+        rel,
+        Path::new("cache/SHA-256/BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD")
+    );
+    let final_path = f.dir.join(&rel);
+    assert_eq!(mode(&final_path), 0o600);
+    for d in ["cache", "cache/SHA-256", "cache/tmp"] {
+        assert_eq!(mode(&f.dir.join(d)), 0o700, "{d}");
+    }
+}
