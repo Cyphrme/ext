@@ -993,3 +993,76 @@ fn service_max_size_may_not_exceed_cache_capacity() {
     );
     assert!(ext::config::parse(b"{ CacheCapacity: 10, ServiceMaxSize: 10 }").is_ok());
 }
+
+/// ES-25 with a write-ahead log the store's owner never checkpointed: a
+/// crash, or a store made read-only (or bind-mounted read-only) while live,
+/// leaves committed rows only in `index.db-wal`. A read-only `resolve` must
+/// see them, or fail loudly; it must never answer "absent" (exit 1).
+/// Violator: a read-only open that ignores the WAL (SQLite `immutable`).
+#[test]
+fn a_read_only_store_reads_its_uncheckpointed_wal() {
+    if skip_if_root("read-only store") {
+        return;
+    }
+    let env = setup(&[]);
+    // A second connection keeps the WAL from being checkpointed and removed
+    // when ext closes its own.
+    let holder = rusqlite::Connection::open(env.store.join("index.db")).unwrap();
+    holder
+        .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))
+        .unwrap();
+    // An open read transaction pins the old snapshot, so ext's closing
+    // checkpoint cannot move the new rows into index.db.
+    holder.execute_batch("BEGIN").unwrap();
+    let _: i64 = holder
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+        .unwrap();
+    let b = blob(10, 1);
+    let p = env.index_file("f", &b);
+    let wal = env.store.join("index.db-wal");
+    assert!(
+        fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+        "fixture: the record must be in a non-empty WAL: {:?}",
+        fs::read_dir(&env.store)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), e.metadata().unwrap().len())
+            })
+            .collect::<Vec<_>>()
+    );
+    let found_or_loud = |o: &Out, what: &str| {
+        assert_ne!(o.code, 1, "{what}: answered absent: {}", o.stderr);
+        if o.code == 0 {
+            assert!(
+                String::from_utf8_lossy(&o.stdout).contains(p.to_str().unwrap()),
+                "{what}"
+            );
+        } else {
+            assert!(!o.stderr.is_empty(), "{what}: failed without saying why");
+        }
+    };
+
+    fs::set_permissions(&env.store, fs::Permissions::from_mode(0o500)).unwrap();
+    let with_shm = env.ext(&["resolve", &label(&b)]);
+    fs::set_permissions(&env.store, fs::Permissions::from_mode(0o700)).unwrap();
+    found_or_loud(&with_shm, "WAL and -shm present");
+    assert_eq!(
+        with_shm.code, 0,
+        "with its -shm the WAL is readable: {}",
+        with_shm.stderr
+    );
+
+    // The same files without the -shm, which a read-only directory cannot
+    // recreate.
+    let env2 = setup(&[]);
+    for f in ["index.db", "index.db-wal"] {
+        fs::copy(env.store.join(f), env2.store.join(f)).unwrap();
+    }
+    fs::copy(env.store.join("registry"), env2.store.join("registry")).unwrap();
+    fs::set_permissions(&env2.store, fs::Permissions::from_mode(0o500)).unwrap();
+    let no_shm = env2.ext(&["resolve", &label(&b)]);
+    fs::set_permissions(&env2.store, fs::Permissions::from_mode(0o700)).unwrap();
+    found_or_loud(&no_shm, "WAL without -shm");
+    drop(holder);
+}
