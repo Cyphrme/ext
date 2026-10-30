@@ -1189,3 +1189,83 @@ fn lookup_does_not_open_a_fifo() {
     assert!(!opened, "lookup opened the FIFO (a reader appeared)");
     assert!(matches!(got, Ok(None)), "a FIFO is a miss");
 }
+
+/// ES-30 with ES-26: sweep runs at the start of every admit, and an orphan
+/// is nothing worse than a leftover. Two record-less files and two dead
+/// temporaries exist; over every non-empty subset whose unlink the OS
+/// refuses, admit still succeeds and records the new blob, the refused
+/// entries stay in place and the others are swept. Violator: `ex.step(Unlink)?`
+/// in `sweep`, which lets one stubborn orphan fail every later admit.
+#[test]
+fn a_sweep_that_cannot_remove_an_orphan_leaves_it_and_admits() {
+    let new = blob(30, 99);
+    for mask in 1u8..16 {
+        let f = fixture();
+        let cache = Cache::new(&f.store, 1 << 20);
+        let lock = f.store.lock().unwrap();
+        // Seed the directories, then plant the sweepable entries.
+        let seed = blob(5, 1);
+        cache
+            .admit(
+                &lock,
+                &mut FsExecutor { store: &f.store },
+                verified(&cache, &seed),
+                1,
+            )
+            .unwrap();
+        let mut planted: Vec<PathBuf> = vec![];
+        for i in 0..2u8 {
+            let content = blob(7, 40 + i);
+            let p = f
+                .dir
+                .join("cache/SHA-256")
+                .join(hex_name(&digest_of(&content)));
+            fs::write(&p, content).unwrap();
+            planted.push(p);
+        }
+        for i in 0..2 {
+            let p = f.dir.join("cache/tmp").join(format!("dead{i}"));
+            fs::write(&p, b"x").unwrap();
+            backdate(&p, 300);
+            planted.push(p);
+        }
+        let refused: Vec<usize> = (0..4).filter(|i| mask >> i & 1 == 1).collect();
+        let names = refused
+            .iter()
+            .map(|&i| {
+                planted[i]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let mut ex = Refuse::new(&f.store, "unlink", names);
+        let r = cache.admit(&lock, &mut ex, verified(&cache, &new), 10);
+        assert!(
+            r.is_ok(),
+            "mask {mask:04b}: an unremovable orphan failed the admit: {r:?}"
+        );
+        assert_eq!(ex.refused, refused.len(), "mask {mask:04b}: setup");
+        drop(lock);
+        assert!(cache
+            .records()
+            .unwrap()
+            .iter()
+            .any(|r| r.digest == digest_of(&new)));
+        for (i, p) in planted.iter().enumerate() {
+            assert_eq!(
+                p.exists(),
+                refused.contains(&i),
+                "mask {mask:04b}: {} should be {}",
+                p.display(),
+                if refused.contains(&i) {
+                    "left"
+                } else {
+                    "swept"
+                }
+            );
+        }
+        assert_cache_invariants(&f);
+    }
+}
