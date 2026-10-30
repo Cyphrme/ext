@@ -94,8 +94,10 @@ MAY make `ext` abort early, and then only to `Error`, never to `Hit`.
 
 **ES-10** On `resolve`, a cache record is an answer only if its file is a
 regular file (opened without following symlinks) whose size equals the
-record's size. Otherwise the record and file are evicted when the lock is
-available and the lookup continues as a miss. `resolve` does not hash cache or
+record's size. Otherwise the record is removed, and the file with it when it
+is a regular file, when the lock is available, and the lookup continues as a
+miss. A directory or other non-regular file found where a cache file should be
+is left in place; only its record is removed. `resolve` does not hash cache or
 index hits; the store's protection is the trust boundary (README, Trust).
 
 **ES-11** `ext cat` MUST hash in full every blob it returns, on every layer
@@ -117,8 +119,9 @@ read more than `ServiceMaxSize` + 1 bytes of body (the extra byte shows the
 body is too long), counted by `ext` itself. A body longer than the limit, or a
 `Content-Length` above it, is `Error`.
 
-**ES-13** Each service attempt MUST end by `ServiceIdleTimeout` of no body
-progress and by `ServiceTimeout` of total elapsed time (name resolution,
+**ES-13** Each service attempt MUST end by `ServiceIdleTimeout` of no progress
+in any phase (connect, the TLS handshake, waiting for response headers and the
+body) and by `ServiceTimeout` of total elapsed time (name resolution,
 connect, TLS, every redirect hop and the body). A backstop applies to DNS only
 where the resolver can be bounded. Both limits are enforced by `ext`, not left
 to the HTTP library's defaults.
@@ -206,20 +209,23 @@ line        = base / template
 base        = scheme "://" host [":" port] path          ; no "?" and no "#"
 template    = scheme "://" host [":" port] path-q        ; contains {digest} or {hex}
 scheme      = "https" / "http"                          ; lowercased on parse
-host        = reg-name / IPv4address / "[" IPv6address "]"   ; RFC 3986; lowercased on parse
-port        = 1*5DIGIT                                  ; 1..65535
+host        = dns-name / IPv4address / "[" IPv6address "]"   ; non-empty; lowercased on parse
+dns-name    = 1*( ALPHA / DIGIT / "-" / "." )           ; no "%", no sub-delims
+port        = %x31-39 0*4DIGIT                          ; 1..65535, no leading zeros
 path        = *( "/" / pchar )
 path-q      = *( "/" / "?" / pchar / placeholder )
 placeholder = "{alg}" / "{digest}" / "{hex}"
 ```
 
-`pchar`, `reg-name` and the address productions are RFC 3986's. There is no
+`pchar`, `IPv4address` and `IPv6address` are RFC 3986's. There is no
 userinfo. A line is at most 2048 bytes. A line equal to an earlier line after
 lowercasing scheme and host is a parse error; `https://h` and `https://h/` are
 different lines. Any other `{...}` is rejected.
 
 **ES-21** The parser MUST accept exactly a line satisfying the grammar and
-reject everything else with exit 4 naming the file and the 1-based line number.
+reject everything else with exit 4. The error message is
+`services:<line>: <reason>`, with a 1-based line number and the reason escaped
+per ES-19. An empty host and a port with leading zeros are rejected.
 
 **ES-22** `ext -r <arg>`: `arg` is a service if and only if it matches
 `^[A-Za-z][A-Za-z0-9+.-]*://`; otherwise it is a path (a relative path that
@@ -264,7 +270,9 @@ Transitions, each under the store lock (fetching never holds it, ES-29):
 - **admit**: write a temporary file, fsync, rename it to the final name, then
   in one transaction insert the record and evict until ES-26 holds.
 - **evict**: delete the record (commit), then unlink the file.
-- **touch**: `atime := max(now, atime)`.
+- **touch**: `atime := max(now, atime)`. Touching a digest with no record is
+  a no-op. Admitting a digest that is already resident likewise sets
+  `atime := max(old, now)`.
 - **sweep**: delete files without a record and unlocked stale temporary files.
 
 **ES-24** Cache directories MUST be created 0700 and files 0600 with explicit
@@ -277,7 +285,12 @@ from its name. An orphan file is permitted. Power loss is not claimed. If the
 verified blob cannot be admitted (read-only store, lock unavailable for the 5 s
 busy timeout, no space) the lookup (`resolve` or `cat`) stops with exit 5 and a
 clear error, no later service is tried, nothing is delivered and nothing
-partial remains. Temporary files MUST be removed on every error path.
+partial remains, unless an earlier row of the ES-7 list (exit 2) matches: the
+ES-7 order governs. Temporary files MUST be removed on every error path. A
+read-only store supports reads only: a lookup answered from the local index
+(`resolve`, or `cat --offline` of an indexed file) MUST succeed on one, and
+only the writes (private copy, admission, touch, eviction) are unsupported
+there.
 
 **ES-26** After every command, the sum of record sizes is at most
 `CacheCapacity` and the files under `cache/` excluding `tmp/` total no more,
@@ -306,14 +319,16 @@ remove an older one whose process died. Each temporary file is `flock`ed by its
 fetch; the age floor covers the window between creating a file and locking it.
 
 **ES-31** `ServiceMaxSize` MUST be at most `CacheCapacity`, else the config is
-exit 4. Config keys (flat JSON5, as in the README) and their defaults:
+exit 4. Config keys (flat JSON5, as in the README) and their defaults.
+`CacheCapacity` and `ServiceMaxSize` are integers in bytes; `ServiceTimeout`
+and `ServiceIdleTimeout` are integers in milliseconds.
 
 | Key | Default |
 |---|---|
-| `CacheCapacity` | 1 GiB |
-| `ServiceMaxSize` | 256 MiB |
-| `ServiceTimeout` | 600 s |
-| `ServiceIdleTimeout` | 30 s |
+| `CacheCapacity` | 1073741824 (1 GiB) |
+| `ServiceMaxSize` | 268435456 (256 MiB) |
+| `ServiceTimeout` | 600000 (600 s) |
+| `ServiceIdleTimeout` | 30000 (30 s) |
 | `AllowHTTP` | false |
 | `AllowLocal` | false |
 

@@ -307,11 +307,13 @@ The config file is saved as <extant_path>/config. Its format is JSON5.
 - CompareCtimeInode - True - Compare ctime, inode and dev when deciding to skip a file
   (see Incrementality).
 - UnregisterDeleted - True - Unregister a deleted root (see docs/traversal.md).
-- CacheCapacity - 1 GiB - Cache size limit in bytes.
-- ServiceMaxSize - 256 MiB - Largest blob fetched from a service. At most
-  `CacheCapacity`.
-- ServiceTimeout - 600 s - Total time allowed for one service attempt.
-- ServiceIdleTimeout - 30 s - Time allowed without body progress.
+- CacheCapacity - 1073741824 - Cache size limit, integer bytes (1 GiB).
+- ServiceMaxSize - 268435456 - Largest blob fetched from a service, integer
+  bytes (256 MiB). At most `CacheCapacity`.
+- ServiceTimeout - 600000 - Total time allowed for one service attempt,
+  integer milliseconds (600 s).
+- ServiceIdleTimeout - 30000 - Time allowed without progress in any phase,
+  integer milliseconds (30 s).
 - AllowHTTP  - False - Permit `http` services and `https` to `http` redirects.
 - AllowLocal - False - Permit services at loopback or other local addresses.
 
