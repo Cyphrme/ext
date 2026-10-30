@@ -167,17 +167,19 @@ certificate loader, and MUST NOT come from a list compiled into `ext`, so that
 root updates and distrust of a CA are the platform's concern and not a release
 of `ext`. `SSL_CERT_FILE` and `SSL_CERT_DIR` are the only environment variables
 that may alter the trust roots, and only through that loader. When either is
-set, the loader's result is used as it returns it; if it yields no usable root,
-or the named file or directory cannot be read, the attempt is `Error` naming
-the cause (ES-19 applies to the path) and there is no fallback to any other
-root source. `ext` MUST NOT read any other environment variable or config key
-that alters trust, routing or name resolution, and MUST NOT log TLS key
-material (`SSLKEYLOGFILE` is ignored). In particular the proxy variables
-(`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, in any case) and the
-resolver-altering variables (`RES_OPTIONS`, `HOSTALIASES`, `LOCALDOMAIN` and
-the like) are ignored, so ES-15 is judged on the real peer. `AllowHTTP` and
-`AllowLocal` are settable only in the config file, never by flag or
-environment.
+set, any error the loader reports for a named source (an unreadable file or
+directory entry, or a malformed certificate) makes the attempt `Error` naming
+the source, even if other roots loaded; entries in a format the loader does not
+recognise are not errors. If the loader yields no usable root, or the named
+file or directory cannot be read, the attempt is `Error` naming the cause
+(ES-19 applies to the path) and there is no fallback to any other root source.
+`ext` MUST NOT read any other environment variable or config key that alters
+trust, routing or name resolution, and MUST NOT log TLS key material
+(`SSLKEYLOGFILE` is ignored). In particular the proxy variables (`HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, in any case) and the resolver-altering
+variables (`RES_OPTIONS`, `HOSTALIASES`, `LOCALDOMAIN` and the like) are
+ignored, so ES-15 is judged on the real peer. `AllowHTTP` and `AllowLocal` are
+settable only in the config file, never by flag or environment.
 
 **ES-18** Every request MUST be `GET` with no body and only the headers
 `Host`, `User-Agent: ext/<version>`, `Accept: application/octet-stream`,
