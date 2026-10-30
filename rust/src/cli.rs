@@ -527,7 +527,7 @@ fn cat(
                         "ext: cached file does not match its digest, discarded: {}",
                         terminal(p.as_os_str().as_bytes())
                     );
-                    cache.discard_if_free(d.digest(), &mut ex)?;
+                    cache.discard_if_free(d.digest(), &mut ex);
                 }
                 Emitted::ReadFailed(e) => eprintln!(
                     "ext: cannot read cached file {}: {}",

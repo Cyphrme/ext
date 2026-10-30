@@ -426,23 +426,23 @@ impl<'a> Cache<'a> {
 
     /// Removes the record of `d` and, unless a directory or other special
     /// file stands there, its file; only when the lock is free right now
-    /// and the store is writable (ES-10, ES-11, ES-27). Returns whether it
-    /// ran.
-    pub fn discard_if_free(
-        &self,
-        d: &Digest,
-        ex: &mut dyn StepExecutor,
-    ) -> Result<bool, CacheError> {
+    /// and the store is writable (ES-10, ES-11, ES-27). Best effort: the
+    /// caller goes on as on a miss whether or not it ran, so a failure
+    /// leaves the stale record for a later lookup to try again.
+    pub fn discard_if_free(&self, d: &Digest, ex: &mut dyn StepExecutor) {
         if self.store.read_only() {
-            return Ok(false);
+            return;
         }
-        let Some(lock) = self.store.try_lock()? else {
-            return Ok(false);
+        let Ok(Some(lock)) = self.store.try_lock() else {
+            return;
         };
-        ex.step(&Effect::Commit {
+        let commit = Effect::Commit {
             insert: None,
             delete: vec![d.clone()],
-        })?;
+        };
+        if ex.step(&commit).is_err() {
+            return;
+        }
         let path = self.store.path().join(Self::relative_path(d));
         // A symlink is removed (unlink never follows it); a directory or a
         // device is left for its owner to look at.
@@ -452,7 +452,6 @@ impl<'a> Cache<'a> {
             }
         }
         drop(lock);
-        Ok(true)
     }
 
     /// The file for `d` if the record's file is a regular file, opened without
@@ -475,7 +474,7 @@ impl<'a> Cache<'a> {
         if answers {
             return Ok(Some(self.store.path().join(rel)));
         }
-        self.discard_if_free(d, ex)?;
+        self.discard_if_free(d, ex);
         Ok(None)
     }
 
