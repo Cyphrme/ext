@@ -750,7 +750,7 @@ fn exit_code_follows_the_decision_list() {
     for l in lists {
         for index_failed in [false, true] {
             for write_failed in [false, true] {
-                let hit = l.iter().any(|o| *o == Hit);
+                let hit = l.contains(&Hit);
                 let bad = l.iter().any(|o| matches!(o, Error(_) | Mismatch));
                 let want = if hit && !write_failed {
                     0

@@ -111,7 +111,7 @@ fn non_fetchable_digests_never_reach_a_service() {
         format!("{}:SHA-256", &value[..10]),
         value.to_string(),
         format!("{value}:SHA-3"),
-        format!("{}:SHA-256", hex_of(&b)[..30].to_string()),
+        format!("{}:SHA-256", &hex_of(&b)[..30]),
         format!("SHA-256:{}", &value[..42]),
     ] {
         let o = env.ext(&["cat", &arg]);
@@ -811,7 +811,7 @@ fn the_cache_is_invisible_to_list_and_scans() {
     for f in env.cache_files() {
         fs::set_permissions(
             env.store.join("cache").join(f),
-            fs::Permissions::from_mode(0),
+            fs::Permissions::from_mode(0o000),
         )
         .unwrap();
     }
