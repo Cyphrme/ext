@@ -11,11 +11,11 @@ blob services.
   - Provide cryptographic integrity to files.
  - Incremental behavior. (New changes are added as they occur. No global
    re-hashing)
- - Support external blob services.
+ - Fetch blobs by digest from external services on a local miss.
 
 ## Registration
 **Registry**
-A registry is simply a list of paths and URIs, newline delimited. For example,
+A registry is simply a list of absolute paths, newline delimited. For example,
 to register a whole system, the registry contains simply the root path, `/`. A subtree such as `/srv/www`
 may equally be registered.
 The system-wide registry is kept by default in `/var/lib/ext/registry`. Files
@@ -32,12 +32,18 @@ hide a subtree from the parent. A sub-extant works standalone: `ext init
 Sub-extants may be registered to a parent extant.
 
 **External Service Registration**
-External services may be registered via
+External services are registered with `ext -r <URI>` and removed with
+`ext -u <URI>`. For example:
 
-`ext -r <URI>`
-
-For example:
 `ext -r https://cyphr.me/e`
+
+An argument matching `^[A-Za-z][A-Za-z0-9+.-]*://` is a service URI; anything
+else is a path (a relative path that looks like a URI is written `./...`).
+Service URIs are kept in the `services` file, one per line, never in the
+registry. File order is priority: the first service to deliver a verified blob
+wins. At most 64 services are registered. Only `https` is built; `http` is
+refused unless the config allows it. The file's grammar and the rules for
+fetching are in [docs/services.md](docs/services.md).
 
 ## Extant Registry and Index paths
 Indexes are kept in `<extant_path>/<index_name>`. The registry and source index
@@ -50,11 +56,10 @@ roots are handled, is in [docs/traversal.md](docs/traversal.md).
 
 **File Formats**
 Registry:   <registered_file_path>
+Services:   <uri>
 Source:     <digest>:<alg>\t<path>
 Path Index: <path>\t<digest>:<alg>
 Tag:        <tag>\t<digest>:<alg>
-Cache:      <digest>:<alg>\t<path>
-Cache Time: <digest>:<alg>\t<time>
 Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>\t<dev>
 
 Index files are TSV as defined in https://github.com/Cyphrme/TSV: fields are
@@ -67,7 +72,9 @@ A process that writes a store holds an exclusive lock on
 replaced atomically: it is written to a temporary file in the store and renamed
 over the old one, so a reader never sees a partial file.
 
-External service URIs are not stored in the system indexes.
+External service URIs are kept in `services`, not in the indexes. The services
+file is one URI per line and is not TSV. The cache (see Caching) is a table in
+`index.db`, not a TSV index.
 
 The same digest may appear more than once when multiple paths contain
 identical content. Lookup by digest returns every matching path. The path index,
@@ -117,6 +124,13 @@ https://cyphr.me/File:Example:SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU
 
 Simple blog service:
 https://cyphr.me/e/SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
+
+`ext` itself requests `<base>/<alg>:<digest-b64ut>` from a registered base URI,
+which is the simple blog service form above. A registered URI that contains
+`{alg}`, `{digest}` or `{hex}` is a template instead: `{alg}` is the Coz
+algorithm name, `{digest}` the b64ut digest and `{hex}` the uppercase hex
+digest. This lets servers that format names differently be used without
+per-server code. See [docs/services.md](docs/services.md).
 
 **Hash URI** - Names bytes by digest. The following URI requires support by
 implementing systems (such as a browser):
@@ -209,7 +223,8 @@ happen when using a non-cryptographic hash, truncation, or a broken
 cryptographic hash. Although `ext` is designed for cryptographic hashes, there
 are circumstances where non-cryptographic hashes are useful, such as speed and
 smaller lookup keys. Non-cryptographic algorithms are "locate only": they are
-never used for verification, cache admission, or fetching.
+never used for verification, cache admission, or fetching. Truncated digests
+are locate-only in the same way: they are never sent to an external service.
 
 On collision for truncation or non-cryptographic hashed, tooling provides top
 matches. For cryptographic hashes provided with full sized digests, tooling must
@@ -222,29 +237,35 @@ AMBIGUOUS SHA-256 2rfHUI84JB 2
 ```
 
 ## Caching
-The cache is used for external services. After external retrieval the digest is
-added to the cache.  The cache is a least recently used (LRU) Unix time cache.
+The cache holds blobs fetched from external services. It is a least recently
+used (LRU) cache bounded in bytes.
 
-The order of operations for the lookups is:
+The order of operations for lookups is:
 
 1. Local lookup
 2. Local cache
-3. Query external services
+3. External services, one at a time in `services` file order
 
-The cache has two indexes which provide O(log(n)) lookups, the Cache Index
-comprises <dig>:<path> pairs and the Cache Time Index comprises <dig>:<time>
-pairs. Cache capacity is set in bytes in the config. Once the cache reaches
-capacity, the least recently used items are evicted.
+The first service to deliver a blob that verifies wins; later services are not
+contacted. A service that errors, is missing the blob, or returns bytes that do
+not match is passed over, and the failure is reported on stderr.
 
 A fetched blob is hashed in full with the requested alg and compared with the
 requested digest before it is cached or returned. On mismatch it is discarded,
-nothing is cached, and the error names the service. Fetch size and timeout
-limits are configurable. By default, redirects to a different scheme are not
-followed, and a service may not direct `ext` to a loopback or other local
-address. A config option can relax both.
+nothing is cached, and the error names the service. Services are trusted for
+availability, never for integrity.
 
-A cache record holds the alg and digest, the origin service, the local file
-name (derived only from the verified digest), and the last access time.
+Fetch size and timeout limits are configurable. By default, redirects to a
+different scheme are not followed, and a service may not direct `ext` to a
+loopback or other local address. A config option can relax both.
+
+The cache is a table in `index.db`. A cache record holds the alg, the digest,
+the size and the last access time; there is no origin service. The file name is
+derived only from the verified digest: `cache/<ALG>/<HEX>`, with the digest in
+uppercase hex. When the total size passes `CacheCapacity`, the least recently
+used blobs are evicted. Cached blobs do not appear in `ext list` and are not
+scanned by `check`. `--offline` consults only the local index and cache and
+contacts no service. Details are in [docs/services.md](docs/services.md).
 
 ## Directories
 `ext` checks for stores, indexes, and registrations. Default system wide userland
@@ -284,6 +305,16 @@ The config file is saved as <extant_path>/config. Its format is JSON5.
 - CompareCtimeInode - True - Compare ctime, inode and dev when deciding to skip a file
   (see Incrementality).
 - UnregisterDeleted - True - Unregister a deleted root (see docs/traversal.md).
+- CacheCapacity - 1 GiB - Cache size limit in bytes.
+- ServiceMaxSize - 256 MiB - Largest blob fetched from a service. At most
+  `CacheCapacity`.
+- ServiceTimeout - 600 s - Total time allowed for one service attempt.
+- ServiceIdleTimeout - 30 s - Time allowed without body progress.
+- AllowHTTP  - False - Permit `http` services and `https` to `http` redirects.
+- AllowLocal - False - Permit services at loopback or other local addresses.
+
+`AllowHTTP` and `AllowLocal` are read from the config file only, never from a
+flag or the environment.
 
 ## Commands
 `ext init <path>` - Create an `ext` directory with a new registry. If no path is
@@ -295,7 +326,12 @@ specified CWD is used.
 indexing. A deleted root is also unregistered; see
 [docs/traversal.md](docs/traversal.md).
 
-`ext resolve <dig>` - Print path(s)
+`ext resolve <dig>` - Print path(s). On a miss, consults the cache and then
+external services; a fetched blob is printed as its cache path.
+
+`ext cat [--offline] <alg>:<digest>` - Write the verified bytes of a blob to
+stdout, fetching from external services on a local miss. `--offline` contacts
+no service.
 
 `ext list` - prints the source index.
 
@@ -324,7 +360,9 @@ reported, the index is not updated, and `check` exits 2.
 - 3 - Ambiguous
 - 4 - Usage or configuration error
 - 5 - Incomplete: some paths could not be read or were refused, and no
-  mismatch was found. A mismatch (2) takes precedence.
+  mismatch was found; or a lookup found nothing but a service errored or
+  returned mismatching bytes, or a fetched blob could not be cached. A
+  mismatch (2) takes precedence.
 
 ## Incrementality
 Incrementality uses a persistent timestamp index and an optional continuous
@@ -387,7 +425,7 @@ using the rules above. With that rule the watcher is not required for
 correctness: any later `ext` invocation observes the same metadata and
 produces the same result.
 
-External services are never watched; they are consulted only on cache miss.
+External services are never watched; they are consulted only on a local miss.
 
 ## Coz
 Extant uses the algorithm hash naming convention and b64ut (RFC 4648 base64 url,
@@ -406,7 +444,10 @@ COLLISION - Two distinct payloads resolve to the same digest.
 
 ## Technical Considerations
 **Extant Non-goals**
-- Not a transport.
+- Not a server: serving blobs is a separate binary's job.
+- Not an index or mirror of an external service; services are never listed.
+- Not a relay: blobs are never moved between services.
+- No upload: `ext` never writes to a service.
 - Not a multi-hash registry. Not ni:. Not a filename standard.
   In `hash:` the digest's algorithm is the authority, so ni's empty authority
   (`///`) is not needed.
