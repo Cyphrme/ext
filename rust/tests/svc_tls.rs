@@ -42,11 +42,27 @@ struct Leaf {
     key: PrivatePkcs8KeyDer<'static>,
 }
 
-/// A server certificate for `san` signed by `ca`; `expired` backdates it.
+/// A server certificate for the IP `san` signed by `ca`; `expired` backdates it.
 fn leaf(ca: &Ca, san: &str, expired: bool) -> Leaf {
+    leaf_san(ca, SanType::IpAddress(san.parse().unwrap()), expired)
+}
+
+/// An intermediate CA issued by `root`, with its certificate as sent on the wire.
+fn intermediate(root: &Ca, name: &str) -> (Ca, CertificateDer<'static>) {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.distinguished_name.push(DnType::CommonName, name);
+    let issuer = Issuer::from_params(&root.params, &root.key);
+    let cert = params.signed_by(&key, &issuer).unwrap();
+    let (pem, der) = (cert.pem(), cert.der().clone());
+    (Ca { params, key, pem }, der)
+}
+
+fn leaf_san(ca: &Ca, san: SanType, expired: bool) -> Leaf {
     let key = KeyPair::generate().unwrap();
     let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
-    p.subject_alt_names = vec![SanType::IpAddress(san.parse().unwrap())];
+    p.subject_alt_names = vec![san];
     p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     if expired {
         p.not_before = date_time_ymd(1990, 1, 1);
@@ -83,11 +99,17 @@ enum Mode {
     /// Redirects the service's own request path to `/b` on the same server
     /// (https to https), and serves the blob at `/b`.
     Hop(Vec<u8>),
+    /// As `Hop`, but the blob at `/b` is sent with chunked transfer coding.
+    HopChunked(Vec<u8>),
 }
 
 fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
+    tls_fb_at("127.0.0.2", l, mode)
+}
+
+fn tls_fb_at(bind: &str, l: Leaf, mode: Mode) -> TlsFb {
     let blob = mode;
-    let listener = TcpListener::bind("127.0.0.2:0").unwrap();
+    let listener = TcpListener::bind((bind, 0)).unwrap();
     let addr = listener.local_addr().unwrap();
     let served = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -131,7 +153,7 @@ fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
                     .unwrap_or("")
                     .to_string();
                 match &blob {
-                    Mode::Hop(_) if target.starts_with("/SHA") => {
+                    Mode::Hop(_) | Mode::HopChunked(_) if target.starts_with("/SHA") => {
                         let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n");
                     }
                     Mode::Hop(b) => {
@@ -141,6 +163,18 @@ fn tls_fb(l: Leaf, mode: Mode) -> TlsFb {
                             b.len()
                         );
                         let _ = s.write_all(b);
+                    }
+                    Mode::HopChunked(b) => {
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        );
+                        for ch in b.chunks(7) {
+                            let _ = write!(s, "{:x}\r\n", ch.len());
+                            let _ = s.write_all(ch);
+                            let _ = write!(s, "\r\n");
+                        }
+                        let _ = write!(s, "0\r\n\r\n");
                     }
                     Mode::Redirect(to) => {
                         let _ = write!(s, "HTTP/1.1 302 Found\r\nConnection: close\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n");
@@ -415,6 +449,84 @@ fn an_https_to_https_redirect_needs_no_allow_http() {
         2,
         "one redirect, one blob"
     );
+}
+
+/// ES-17, ES-14, ES-15. The shape of a real fetch, end to end through the
+/// binary: the service is a DNS name (`localhost`, resolved by ext's own
+/// resolver under `AllowLocal`), so SNI and hostname verification run against a
+/// name; the server sends `[leaf, intermediate]` and only the root is trusted,
+/// through a directory in `SSL_CERT_DIR`; the https service redirects to
+/// another path (ES-14, https to https) that answers with a chunked body. The
+/// blob is admitted (a second run is a cache hit with no request). Controls in
+/// the same test: a chain missing the intermediate, an intermediate issued by
+/// a root the directory does not hold, and a leaf for another DNS name are
+/// each Error with no request made. Violators: the intermediate ignored or
+/// assumed present, trust from a leaf pin or a compiled-in list, hostname
+/// verification skipped or done against the resolved IP, `SSL_CERT_DIR` not
+/// honoured, chunked bodies or the redirect hop mishandled over TLS.
+///
+/// `localhost` resolves here to `::1` before `127.0.0.1`; the server binds
+/// `127.0.0.1`, so the fetch also exercises falling through the refused
+/// first address.
+#[test]
+fn a_named_host_behind_an_intermediate_and_a_redirect_is_fetched_and_admitted() {
+    let b = blob(300, 7);
+    let root = ca("root");
+    let (mid, mid_der) = intermediate(&root, "intermediate");
+    let dns = |n: &str| SanType::DnsName(n.try_into().unwrap());
+    let with_mid = |mut l: Leaf| {
+        l.chain.push(mid_der.clone());
+        l
+    };
+    let start = |l: Leaf| tls_fb_at("127.0.0.1", l, Mode::HopChunked(b.clone()));
+    let env_at = |fb: &TlsFb, root_pem: &str| {
+        let env = Env::new();
+        env.config_raw("{ AllowLocal: true }");
+        env.services(&[format!("https://localhost:{}/", fb.addr.port())]);
+        let dir = env.base.join("certs");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("root.pem"), root_pem).unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        (env, d)
+    };
+
+    let fb = start(with_mid(leaf_san(&mid, dns("localhost"), false)));
+    let (env, d) = env_at(&fb, &root.pem);
+    let o = cat_with(&env, &b, &[("SSL_CERT_DIR", &d)]);
+    assert_eq!((o.code, &o.stdout), (0, &b), "full chain: {}", o.stderr);
+    assert_eq!(
+        fb.served.load(Ordering::SeqCst),
+        2,
+        "one redirect, one chunked blob"
+    );
+    let o = cat_with(&env, &b, &[("SSL_CERT_DIR", &d)]);
+    assert_eq!((o.code, &o.stdout), (0, &b), "re-run: {}", o.stderr);
+    assert_eq!(
+        fb.served.load(Ordering::SeqCst),
+        2,
+        "the blob was admitted: the re-run is a cache hit"
+    );
+
+    let fb = start(leaf_san(&mid, dns("localhost"), false));
+    let (env, d) = env_at(&fb, &root.pem);
+    let o = cat_with(&env, &b, &[("SSL_CERT_DIR", &d)]);
+    assert_eq!(o.code, 5, "intermediate not sent: {}", o.stderr);
+    assert!(o.stdout.is_empty());
+    assert_eq!(fb.served.load(Ordering::SeqCst), 0);
+
+    let fb = start(with_mid(leaf_san(&mid, dns("localhost"), false)));
+    let (env, d) = env_at(&fb, &ca("unrelated root").pem);
+    let o = cat_with(&env, &b, &[("SSL_CERT_DIR", &d)]);
+    assert_eq!(o.code, 5, "root did not issue the chain: {}", o.stderr);
+    assert!(o.stdout.is_empty());
+    assert_eq!(fb.served.load(Ordering::SeqCst), 0);
+
+    let fb = start(with_mid(leaf_san(&mid, dns("example.invalid"), false)));
+    let (env, d) = env_at(&fb, &root.pem);
+    let o = cat_with(&env, &b, &[("SSL_CERT_DIR", &d)]);
+    assert_eq!(o.code, 5, "certificate for another name: {}", o.stderr);
+    assert!(o.stdout.is_empty());
+    assert_eq!(fb.served.load(Ordering::SeqCst), 0);
 }
 
 /// ES-17. "The named file or directory cannot be read" is an Error naming the
