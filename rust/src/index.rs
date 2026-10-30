@@ -53,6 +53,9 @@ impl std::fmt::Display for RootId {
 
 pub struct Index {
     conn: Connection,
+    /// A read-only open of an index nobody has written yet: its tables are
+    /// absent, and that alone means "empty".
+    uninitialised: bool,
 }
 
 /// SQLite integers are signed 64-bit; `u64` fields are stored as their
@@ -173,7 +176,10 @@ impl Index {
                 Err(e) => return Err(e.into()),
             }
         }
-        let ix = Index { conn };
+        let ix = Index {
+            conn,
+            uninitialised: false,
+        };
         ix.ensure_schema()?;
         Ok(ix)
     }
@@ -185,10 +191,50 @@ impl Index {
     pub fn open_read_only(store: &Store) -> Result<Index, StoreError> {
         store.check_unmoved()?;
         let db = store.path().join("index.db");
-        // A WAL database can be read without writing only as `immutable`:
-        // otherwise SQLite must create its `-shm` file beside it. Immutable
-        // also drops SQLite's locking, which is sound here because the
-        // effective user, the store's only permitted writer, cannot write.
+        let wal = store.path().join("index.db-wal");
+        // Committed rows may still be only in the WAL: a crash, or a live
+        // store made read-only or bind-mounted read-only, leaves them there.
+        let wal_content = match std::fs::symlink_metadata(&wal) {
+            Ok(m) => m.len() > 0,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(wrap(e, "stat", &wal)),
+        };
+        // `mode=ro` reads the WAL, but needs the `-shm` file, which a
+        // directory we cannot write cannot gain.
+        let ro = Index::open_uri(&db, "mode=ro");
+        let conn = match ro {
+            Ok(c) => c,
+            Err(e) if wal_content => {
+                return Err(StoreError::IndexUnreadable {
+                    path: db,
+                    why: format!(
+                        "it has a write-ahead log that cannot be read without writing ({e})"
+                    ),
+                })
+            }
+            // `immutable` reads index.db alone, with no `-shm` and no locks.
+            // That is right only with no WAL content to miss; a writer that
+            // changes the file during this one read (only the owner can,
+            // through a mount or mode change) may still make it fail.
+            Err(_) => Index::open_uri(&db, "immutable=1")?,
+        };
+        store.check_unmoved()?;
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if found != SCHEMA_VERSION && found != 0 {
+            return Err(StoreError::Schema {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        Ok(Index {
+            conn,
+            uninitialised: found == 0,
+        })
+    }
+
+    /// A read-only connection to `db` with URI parameter `param`, proven
+    /// usable by one read.
+    fn open_uri(db: &std::path::Path, param: &str) -> Result<Connection, StoreError> {
         let mut uri = String::from("file:");
         for &b in db.as_os_str().as_bytes() {
             if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
@@ -197,23 +243,20 @@ impl Index {
                 uri.push_str(&format!("%{b:02X}"));
             }
         }
-        uri.push_str("?immutable=1");
+        uri.push('?');
+        uri.push_str(param);
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(&uri, flags).map_err(|e| wrap_db(e, &db))?;
-        store.check_unmoved()?;
+        let conn = Connection::open_with_flags(&uri, flags).map_err(|e| wrap_db(e, db))?;
         conn.busy_timeout(Duration::from_millis(5000))?;
         conn.pragma_update(None, "trusted_schema", "OFF")?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
-        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if found != SCHEMA_VERSION && found != 0 {
-            return Err(StoreError::Schema {
-                found,
-                expected: SCHEMA_VERSION,
-            });
-        }
-        Ok(Index { conn })
+        // SQLite opens lazily; the first read is what fails without `-shm`.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        Ok(conn)
     }
 
     /// The writable index, or the read-only one when the store cannot be
@@ -315,9 +358,11 @@ impl Index {
 
     /// Sorted by raw path bytes so `resolve` output is deterministic.
     pub fn by_digest(&self, digest: &Digest) -> Result<Vec<Vec<u8>>, StoreError> {
-        // Only a read-only open of a never-written index lacks the table.
         if !self.has_table("files")? {
-            return Ok(Vec::new());
+            if self.uninitialised {
+                return Ok(Vec::new());
+            }
+            return Err(StoreError::Corrupt("the index has no files table".into()));
         }
         let mut stmt = self.conn.prepare_cached(
             "SELECT path FROM files WHERE alg = ?1 AND digest = ?2 ORDER BY path",

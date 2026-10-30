@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime};
 const SYSTEM_STORE: &str = "/var/lib/ext";
 const EXIT_NOT_FOUND: u8 = 1;
 const EXIT_USAGE: u8 = 4;
+const EXIT_INCOMPLETE: u8 = 5;
 
 /// ES-25: how long an admission waits for the store lock.
 const ADMIT_LOCK_WAIT: Duration = Duration::from_secs(5);
@@ -225,7 +226,12 @@ pub fn run(cli: &Cli) -> u8 {
         Ok(code) => code,
         Err(e) => {
             eprintln!("ext: error: {e}");
-            EXIT_USAGE
+            match e {
+                // The blob may be indexed, so this is no usage error and no
+                // "absent" either.
+                CliError::Store(StoreError::IndexUnreadable { .. }) => EXIT_INCOMPLETE,
+                _ => EXIT_USAGE,
+            }
         }
     }
 }
