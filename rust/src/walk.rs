@@ -1,0 +1,563 @@
+//! fd-relative tree walk that never follows symlinks or opens specials.
+
+use crate::hash::meta_of;
+use crate::index::{Meta, RootId};
+use crate::registry::RegPath;
+use crate::vfs;
+use rustix::fs::{
+    fstat, fstatfs, fstatvfs, makedev, openat, openat2, statx, AtFlags, Dir, FileType, Mode,
+    OFlags, ResolveFlags, Statx, StatxFlags, CWD,
+};
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::rc::Rc;
+use std::sync::Once;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug)]
+pub enum Event {
+    File {
+        path: Vec<u8>,
+        file: File,
+        meta: Meta,
+        last_checked_ns: i64,
+    },
+    Symlink(Vec<u8>),
+    Special(Vec<u8>),
+    Mount(Vec<u8>),
+    SubExtant(Vec<u8>),
+    Refused(Vec<u8>, io::Error),
+    Error(Vec<u8>, io::Error),
+    /// The entry changed type or identity between the metadata read and the
+    /// open: known to be moving, so not merely unreadable.
+    Unstable(Vec<u8>, io::Error),
+}
+
+const STAT_MASK: StatxFlags = StatxFlags::TYPE
+    .union(StatxFlags::MODE)
+    .union(StatxFlags::UID)
+    .union(StatxFlags::INO)
+    .union(StatxFlags::SIZE)
+    .union(StatxFlags::MTIME)
+    .union(StatxFlags::CTIME)
+    .union(StatxFlags::MNT_ID);
+
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::DIRECTORY);
+
+/// A root is first held by `O_PATH`: its type is known before anything that
+/// could block or act (a FIFO, a device) is opened for reading.
+const ROOT_FLAGS: OFlags = OFlags::PATH.union(OFlags::CLOEXEC).union(OFlags::NOFOLLOW);
+
+static NO_MNT_ID: Once = Once::new();
+
+/// A directory held open while any of its children are still to be visited.
+struct DirHandle {
+    fd: OwnedFd,
+    path: Vec<u8>,
+    /// The mount this directory is on; a child differing from it is a crossing.
+    mnt: u64,
+}
+
+/// A subdirectory found while listing its parent, opened only when popped.
+/// Sharing the parent handle keeps open descriptors proportional to the
+/// directories that still have unvisited children, not to tree depth.
+struct Pending {
+    parent: Rc<DirHandle>,
+    name: CString,
+    id: (u64, u64),
+    /// The child's mount, and whether it differs from the parent's: a
+    /// crossing is entered only if the filesystem there is not virtual.
+    mnt: u64,
+    crossed: bool,
+}
+
+struct Ctx<'a> {
+    store_id: (u64, u64),
+    root_uid: u32,
+    /// Kernel without `STATX_MNT_ID`: mount identity degrades to `st_dev`.
+    /// Wrong on btrfs subvolumes, hence only a fallback.
+    use_dev: bool,
+    stack: Vec<Pending>,
+    /// Paths of other registered roots: each is walked by its own scan only.
+    skip: &'a dyn Fn(&[u8]) -> bool,
+    before_open: &'a mut dyn FnMut(&[u8]),
+    visit: &'a mut dyn FnMut(Event),
+}
+
+pub(crate) fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        // An unrepresentable clock must err toward re-hashing: MAX makes
+        // every stored timestamp racy.
+        .unwrap_or(i64::MAX)
+}
+
+fn dev_of(st: &Statx) -> u64 {
+    makedev(st.stx_dev_major, st.stx_dev_minor)
+}
+
+fn is_type(st: &Statx, t: FileType) -> bool {
+    FileType::from_raw_mode(st.stx_mode.into()) == t
+}
+
+fn child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(parent.len() + 1 + name.len());
+    p.extend_from_slice(parent);
+    if parent != b"/" {
+        p.push(b'/');
+    }
+    p.extend_from_slice(name);
+    p
+}
+
+fn changed(what: &str) -> io::Error {
+    io::Error::other(format!(
+        "{what} changed type or identity while being opened"
+    ))
+}
+
+/// The filesystem identity `walk` would record for `root` right now.
+pub fn root_id(root: &RegPath) -> io::Result<RootId> {
+    let fd = openat2(
+        CWD,
+        root.as_bytes(),
+        ROOT_FLAGS,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )?;
+    Ok(RootId(fstatvfs(&fd)?.f_fsid))
+}
+
+/// True if opening `root` still fails with ENOENT. Checked after the
+/// ancestor's filesystem is read, so a mount that landed in between is not
+/// mistaken for a deletion.
+pub fn root_still_absent(root: &RegPath) -> bool {
+    matches!(
+        openat2(
+            CWD,
+            root.as_bytes(),
+            DIR_FLAGS,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ),
+        Err(rustix::io::Errno::NOENT)
+    )
+}
+
+/// The filesystem of the nearest existing ancestor of `root`, which is itself
+/// gone: what a deleted root is compared against (a root on an unmounted disk
+/// leaves an ancestor on a different filesystem). A symlink or any other
+/// obstacle on the way is an error, never a guess.
+pub fn nearest_ancestor_id(root: &RegPath) -> io::Result<RootId> {
+    let mut path = root.as_bytes();
+    loop {
+        path = match path.iter().rposition(|&b| b == b'/') {
+            Some(0) | None => b"/",
+            Some(i) => &path[..i],
+        };
+        match openat2(
+            CWD,
+            path,
+            DIR_FLAGS,
+            Mode::empty(),
+            ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        ) {
+            Ok(fd) => return Ok(RootId(fstatvfs(&fd)?.f_fsid)),
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) if path != b"/" => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Every descent is relative to a held descriptor, so no component can be
+/// swapped for a symlink after it was checked.
+pub fn walk(root: &RegPath, store_id: (u64, u64), visit: &mut dyn FnMut(Event)) {
+    walk_hooked(root, store_id, &mut |_| {}, visit)
+}
+
+/// As [`walk`], but `before_open(path)` runs for each regular file and
+/// directory after its metadata is read and before it is opened, so a test
+/// can swap the entry in that window.
+pub fn walk_hooked(
+    root: &RegPath,
+    store_id: (u64, u64),
+    before_open: &mut dyn FnMut(&[u8]),
+    visit: &mut dyn FnMut(Event),
+) {
+    walk_checked(
+        root,
+        store_id,
+        &mut |_| Ok(()),
+        &|_| false,
+        before_open,
+        visit,
+    )
+}
+
+/// As [`walk_hooked`], and `check` sees the root's filesystem identity once
+/// the root is open; an `Err` refuses the root before anything is listed.
+pub(crate) fn walk_checked(
+    root: &RegPath,
+    store_id: (u64, u64),
+    check: &mut dyn FnMut(RootId) -> io::Result<()>,
+    skip: &dyn Fn(&[u8]) -> bool,
+    before_open: &mut dyn FnMut(&[u8]),
+    visit: &mut dyn FnMut(Event),
+) {
+    let path = root.as_bytes().to_vec();
+    // Sampled before the metadata read, as for every file (see visit_child).
+    let last_checked_ns = now_ns();
+    let held = match openat2(
+        CWD,
+        root.as_bytes(),
+        ROOT_FLAGS,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(e) => return visit(Event::Refused(path, e.into())),
+    };
+    let fd = &held;
+    let st = match statx(
+        fd,
+        "",
+        AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW,
+        STAT_MASK,
+    ) {
+        Ok(st) => st,
+        Err(e) => return visit(Event::Error(path, e.into())),
+    };
+    let use_dev = st.stx_mask & StatxFlags::MNT_ID.bits() == 0;
+    if use_dev {
+        NO_MNT_ID.call_once(|| {
+            eprintln!("warning: kernel lacks STATX_MNT_ID; mount boundaries compared by st_dev");
+        });
+    }
+    let root_mnt = if use_dev { dev_of(&st) } else { st.stx_mnt_id };
+    let id = match fstatvfs(fd) {
+        Ok(v) => RootId(v.f_fsid),
+        Err(e) => return visit(Event::Error(path, e.into())),
+    };
+    // Before the identity is recorded or anything is read.
+    match inside_store(root, store_id, st.stx_uid) {
+        Ok(None) => {}
+        Ok(Some(why)) => {
+            return visit(Event::Refused(
+                path,
+                io::Error::other(format!("not indexed: {why}")),
+            ))
+        }
+        Err(e) => return visit(Event::Refused(path, e)),
+    }
+    if let Err(e) = check(id) {
+        return visit(Event::Refused(path, e));
+    }
+    let fd = match FileType::from_raw_mode(st.stx_mode.into()) {
+        FileType::Directory => match openat(fd, ".", DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(e) => return visit(Event::Error(path, e.into())),
+        },
+        FileType::RegularFile => {
+            return file_root(path, (dev_of(&st), st.stx_ino), last_checked_ns, visit)
+        }
+        // Symlinks never get this far (the open refuses them); anything else
+        // is not content and is not opened.
+        _ => {
+            return visit(Event::Refused(
+                path,
+                io::Error::other("root is not a file or directory"),
+            ))
+        }
+    };
+    let mut ctx = Ctx {
+        store_id,
+        root_uid: st.stx_uid,
+        use_dev,
+        stack: Vec::new(),
+        skip,
+        before_open,
+        visit,
+    };
+    list_dir(
+        &mut ctx,
+        Rc::new(DirHandle {
+            fd,
+            path,
+            mnt: root_mnt,
+        }),
+        true,
+    );
+    // Explicit stack: depth costs heap, never call-stack or one fd per level.
+    while let Some(p) = ctx.stack.pop() {
+        let path = child_path(&p.parent.path, p.name.to_bytes());
+        (ctx.before_open)(&path);
+        let fd = match openat(&p.parent.fd, &p.name, DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            // O_NOFOLLOW|O_DIRECTORY on a name swapped for a symlink or a
+            // file fails with ELOOP or ENOTDIR.
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => {
+                (ctx.visit)(Event::Unstable(path, changed("directory")));
+                continue;
+            }
+            Err(e) => {
+                (ctx.visit)(Event::Error(path, e.into()));
+                continue;
+            }
+        };
+        match fstat(&fd) {
+            Ok(f) if (f.st_dev, f.st_ino) == p.id => {
+                if p.crossed {
+                    match fstatfs(&fd) {
+                        // Truncating: every magic number fits in 32 bits.
+                        Ok(s) if vfs::is_virtual(s.f_type as u32) => {
+                            (ctx.visit)(Event::Mount(path));
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            (ctx.visit)(Event::Error(path, e.into()));
+                            continue;
+                        }
+                    }
+                }
+                let mnt = p.mnt;
+                // Release the parent before descending; if this was its last
+                // pending child, its descriptor closes here.
+                drop(p);
+                list_dir(&mut ctx, Rc::new(DirHandle { fd, path, mnt }), false);
+            }
+            Ok(_) => (ctx.visit)(Event::Unstable(path, changed("directory"))),
+            Err(e) => (ctx.visit)(Event::Error(path, e.into())),
+        }
+    }
+}
+
+/// Why `root` may not be a root: it is the active store, or lies inside it, or
+/// lies inside a sub-extant's store. The store is never indexed, and the
+/// directory walk already leaves these alone below a root; a root placed
+/// there directly would bypass that. Identity is by device and inode of each
+/// directory on the path (the path has no symlinks), not by path text, and a
+/// `.ext` counts under the same rule as in the walk, with `root_uid` the
+/// owner of the root.
+pub fn inside_store(
+    root: &RegPath,
+    store_id: (u64, u64),
+    root_uid: u32,
+) -> io::Result<Option<&'static str>> {
+    let path = root.as_bytes();
+    let ends = path
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b == b'/' && i > 0)
+        .map(|(i, _)| i)
+        .chain(std::iter::once(path.len()));
+    for end in ends {
+        let prefix = &path[..end];
+        let st = statx(
+            CWD,
+            prefix,
+            AtFlags::SYMLINK_NOFOLLOW,
+            StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::INO,
+        )?;
+        if !is_type(&st, FileType::Directory) {
+            continue;
+        }
+        if (dev_of(&st), st.stx_ino) == store_id {
+            return Ok(Some("it is the store in use, or lies inside it"));
+        }
+        let slash = prefix.iter().rposition(|&b| b == b'/').unwrap_or(0);
+        if &prefix[slash + 1..] == b".ext" {
+            let parent = &prefix[..slash.max(1)];
+            let parent = openat2(
+                CWD,
+                parent,
+                DIR_FLAGS,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+            )?;
+            if is_real_store(root_uid, &parent, &st) {
+                return Ok(Some("it lies inside a sub-extant's store"));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A root that is one regular file: hashed like any other file, by a read-only
+/// open that cannot block, checked against the identity just seen.
+fn file_root(path: Vec<u8>, id: (u64, u64), last_checked_ns: i64, visit: &mut dyn FnMut(Event)) {
+    let fd = match openat2(
+        CWD,
+        path.as_slice(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP) => return visit(Event::Unstable(path, changed("file"))),
+        Err(e) => return visit(Event::Error(path, e.into())),
+    };
+    let file = File::from(fd);
+    let md = match file.metadata() {
+        Ok(md) => md,
+        Err(e) => return visit(Event::Error(path, e)),
+    };
+    if !md.file_type().is_file() || (md.dev(), md.ino()) != id {
+        return visit(Event::Unstable(path, changed("file")));
+    }
+    visit(Event::File {
+        path,
+        file,
+        meta: meta_of(&md),
+        last_checked_ns,
+    });
+}
+
+/// A `.ext` directory makes its parent a sub-extant only if it holds a
+/// `registry` file (README, Subdirectory Registration), both owned by the
+/// root's owner or by root. Another implementation's store need not have the
+/// index and lock files this one keeps, so they are not required. Not being
+/// group/other-writable is added hardening. Any other `.ext` is ordinary
+/// content, so planting one cannot hide a subtree.
+fn is_real_store(root_uid: u32, parent: &OwnedFd, ext: &Statx) -> bool {
+    let trusted =
+        |st: &Statx| (st.stx_uid == 0 || st.stx_uid == root_uid) && st.stx_mode & 0o022 == 0;
+    if !trusted(ext) {
+        return false;
+    }
+    let Ok(dir) = openat(parent, ".ext", DIR_FLAGS, Mode::empty()) else {
+        return false;
+    };
+    statx(
+        &dir,
+        "registry",
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID,
+    )
+    .is_ok_and(|st| is_type(&st, FileType::RegularFile) && trusted(&st))
+}
+
+fn list_dir(ctx: &mut Ctx<'_>, dir: Rc<DirHandle>, is_root: bool) {
+    match statx(
+        &dir.fd,
+        ".ext",
+        AtFlags::SYMLINK_NOFOLLOW,
+        StatxFlags::TYPE | StatxFlags::MODE | StatxFlags::UID | StatxFlags::INO,
+    ) {
+        Ok(st)
+            if !is_root
+                && is_type(&st, FileType::Directory)
+                && (dev_of(&st), st.stx_ino) != ctx.store_id
+                && is_real_store(ctx.root_uid, &dir.fd, &st) =>
+        {
+            return (ctx.visit)(Event::SubExtant(dir.path.clone()));
+        }
+        Ok(_) => {}
+        Err(rustix::io::Errno::NOENT) => {}
+        // Not knowing whether this is a sub-extant means not walking it.
+        Err(e) => return (ctx.visit)(Event::Error(dir.path.clone(), e.into())),
+    }
+    let mut listing = match Dir::read_from(&dir.fd) {
+        Ok(d) => d,
+        Err(e) => return (ctx.visit)(Event::Error(dir.path.clone(), e.into())),
+    };
+    while let Some(ent) = listing.read() {
+        let ent = match ent {
+            Ok(ent) => ent,
+            // A failed listing cannot be resumed; the directory as a whole
+            // is unverified.
+            Err(e) => return (ctx.visit)(Event::Error(dir.path.clone(), e.into())),
+        };
+        let name: &CStr = ent.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        visit_child(ctx, &dir, name);
+    }
+}
+
+fn visit_child(ctx: &mut Ctx<'_>, dir: &Rc<DirHandle>, name: &CStr) {
+    // Sampled before the metadata read (PR #12): anything modified after this
+    // instant is at worst reported racy, never trusted.
+    let last_checked_ns = now_ns();
+    let path = child_path(&dir.path, name.to_bytes());
+    let st = match statx(&dir.fd, name, AtFlags::SYMLINK_NOFOLLOW, STAT_MASK) {
+        Ok(st) => st,
+        // Vanished since the listing: simply absent from this scan.
+        Err(rustix::io::Errno::NOENT) => return,
+        Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
+    };
+    let id = (dev_of(&st), st.stx_ino);
+    match FileType::from_raw_mode(st.stx_mode.into()) {
+        FileType::Symlink => (ctx.visit)(Event::Symlink(path)),
+        FileType::Directory => {
+            // A store is never content, whether it is the one in use or a
+            // sub-extant's that a registered root hashes around.
+            if id == ctx.store_id
+                || (name.to_bytes() == b".ext" && is_real_store(ctx.root_uid, &dir.fd, &st))
+                || (ctx.skip)(&path)
+            {
+                return;
+            }
+            let mnt = if ctx.use_dev { id.0 } else { st.stx_mnt_id };
+            ctx.stack.push(Pending {
+                parent: Rc::clone(dir),
+                name: name.to_owned(),
+                id,
+                mnt,
+                crossed: crosses_mount(dir.mnt, mnt),
+            });
+        }
+        FileType::RegularFile => {
+            // A registered file root is indexed by its own scan only.
+            if (ctx.skip)(&path) {
+                return;
+            }
+            (ctx.before_open)(&path);
+            // NONBLOCK: should the name be swapped for a FIFO after the
+            // check above, the open still cannot hang.
+            let fd = match openat(
+                &dir.fd,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            ) {
+                Ok(fd) => fd,
+                // A name swapped for a symlink fails O_NOFOLLOW with ELOOP.
+                Err(rustix::io::Errno::LOOP) => {
+                    return (ctx.visit)(Event::Unstable(path, changed("file")))
+                }
+                Err(e) => return (ctx.visit)(Event::Error(path, e.into())),
+            };
+            let file = File::from(fd);
+            let md = match file.metadata() {
+                Ok(md) => md,
+                Err(e) => return (ctx.visit)(Event::Error(path, e)),
+            };
+            if !md.file_type().is_file() || (md.dev(), md.ino()) != id {
+                return (ctx.visit)(Event::Unstable(path, changed("file")));
+            }
+            (ctx.visit)(Event::File {
+                path,
+                file,
+                meta: meta_of(&md),
+                last_checked_ns,
+            });
+        }
+        // Never opened: opening a device or FIFO can block or have effects.
+        _ => (ctx.visit)(Event::Special(path)),
+    }
+}
+
+/// Pure so the mount rule is testable without privilege.
+pub fn crosses_mount(parent_mnt: u64, child_mnt: u64) -> bool {
+    parent_mnt != child_mnt
+}
