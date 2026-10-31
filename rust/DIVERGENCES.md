@@ -171,13 +171,54 @@ into unless registered (README, Technical Considerations: Recursion).
 
 ## External services, names, algorithms
 
-### External services and cache (deferred, #3)
+### External services and cache (follows, #3)
 
-- Spec: README, External Service Registration and Caching. The spec says to verify before caching,
-  configurable size and timeout limits, an origin per cache entry, and LRU by
-  bytes; rules for redirects and localhost are unsettled.
-- Does: none of it. A URI given to `register` fails; a URI in the registry file
-  is a parse error. There is no cache.
+- Spec: `docs/services.md` (ES-1 to ES-33), branch `spec/external-services`.
+- Does: the `https` backend, the cache and the services file as specified.
+  The choices below are ones the spec leaves to the implementation.
+
+### Read-only index open (follows: implementation choice)
+
+- Spec: ES-25, "a `resolve` answered from the local index MUST succeed" on a
+  read-only store; the spec does not say how the index is read there.
+- Does: on a store the effective user cannot write, the index is opened
+  `mode=ro`, which reads `index.db-wal`. If that fails (no `-shm`, which a
+  read-only directory cannot gain) and the WAL holds data, the lookup stops
+  with exit 5 naming the index. Only with no WAL content does it fall back to
+  SQLite `immutable`. An initialised index missing its `files` table is also
+  exit 5; a missing table reads as empty only in an index never written.
+- Why: committed rows may exist only in the WAL (a crash, or a live store made
+  read-only); reading past them would answer "absent" for an indexed file.
+
+### Address allow-list (differs: implementation choice)
+
+- Spec: ES-15, the IANA special-purpose registries "minus every block ...
+  whose Globally Reachable value is False".
+- Does: a block marked False is denied whole, including smaller blocks inside
+  it that the registry marks True (192.0.0.9/32, 192.0.0.10/32, the reachable
+  parts of 2001::/23).
+- Why: those are anycast and protocol assignments no blob service uses, and
+  denying too much is the safe direction.
+
+### Redirect Locations that only look like a scheme (differs: implementation choice)
+
+- Spec: ES-14, a `Location` "is resolved against the current URL" and must
+  satisfy the services grammar; it does not say what counts as a scheme.
+- Does: a `Location` is absolute only if the text before its first `:` is a
+  valid scheme (a letter, then letters, digits, `+`, `-`, `.`). Otherwise it is
+  a relative reference: `9:x` and `a_b:c` resolve to the paths `/9:x` and
+  `/a_b:c`. A valid scheme other than `http` or `https` is an Error.
+- Why: RFC 3986 treats such text as an invalid reference, neither a scheme nor
+  a relative path; the WHATWG parser, which browsers and most HTTP clients
+  follow, reads it as a relative path.
+
+### `resolve` with a file name (follows: implementation choice)
+
+- Spec: ES-1 orders the layers and says nothing of names; README, Human
+  names, makes a name a filter on the returned paths.
+- Does: a query with a name is answered by the index alone; the cache and the
+  services are not consulted.
+- Why: cache paths and services carry no file names to match.
 
 ### Hash URI (follows, #4)
 

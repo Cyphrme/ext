@@ -4,8 +4,11 @@ use crate::digest::{Alg, Digest};
 use crate::registry::RegPath;
 use crate::store::{wrap, Store, StoreError};
 use rusqlite::config::DbConfig;
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use std::collections::HashSet;
+use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -50,6 +53,11 @@ impl std::fmt::Display for RootId {
 
 pub struct Index {
     conn: Connection,
+    /// A read-only open of an index nobody has written yet: its tables are
+    /// absent, and that alone means "empty".
+    uninitialised: bool,
+    /// For messages naming the database.
+    path: std::path::PathBuf,
 }
 
 /// SQLite integers are signed 64-bit; `u64` fields are stored as their
@@ -152,10 +160,135 @@ impl Index {
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
         // Readers must not block the single writer or vice versa; the mode is
         // persisted in the file, so this is a no-op on later opens.
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
-        let ix = Index { conn };
+        // Switching a fresh file to WAL needs an exclusive lock that SQLite
+        // does not wait for through the busy handler, so processes opening a
+        // new store together retry here instead of failing.
+        let deadline = std::time::Instant::now() + Duration::from_millis(5000);
+        loop {
+            match conn
+                .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))
+            {
+                Ok(_) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let ix = Index {
+            conn,
+            uninitialised: false,
+            path: db,
+        };
         ix.ensure_schema()?;
         Ok(ix)
+    }
+
+    /// For a store the effective user cannot write (ES-25: a `resolve`
+    /// answered from the index must still succeed there). Nothing is created
+    /// or migrated, so a store whose index was never initialised reads as
+    /// empty.
+    pub fn open_read_only(store: &Store) -> Result<Index, StoreError> {
+        store.check_unmoved()?;
+        let db = store.path().join("index.db");
+        let wal = store.path().join("index.db-wal");
+        // Committed rows may still be only in the WAL: a crash, or a live
+        // store made read-only or bind-mounted read-only, leaves them there.
+        let wal_content = match std::fs::symlink_metadata(&wal) {
+            Ok(m) => m.len() > 0,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(wrap(e, "stat", &wal)),
+        };
+        // `mode=ro` reads the WAL, but needs the `-shm` file, which a
+        // directory we cannot write cannot gain.
+        let ro = Index::open_uri(&db, "mode=ro");
+        let conn = match ro {
+            Ok(c) => c,
+            Err(e) if wal_content => {
+                return Err(StoreError::IndexUnreadable {
+                    path: db,
+                    why: format!(
+                        "it has a write-ahead log that cannot be read without writing ({e})"
+                    ),
+                })
+            }
+            // `immutable` reads index.db alone, with no `-shm` and no locks.
+            // That is right only with no WAL content to miss; a writer that
+            // changes the file during this one read (only the owner can,
+            // through a mount or mode change) may still make it fail.
+            Err(_) => Index::open_uri(&db, "immutable=1")?,
+        };
+        store.check_unmoved()?;
+        let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if found != SCHEMA_VERSION && found != 0 {
+            return Err(StoreError::Schema {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        Ok(Index {
+            conn,
+            uninitialised: found == 0,
+            path: db,
+        })
+    }
+
+    /// A read-only connection to `db` with URI parameter `param`, proven
+    /// usable by one read.
+    fn open_uri(db: &std::path::Path, param: &str) -> Result<Connection, StoreError> {
+        let mut uri = String::from("file:");
+        for &b in db.as_os_str().as_bytes() {
+            if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+                uri.push(char::from(b));
+            } else {
+                uri.push_str(&format!("%{b:02X}"));
+            }
+        }
+        uri.push('?');
+        uri.push_str(param);
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&uri, flags).map_err(|e| wrap_db(e, db))?;
+        conn.busy_timeout(Duration::from_millis(5000))?;
+        conn.pragma_update(None, "trusted_schema", "OFF")?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        // SQLite opens lazily; the first read is what fails without `-shm`.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })?;
+        Ok(conn)
+    }
+
+    /// The writable index, or the read-only one when the store cannot be
+    /// written: for the lookups, which must not fail on a read-only store.
+    pub fn open_for_lookup(store: &Store) -> Result<Index, StoreError> {
+        if store.read_only() {
+            Index::open_read_only(store)
+        } else {
+            Index::open(store)
+        }
+    }
+
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Whether `table` exists; a read-only open of an old or never-written
+    /// index may lack tables a writable open would have created.
+    pub(crate) fn has_table(&self, table: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// No migrations: an unknown version is refused rather than guessed at.
@@ -195,6 +328,13 @@ impl Index {
                  path BLOB PRIMARY KEY,
                  kind TEXT NOT NULL,
                  id INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS cache (
+                 alg TEXT NOT NULL,
+                 digest BLOB NOT NULL,
+                 size INTEGER NOT NULL,
+                 atime_ns INTEGER NOT NULL,
+                 PRIMARY KEY (alg, digest)
              );",
         )?;
         tx.commit()?;
@@ -204,7 +344,7 @@ impl Index {
     /// IMMEDIATE so the write lock is taken up front: a deferred transaction
     /// that reads first can fail on upgrade with BUSY, which `busy_timeout`
     /// does not retry.
-    fn write_tx(&self) -> Result<Transaction<'_>, StoreError> {
+    pub(crate) fn write_tx(&self) -> Result<Transaction<'_>, StoreError> {
         Ok(Transaction::new_unchecked(
             &self.conn,
             TransactionBehavior::Immediate,
@@ -222,6 +362,16 @@ impl Index {
 
     /// Sorted by raw path bytes so `resolve` output is deterministic.
     pub fn by_digest(&self, digest: &Digest) -> Result<Vec<Vec<u8>>, StoreError> {
+        if !self.has_table("files")? {
+            if self.uninitialised {
+                return Ok(Vec::new());
+            }
+            // Damage, not a usage error: the blob may be indexed (ES-7).
+            return Err(StoreError::IndexUnreadable {
+                path: self.path.clone(),
+                why: "it is initialised but has no files table".into(),
+            });
+        }
         let mut stmt = self.conn.prepare_cached(
             "SELECT path FROM files WHERE alg = ?1 AND digest = ?2 ORDER BY path",
         )?;

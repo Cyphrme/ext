@@ -56,3 +56,18 @@ pub enum EscapeError {
     #[error("truncated escape")]
     Truncated,
 }
+
+/// ES-19: text bound for a terminal whose bytes did not come from `ext`
+/// (service text, file paths in diagnostics). Every byte outside 0x20-0x7E,
+/// and the backslash so the escaping stays injective, becomes `\xNN`.
+pub fn terminal(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if (0x20..=0x7e).contains(&b) && b != b'\\' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("\\x{b:02x}"));
+        }
+    }
+    out
+}

@@ -3,8 +3,8 @@
 use crate::config::{self, Config, ConfigError};
 use crate::registry::{self, RegPath, RegistryErrorKind};
 use rustix::fs::{
-    flock, fstat, fsync, mkdirat, openat, renameat, renameat_with, statat, unlinkat, AtFlags,
-    FileType, FlockOperation, Mode, OFlags, RenameFlags, CWD,
+    accessat, flock, fstat, fsync, mkdirat, openat, renameat, renameat_with, statat, unlinkat,
+    Access, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags, CWD,
 };
 use rustix::io::Errno;
 use rustix::process::{getegid, geteuid, getgid, getuid};
@@ -16,12 +16,15 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const REGISTRY: &str = "registry";
 const INDEX_DB: &str = "index.db";
 const LOCK: &str = "lock";
 const CONFIG: &str = "config";
 const REGISTRY_TMP: &str = "registry.tmp";
+/// The services file (ES-21), one URI per line.
+pub(crate) const SERVICES: &str = "services";
 const FILES: [&str; 3] = [REGISTRY, INDEX_DB, LOCK];
 const S_ISVTX: u32 = 0o1000;
 
@@ -67,6 +70,11 @@ pub enum StoreError {
     Schema { found: i64, expected: i64 },
     #[error("corrupt index row: {0}")]
     Corrupt(String),
+    /// An index that cannot be read completely: a read-only store whose WAL
+    /// is unreadable, or an initialised index missing a table. Not a usage
+    /// error: the blob may be indexed (exit 5, as ES-25's failed writes).
+    #[error("cannot read index {}: {why}", path.display())]
+    IndexUnreadable { path: PathBuf, why: String },
 }
 
 /// Io error that keeps the kind (callers match on `AlreadyExists`) but says
@@ -343,6 +351,132 @@ impl Store {
     /// inode would not exclude the next writer.
     pub fn lock(&self) -> Result<WriteLock, StoreError> {
         let p = self.path.join(LOCK);
+        let fd = self.open_lock()?;
+        loop {
+            match flock(&fd, FlockOperation::LockExclusive) {
+                Ok(()) => break,
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(errno(e, "flock", &p)),
+            }
+        }
+        Ok(WriteLock {
+            _fd: fd,
+            store: self.id,
+        })
+    }
+
+    /// The exclusive lock if it is free right now, `None` if another holder
+    /// has it (ES-27: a touch or a lookup's eviction never waits).
+    pub fn try_lock(&self) -> Result<Option<WriteLock>, StoreError> {
+        let fd = self.open_lock()?;
+        loop {
+            match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {
+                    return Ok(Some(WriteLock {
+                        _fd: fd,
+                        store: self.id,
+                    }))
+                }
+                Err(Errno::INTR) => continue,
+                Err(Errno::WOULDBLOCK) => return Ok(None),
+                Err(e) => return Err(errno(e, "flock", &self.path.join(LOCK))),
+            }
+        }
+    }
+
+    /// The lock, or `None` once `limit` has passed with it still busy
+    /// (ES-25: an admission waits at most the busy timeout).
+    pub fn lock_within(&self, limit: Duration) -> Result<Option<WriteLock>, StoreError> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(l) = self.try_lock()? {
+                return Ok(Some(l));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+        }
+    }
+
+    /// Whether `lock` is this store's.
+    pub fn holds(&self, lock: &WriteLock) -> bool {
+        lock.store == self.id
+    }
+
+    /// The effective user cannot write the store directory (a read-only
+    /// mount, or modes that forbid it). Such a store supports no writes
+    /// (ES-25), so callers skip the ones that are optional.
+    pub fn read_only(&self) -> bool {
+        accessat(&self.dir, ".", Access::WRITE_OK, AtFlags::EACCESS).is_err()
+    }
+
+    /// Whether the store directory has an entry `name` (not followed).
+    pub(crate) fn has_entry(&self, name: &str) -> bool {
+        statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok()
+    }
+
+    /// The bytes of `<store>/services`, or `None` if there is none. It gets
+    /// the registry's checks: not a symlink, a regular file, owned by the
+    /// effective user, not group/other-writable.
+    pub fn services_bytes(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        let name = SERVICES;
+        let p = self.path.join(name);
+        let fd = match openat(
+            &self.dir,
+            name,
+            // NONBLOCK: a planted FIFO must fail the type check, not hang.
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(e) => return Err(errno(e, "open", &p)),
+        };
+        let st = fstat(&fd).map_err(|e| errno(e, "stat", &p))?;
+        if !FileType::from_raw_mode(st.st_mode).is_file() {
+            return Err(StoreError::NotAStore(self.path.clone()));
+        }
+        judge_owner_mode(st.st_uid, st.st_mode, geteuid().as_raw(), &p)?;
+        let mut bytes = Vec::new();
+        fs::File::from(fd)
+            .read_to_end(&mut bytes)
+            .map_err(|e| wrap(e, "read", &p))?;
+        Ok(Some(bytes))
+    }
+
+    /// Judges a directory inside the store as the store itself is judged
+    /// (ES-21 extends the owner check to `cache/`). `Ok(false)` when absent.
+    pub(crate) fn check_subdir(&self, rel: &Path) -> Result<bool, StoreError> {
+        let p = self.path.join(rel);
+        match statat(&self.dir, rel, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => {
+                if !FileType::from_raw_mode(st.st_mode).is_dir() {
+                    return Err(StoreError::NotAStore(self.path.clone()));
+                }
+                judge_owner_mode(st.st_uid, st.st_mode, geteuid().as_raw(), &p)?;
+                Ok(true)
+            }
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(errno(e, "stat", &p)),
+        }
+    }
+
+    /// Opens `rel` below the store for reading, never through a symlink in
+    /// its last component and never blocking on a FIFO.
+    pub(crate) fn open_nofollow(&self, rel: &Path) -> io::Result<fs::File> {
+        let fd = openat(
+            &self.dir,
+            rel,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )?;
+        Ok(fs::File::from(fd))
+    }
+
+    fn open_lock(&self) -> Result<OwnedFd, StoreError> {
+        let p = self.path.join(LOCK);
         let fd = openat(
             &self.dir,
             LOCK,
@@ -355,17 +489,7 @@ impl Store {
             return Err(StoreError::NotAStore(self.path.clone()));
         }
         judge_owner_mode(st.st_uid, st.st_mode, geteuid().as_raw(), &p)?;
-        loop {
-            match flock(&fd, FlockOperation::LockExclusive) {
-                Ok(()) => break,
-                Err(Errno::INTR) => continue,
-                Err(e) => return Err(errno(e, "flock", &p)),
-            }
-        }
-        Ok(WriteLock {
-            _fd: fd,
-            store: self.id,
-        })
+        Ok(fd)
     }
 
     pub fn registry(&self) -> Result<Vec<RegPath>, StoreError> {

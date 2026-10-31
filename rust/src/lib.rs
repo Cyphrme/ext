@@ -1,12 +1,16 @@
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod digest;
 pub mod escape;
 pub mod fresh;
 pub mod hash;
+pub mod https;
 pub mod index;
+pub mod lookup;
 pub mod registry;
 pub mod scan;
+pub mod services;
 pub mod store;
 pub mod transfer;
 pub mod vfs;
