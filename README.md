@@ -16,12 +16,18 @@ blob services.
 ## Registration
 **Registry**
 A registry is simply a list of paths and URIs, newline delimited. For example,
-to register a whole system, the registry contains simply the root path, `/`.
+to register a whole system, the registry contains simply the root path, `/`. A subtree such as `/srv/www`
+may equally be registered.
 The system-wide registry is kept by default in `/var/lib/ext/registry`. Files
 may be registered by `ext -r <path>` or by editing the registry file.
 
 **Subdirectory Registration**
-Sub-extants keep their own registries in `<sub-extant_path>/registry`.
+A sub-extant keeps its store in `<sub-extant_path>/.ext/`, which holds its
+registry. A directory is a sub-extant only if its `.ext/` is a directory
+containing a registry, both owned by the owner of the parent's registered
+root or by root. Any other `.ext` is ordinary content, so creating one cannot
+hide a subtree from the parent. A sub-extant works standalone: `ext init
+<dir>`, then `ext --d <dir> ...`.
 
 Sub-extants may be registered to a parent extant.
 
@@ -37,6 +43,11 @@ For example:
 Indexes are kept in `<extant_path>/<index_name>`. The registry and source index
 are required, others are optional.
 
+The store directory is never indexed by `ext`; it does not index itself. A
+per-file read error is reported and does not abort the scan.
+Which files are hashed, and how mounts, symlinks, special files and deleted
+roots are handled, is in [docs/traversal.md](docs/traversal.md).
+
 **File Formats**
 Registry:   <registered_file_path>
 Source:     <digest>:<alg>\t<path>
@@ -44,7 +55,19 @@ Path Index: <path>\t<digest>:<alg>
 Tag:        <tag>\t<digest>:<alg>
 Cache:      <digest>:<alg>\t<path>
 Cache Time: <digest>:<alg>\t<time>
-Timestamp:  <path>\t<last_checked>\t<last_modified>
+Timestamp:  <path>\t<last_checked>\t<mtime>\t<ctime>\t<size>\t<inode>\t<dev>
+
+Index files are TSV as defined in https://github.com/Cyphrme/TSV: fields are
+tab delimited, records are newline delimited, and a backslash, tab, or newline
+in a field is escaped as `\\`, `\t`, or `\n`. Records are sorted by the raw
+bytes of their first field.
+
+A process that writes a store holds an exclusive lock on
+`<extant_path>/lock` for its whole run; readers take no lock. An index file is
+replaced atomically: it is written to a temporary file in the store and renamed
+over the old one, so a reader never sees a partial file.
+
+External service URIs are not stored in the system indexes.
 
 The same digest may appear more than once when multiple paths contain
 identical content. Lookup by digest returns every matching path. The path index,
@@ -63,6 +86,12 @@ If the human name doesn't exist, ext does not return the value even if the
 digest exists. Why? The digest value can always be sent. If the human readable
 value is sent, ext forces interpretation. If you don't need the human name,
 don't use it.
+
+The human name is the file's name, including its extension when present:
+`<human_name>:<alg>:<value>.<ext>` names the file `<human_name>.<ext>`. It is
+optional; when given, it must equal the last component of a path that has the
+digest. When several paths share the digest, one match is enough. Tags, other human-readable data describing
+a digest, are TODO.
 
 Digest with Human Name
 <alg>:<value>:<human_name>
@@ -93,36 +122,43 @@ https://cyphr.me/e/SHA-256:2rfHUI84JBkIziYcLmvg4Dbjkr4B_md0gCupblX_JU8
 implementing systems (such as a browser):
 
 ```
-hash://SHA-256:oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
+hash://SHA-256/oDBDAg4xplHQby6iQ2lZMS1Jz4Op0bNoD5LK3KxEUZo
 ```
 
 **Hash Scheme Grammar**
 ```
-hash-uri = "hash://" alg ":" digest [tail]
+hash-uri = "hash://" alg "/" digest [tail]
 scheme   = "hash://"
-alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No ":".
-digest   = 1*b64ut / 1*hex; 
+alg      = 1 * (ALPHA / DIGIT / "-"); Coz alg. No "/".
+digest   = 1*b64ut; 
 b64ut    = ALPHA / DIGIT / "-" / "_" ; 
-hex      = ALPHA / alpha / DIGIT;
+hex      = DIGIT / %x41-46 / %x61-66; 0-9, A-F, a-f
 tail     = <Starting at first non-b64ut> 
            (which is of course inclusive of the Hex character set)
 ```
 
-Scheme match is case-insensitive while `alg` and `digest` are case-sensitive.
+The b64ut alphabet includes every hex character, so a hex digest is also a
+b64ut string. At full length the encoding is decided by length, not by which
+characters appear: for SHA-256, 43 characters is b64ut and 64 is hex.
+
+Scheme match is case-insensitive and `digest` is case-sensitive. The `alg`
+acts as the URI authority, and generic URI parsers lowercase the authority, so
+in a `hash://` URI `alg` is matched case-insensitively against Coz alg names.
 Tail is optional and resolution is out of scope.
 
 **Hash Scheme Parsing**
-1. After `hash://`, split on first `:`.
+1. After `hash://`, split on first `/`.
 2. `digest` is the longest b64ut prefix of the remainder. First non-b64ut char
    starts `tail`.
 3. Prefer the decoding whose length equals `alg`'s digest size. Even-length
-   `0-9A-F` is hex. Otherwise strict b64ut. Non-canonical encoding is an error.
-4. When truncation is enabled, a shorter digest is accepted: `0-9A-F` only is
-   hex, anything else is b64ut. Else error.
+   hex, in any case, is hex. Otherwise strict b64ut. Non-canonical encoding is an error.
+4. When truncation is enabled, a shorter digest is accepted: hex characters only,
+   in any case, is hex, anything else is b64ut. Else error.
 
 Identity = (`alg`, raw digest bytes). `tail` is not identity.
 
-SHA-256 is 32 bytes, 43 b64ut chars, or 64 uppercase hex chars. No `=`.
+SHA-256 is 32 bytes, 43 b64ut chars, or 64 hex chars. No `=`.
+Hex is accepted in any case and written uppercase.
 
 ## System Integrated Extant: `/dev/ext`
 So far described is **userland extant**. The extant service is designed first as
@@ -140,7 +176,7 @@ exist".
 Using a symbolic link, this file then can be used as a database:
 
 For example:
-ln -s target /dev/ext /var/www/website_name/content
+ln -s /dev/ext /var/www/website_name/content
 
 **List of existing sources or sinks**
 - /dev/null
@@ -157,6 +193,7 @@ ln -s target /dev/ext /var/www/website_name/content
 
 ## Bases
 Both Base64 (b64ut) and hex (lower, upper, and mixed case) are supported.
+Hex output is uppercase.
 However, the default is b64ut.
 
 ## Truncation and Collision
@@ -171,7 +208,8 @@ A collision is where two distinct inputs resolve to a single digest. This may
 happen when using a non-cryptographic hash, truncation, or a broken
 cryptographic hash. Although `ext` is designed for cryptographic hashes, there
 are circumstances where non-cryptographic hashes are useful, such as speed and
-smaller lookup keys.
+smaller lookup keys. Non-cryptographic algorithms are "locate only": they are
+never used for verification, cache admission, or fetching.
 
 On collision for truncation or non-cryptographic hashed, tooling provides top
 matches. For cryptographic hashes provided with full sized digests, tooling must
@@ -195,22 +233,43 @@ The order of operations for the lookups is:
 
 The cache has two indexes which provide O(log(n)) lookups, the Cache Index
 comprises <dig>:<path> pairs and the Cache Time Index comprises <dig>:<time>
-pairs. Once the cache reaches capacity, the oldest touched items are removed.
+pairs. Cache capacity is set in bytes in the config. Once the cache reaches
+capacity, the least recently used items are evicted.
+
+A fetched blob is hashed in full with the requested alg and compared with the
+requested digest before it is cached or returned. On mismatch it is discarded,
+nothing is cached, and the error names the service. Fetch size and timeout
+limits are configurable. By default, redirects to a different scheme are not
+followed, and a service may not direct `ext` to a loopback or other local
+address. A config option can relax both.
+
+A cache record holds the alg and digest, the origin service, the local file
+name (derived only from the verified digest), and the last access time.
 
 ## Directories
 `ext` checks for stores, indexes, and registrations. Default system wide userland
 directory: `/var/lib/ext`. This may be set to a different directory using the
 environment variable `EXTANT_DIR`.
 
-The waterfall for directories. Use the first candidate that exists.
-1. Environment variable
-2. Default path, `/var/lib/ext`
-3. Flag value
-4. Current directory
+The waterfall for directories, highest precedence first:
+1. Flag value (`--d <path>`)
+2. Environment variable, `EXTANT_DIR`
+3. Default path, `/var/lib/ext`
+4. Current directory: its `.ext/` store, as for a sub-extant
 5. Fail if nothing exists.
 
+## Trust
+`ext` runs as the invoking user and indexes only what that user can read. A
+store must be owned by the user running `ext`, and `ext` refuses any other.
+When `ext` runs with elevated privilege, `EXTANT_DIR` and the current
+directory are not consulted.
+
+Integrity means detecting change relative to the index, so the index is only
+as trustworthy as the store's protection. A system-wide store that serves
+queries from other users, filtered to what each may read, is future work.
+
 ## Config Flags
-The config file is saved as <extant_path>/config.
+The config file is saved as <extant_path>/config. Its format is JSON5.
 
 |Flag - Default Value - Description|
 - Aware      - True  - the system only supports digests specified by ext.
@@ -222,6 +281,9 @@ The config file is saved as <extant_path>/config.
 - Unlabeled  - False - Do not require digest labeling.
 - Directory  - CWD   - Specify working directory for `ext`.
 - Hash     - SHA-256 - Default hash.
+- CompareCtimeInode - True - Compare ctime, inode and dev when deciding to skip a file
+  (see Incrementality).
+- UnregisterDeleted - True - Unregister a deleted root (see docs/traversal.md).
 
 ## Commands
 `ext init <path>` - Create an `ext` directory with a new registry. If no path is
@@ -230,22 +292,39 @@ specified CWD is used.
 `ext register`,`ext -r`  - Registration. Supports both files and directories.
 
 `ext unregister`, `ext -u`         - Unregister, removing all references in
-indexing. (Deleting a directory also unregisters.)
+indexing. A deleted root is also unregistered; see
+[docs/traversal.md](docs/traversal.md).
 
 `ext resolve <dig>` - Print path(s)
 
 `ext list` - prints the source index.
 
-`ext check`, `ext -check` - Re-hash all files and compare digests. Skip
-unchanged paths.
+`ext check` - Re-hash files whose metadata changed (see
+Incrementality) and record their new digests as edits. Skip unchanged paths.
 
-`ext check --full` - Re-hash all files and do not skip unchanged paths.
+`ext check --full` - Re-hash all files and do not skip unchanged paths. A
+digest that changed while the file's metadata did not is a violation: it is
+reported, the index is not updated, and `check` exits 2.
 
-`ext -rerun` - Rebuild all indexes and re-hash all files.
+`ext check --accept` - Record reported violations as the new digests.
+
+`ext rebuild` - Rebuild all indexes and re-hash all files.
 
 `ext --d <path>` - Specifies the working directory for `ext`.
 
 `ext watch` - Starts the watcher that triggers on file change.
+
+`-r` and `-u` are aliases of `register` and `unregister`.
+
+**Exit codes**
+|Code - Meaning|
+- 0 - OK
+- 1 - Not found
+- 2 - Mismatch (`check`)
+- 3 - Ambiguous
+- 4 - Usage or configuration error
+- 5 - Incomplete: some paths could not be read or were refused, and no
+  mismatch was found. A mismatch (2) takes precedence.
 
 ## Incrementality
 Incrementality uses a persistent timestamp index and an optional continuous
@@ -254,31 +333,71 @@ ignores them and re-hashes every registered path for a complete integrity
 verification.
 
 **Timestamp Index** - For each registered path the following are stored:
-- `last_checked` - Unix time of the last examination by `ext`
-- `last_modified` - the path’s mtime (or platform equivalent) at that moment
+- `last_checked` - time of the last examination by `ext`, in nanoseconds
+- `mtime`, `ctime` - the file's modification and status-change times, in
+  nanoseconds, as observed at that examination
+- `size` - the file's size in bytes
+- `inode` - the file's inode number (or platform equivalent)
+- `dev` - the device number of the file's filesystem; an inode number only
+  identifies a file together with its device
 
 On run (CLI or watcher):
 
-1. If the current mtime matches the stored `last_modified`, the path is skipped.
-2. Otherwise the file is re-hashed, indexes are updated, and both timestamps are
+1. A path is skipped only if its current `mtime`, `ctime`, `size`, `inode`, and
+   `dev` all match the stored values, and the entry is not *racy* (below).
+2. Otherwise the file is re-hashed, indexes are updated, and the record is
    rewritten.
 
-Large directories (either by size or number of files) may also be added to the
-timestamp index as a further optimization. This allows only some child
-directories in a parent to be re-examined.
+mtime alone is not sufficient: it can be set by any process (`touch -d`,
+`utimensat`, `cp -p`, `rsync -t`, archive extraction), whereas ctime cannot be
+set from userspace. A configuration option may disable the ctime, inode and dev
+comparisons for filesystems where they are unstable (some FUSE and network
+filesystems).
 
-**Watcher** - `ext watch` monitors registered paths via the platform mechanism (Linux:
-inotify/fanotify). On create/modify/delete events it re-hash (or removes) and
-updates the timestamp index. The watcher is not required for correctness; any
-later `ext` invocation will observe the same timestamps and produce the same
-result.
+**Racy entries** - A file modified within the filesystem's timestamp
+granularity after it was hashed can show unchanged metadata. `last_checked` is
+sampled before the file is first examined (before its metadata is read and
+before it is hashed). An entry is racy when the later of its `mtime` and
+`ctime` is not earlier than `last_checked` minus a fixed window of 2 seconds,
+which covers coarse filesystem timestamps without needing to know the
+filesystem's granularity. A racy entry is re-hashed on the next run regardless
+of matching metadata. This is the same problem and remedy as git's "racy git"
+handling.
+
+The rationale is in [docs/incrementality.md](docs/incrementality.md).
+
+**Directories** - Large directories may also be recorded in the timestamp
+index as a further optimization. A directory's mtime changes only when an
+entry directly inside it is created, removed, or renamed; it does not change
+when a file's contents change, or when anything changes in a subdirectory.
+An unchanged directory record therefore permits skipping only the re-listing
+of that one directory. Every entry in it is still checked by rule 1.
+
+**Watcher** - `ext watch` monitors registered paths via the platform
+mechanism (Linux: inotify). inotify is not recursive, so the watcher adds one
+watch per directory, and newly created directories are scanned after their
+watch is added. Files are re-hashed on close-after-write (`IN_CLOSE_WRITE`)
+and on move-in, not on every modification; deleted or moved-out files are
+removed. The timestamp index is updated accordingly.
+
+Events can be lost: on queue overflow (`IN_Q_OVERFLOW`), on failure to add a
+watch (e.g. the per-user watch limit), and while the watcher is not running.
+In each case the watcher performs a full metadata scan of the affected tree
+using the rules above. With that rule the watcher is not required for
+correctness: any later `ext` invocation observes the same metadata and
+produces the same result.
 
 External services are never watched; they are consulted only on cache miss.
 
 ## Coz
 Extant uses the algorithm hash naming convention and b64ut (RFC 4648 base64 url,
 padding truncated, canonical), and expected default digest sizes as specified by
-Coz. Hex may be used in place of b64ut.
+Coz. Hex may be used in place of b64ut. Algorithm names, digest sizes, and
+encoded lengths are listed by Coz.
+
+An `ext` client may support a subset of the Coz algorithms. A digest labeled
+with an algorithm the client does not support is rejected, not treated as
+unlabeled.
 
 ## Errors
 AMBIGUOUS - Multiple digests complete given string
@@ -289,9 +408,12 @@ COLLISION - Two distinct payloads resolve to the same digest.
 **Extant Non-goals**
 - Not a transport.
 - Not a multi-hash registry. Not ni:. Not a filename standard.
+  In `hash:` the digest's algorithm is the authority, so ni's empty authority
+  (`///`) is not needed.
 
-**Recursion** - Recursion is not supported. If an ext path contains another ext,
-it is ignored. Subdirectories must be explicitly registered.
+**Recursion** - A parent's scan skips sub-extants; they are not included by
+default. Registering a sub-extant to the parent includes it: the parent hashes
+the sub-extant's files itself and does not read the sub-extant's index.
 
 **Digest Labeling** - Unlabeled digests are a security concern: the weakest hash
 becomes the security floor of the system overall. A system with unlabeled
